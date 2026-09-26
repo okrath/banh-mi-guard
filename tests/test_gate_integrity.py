@@ -282,6 +282,22 @@ def test_reset_archives_and_closes_a_rejected_session(tmp_path):
     assert execute_post_task(repo_path=repo, hook=True) is True  # no session any more
 
 
+def test_new_pre_archives_the_finished_session_it_replaces(tmp_path):
+    import subprocess
+
+    repo = make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
+    execute_post_task(repo_path=repo)
+    finished = SessionManager(repo).load_local_session()
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "work"], check=True)
+
+    assert execute_pre_task("Fix src/other.ts", repo_path=repo, force=True) is True
+    archived = repo / ".guard" / "history" / f"{finished.session_id}.json"
+    assert archived.is_file()
+    assert json.loads(archived.read_text(encoding="utf-8"))["status"] == finished.status.value
+
+
 def test_prompt_globs_do_not_widen_scope(tmp_path):
     repo = make_repo(tmp_path)
     assert execute_pre_task(r"Fix src\chat.ts but do not edit *.css", repo_path=repo) is True

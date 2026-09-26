@@ -220,6 +220,9 @@ class SessionManager:
     ) -> GuardSession:
         self.guard_dir.mkdir(parents=True, exist_ok=True)
         self.ensure_gitignore()
+        previous = self.load_local_session()
+        if previous:
+            self._archive(previous)  # a new pre must not erase the record of the last decision
 
         session_id = f"guard-{int(time.time())}"
         pre_rec = PreTaskRecord(
@@ -266,13 +269,15 @@ class SessionManager:
     def archive_and_clear(self) -> Optional[Path]:
         """Move the current session to .guard/history/<session_id>.json, then clear it."""
         session = self.load_local_session()
-        archived = None
-        if session:
-            history = self.guard_dir / "history"
-            history.mkdir(parents=True, exist_ok=True)
-            archived = history / f"{session.session_id}.json"
-            archived.write_text(session.model_dump_json(indent=2), encoding="utf-8")
+        archived = self._archive(session) if session else None
         self.clear()
+        return archived
+
+    def _archive(self, session: GuardSession) -> Path:
+        history = self.guard_dir / "history"
+        history.mkdir(parents=True, exist_ok=True)
+        archived = history / f"{session.session_id}.json"
+        archived.write_text(session.model_dump_json(indent=2), encoding="utf-8")
         return archived
 
     def clear(self):
