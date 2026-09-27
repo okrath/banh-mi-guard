@@ -22,6 +22,7 @@ from guard.core.ocr_engine import DiffSummary, FileDiffStat, RuleViolation
 
 
 # File patterns that are legitimate entry points or configs and should not be flagged as orphan
+DOC_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
 DEFAULT_ENTRYPOINT_PATTERNS = [
     # Top-level & documentation
     r"^README(\..+)?$",
@@ -92,6 +93,9 @@ class HygieneEngine:
 
     def is_entrypoint_or_whitelisted(self, file_path: str) -> bool:
         norm = file_path.replace("\\", "/").strip("/")
+        # Documentation is read, not imported: it is never an orphan
+        if norm.lower().endswith(DOC_SUFFIXES) or norm.lower().startswith("docs/") or "/docs/" in norm.lower():
+            return True
         for pat in DEFAULT_ENTRYPOINT_PATTERNS:
             if re.search(pat, norm, re.IGNORECASE):
                 return True

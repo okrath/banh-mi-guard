@@ -2,6 +2,7 @@
 Unit tests for Supply-Chain Security & Update Quarantine Checker (Alibaba OCR).
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from guard.core.updater import (
@@ -33,7 +34,8 @@ def test_ocr_update_quarantine_hold():
     mock_response.json.return_value = {
         "dist-tags": {"latest": "1.13.0"},
         "time": {
-            "1.13.0": "2026-09-24T12:00:00Z"
+            # released a day ago, whatever today is (a fixed date turned this test into a time bomb)
+            "1.13.0": (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
     }
 

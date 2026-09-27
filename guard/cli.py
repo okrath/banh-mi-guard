@@ -204,6 +204,25 @@ def execute_pre_task(
     requested_scope = sorted(
         {p.replace("\\", "/").rstrip("/") for p in _prompt_paths(prompt, target_repo) + list(scope or [])} - {""}
     )
+    # Untracked paths nobody decided about (agent folders such as plans/) cannot be snapshotted as a
+    # baseline: the user says once whether each is part of the repository or always ignored. Checked
+    # for a first pre and for a --force restart alike (a restart does not ask about its task's files).
+    from guard.core.untracked import ASK_USER, RegistryError, printable, shown, undecided
+    try:
+        pending = [p for p in undecided(target_repo, skip_task_files=bool(superseded))
+                   if invariants_existed or p != INVARIANTS_FILENAME]
+    except (RuntimeError, RegistryError) as e:
+        console.print("[bold red]❌ Guard could not check untracked paths:[/bold red]")
+        console.print(printable(str(e)), markup=False)
+        return False
+    if pending:
+        listing = "\n".join(f"  • {shown(p)}" for p in pending[:20])
+        if len(pending) > 20:
+            listing += f"\n  … and {len(pending) - 20} more (guard untracked lists them all)"
+        console.print(f"[bold yellow]⚠️ Untracked path(s) without a decision:[/bold yellow]\n{listing}")
+        console.print(ASK_USER, markup=False)
+        return False
+
     if superseded:
         old = superseded.pre
         baseline_dirty = dict(old.baseline_dirty)
@@ -1226,6 +1245,49 @@ def hook_status_cmd(
                     "✅ Active" if sub_stat["prepare_commit_msg_installed"] else "⚪ Inactive",
                 )
             console.print(sub_table)
+
+
+@app.command("untracked")
+def untracked_cmd(
+    path: Optional[str] = typer.Argument(None, help="Untracked file or folder, e.g. plans/"),
+    include: bool = typer.Option(False, "--include", help="Always include: a normal part of the repository"),
+    ignore: bool = typer.Option(False, "--ignore", help="Always ignore: local info/exclude, no repository file changes"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Target repository directory"),
+):
+    """
+    Decide once, per path, whether an untracked file or folder is part of the repository or always
+    ignored. Run it again with the other flag to change the decision. Without a path: list them.
+    """
+    from guard.core.untracked import RegistryError, decide, load_decisions, printable, shown, suggest, undecided
+    target = git_root(Path(repo).resolve() if repo else Path.cwd().resolve())
+    if target is None:
+        console.print("[bold red]❌ Not inside a Git repository.[/bold red]")
+        raise typer.Exit(code=1)
+    if path is None:
+        try:
+            decisions = load_decisions(target)
+        except RegistryError as e:
+            console.print(f"[bold red]❌ {shown(str(e))}[/bold red]")
+            raise typer.Exit(code=1)
+        for entry, choice in decisions.items():
+            console.print(f"  {shown(entry)}: always {'included' if choice == 'include' else 'ignored'}")
+        try:
+            pending = undecided(target)
+        except (RuntimeError, RegistryError) as e:
+            console.print(f"[bold red]❌ Cannot list untracked paths: {shown(str(e))}[/bold red]")
+            raise typer.Exit(code=1)
+        for entry in pending:
+            console.print(f"  {shown(entry)}: [yellow]not decided[/yellow] ({suggest(entry)})")
+        return
+    if include == ignore:
+        console.print("[bold red]❌ Choose exactly one: --include or --ignore.[/bold red]")
+        raise typer.Exit(code=1)
+    try:
+        console.print(f"[bold green]✅ {decide(target, path, 'include' if include else 'ignore')}[/bold green]")
+    except ValueError as e:
+        console.print("[bold red]❌[/bold red] ", end="")
+        console.print(printable(str(e)), markup=False)
+        raise typer.Exit(code=1)
 
 
 @app.command("agent-event")

@@ -215,6 +215,9 @@ def test_renamed_and_spaced_paths_are_tracked(tmp_path):
     assert "src/renamed.ts" in working and "src/a b ố.ts" in working
     assert not any("->" in f or f.startswith('"') for f in working)
 
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is False  # untracked, undecided
+    from guard.core.untracked import decide
+    decide(repo, "src/a b ố.ts", "include")
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is True
     (repo / "src" / "new dir").mkdir()
     (repo / "src" / "new dir" / "x y.ts").write_text("el.innerHTML = t;\n", encoding="utf-8")
@@ -341,6 +344,15 @@ def test_ocr_skips_only_dirty_files_the_task_left_untouched(tmp_path, fake_ocr_r
     (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
     execute_post_task(repo_path=repo, full=True)
     assert fake_ocr_review.call_args.kwargs["skip_files"] == ["src/other.ts"]  # chat.ts: dirty, but edited by the task
+
+
+def test_a_dirty_file_the_task_edits_is_not_dropped_from_untracked_checks(tmp_path):
+    from guard.core.untracked import decide, undecided
+    repo = make_repo(tmp_path)
+    (repo / "notes.md").write_text("mine\n", encoding="utf-8")  # untracked before pre
+    decide(repo, "notes.md", "include")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is True
+    assert undecided(repo) == []
 
 
 def test_plain_post_does_not_run_ocr_and_says_so(tmp_path, fake_ocr_review):

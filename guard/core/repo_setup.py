@@ -583,7 +583,24 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         add("warn", "Commit messages", "not chosen yet: auto (the agent writes them) or ask (the agent asks you for each one)",
             "guard config commit auto   (or: guard config commit ask)")
 
-    # 6. Files left by guard <= 0.10 (the Laya model is no longer used)
+    # 6. Untracked paths the user has not decided about stop guard pre
+    if repo:
+        from guard.core.untracked import RegistryError, undecided
+        try:
+            pending = undecided(repo)
+        except (RuntimeError, RegistryError) as e:
+            pending = []
+            from rich.markup import escape
+            from guard.core.untracked import printable
+            add("warn", "Untracked paths", f"cannot list untracked paths: {escape(printable(str(e)))}",
+                "git status   (fix the repository, then guard doctor)")
+        if pending:
+            from guard.core.untracked import shown as show_path
+            shown = ", ".join(show_path(p) for p in pending[:5]) + (" …" if len(pending) > 5 else "")
+            add("warn", "Untracked paths", f"{len(pending)} untracked path(s) without a decision: {shown}",
+                "guard untracked <path> --include   (or --ignore)")
+
+    # 7. Files left by guard <= 0.10 (the Laya model is no longer used)
     models = guard_home() / "models"
     if models.is_dir():
         size_mb = sum(f.stat().st_size for f in models.rglob("*") if f.is_file()) / (1024 * 1024)

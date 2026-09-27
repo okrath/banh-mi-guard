@@ -167,3 +167,10 @@ def _unused_subroutine():
     assert "DEAD-001" in rule_ids
     assert "DEAD-002" in rule_ids
     assert "DEAD-003" in rule_ids
+
+
+def test_documentation_is_never_an_orphan(tmp_path):
+    from guard.core.hygiene_engine import HygieneEngine
+    engine = HygieneEngine(tmp_path)
+    for doc in ("plans/2026-x/phase-01.md", "docs/guide.rst", "NOTES.txt", "handbook/docs/a.mdx"):
+        assert engine.check_orphan_file(doc) is None, doc
