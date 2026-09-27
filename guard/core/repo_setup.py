@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -564,7 +565,25 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
                 else:
                     add("ok", "Invariants", f"{len(items) - unchecked}/{len(items)} invariants have automated checks")
 
-    # 4. Files left by guard <= 0.10 (the Laya model is no longer used)
+    # 4. Alibaba OCR: only `guard post --full` runs it
+    from guard.core.config import load_config, load_global_config
+    ocr_binary = load_config(repo or cwd).ocr.binary_path  # the config guard post uses here
+    if shutil.which(ocr_binary):
+        add("ok", "Alibaba OCR", f"{ocr_binary} found; guard post --full adds its review")
+    else:
+        add("warn", "Alibaba OCR", f"'{ocr_binary}' is not on PATH: guard post works, guard post --full (full review) cannot approve",
+            "npm install -g @alibaba-group/open-code-review   then: guard config sync")
+
+    # 5. Commit messages: the user decides who writes them (machine-wide)
+    cfg = load_global_config()
+    if cfg.commit_mode:
+        who = "the agent writes them" if cfg.commit_mode == "auto" else "the agent asks you for each one"
+        add("ok", "Commit messages", f"mode `{cfg.commit_mode}`: {who}")
+    else:
+        add("warn", "Commit messages", "not chosen yet: auto (the agent writes them) or ask (the agent asks you for each one)",
+            "guard config commit auto   (or: guard config commit ask)")
+
+    # 6. Files left by guard <= 0.10 (the Laya model is no longer used)
     models = guard_home() / "models"
     if models.is_dir():
         size_mb = sum(f.stat().st_size for f in models.rglob("*") if f.is_file()) / (1024 * 1024)

@@ -5,6 +5,7 @@ version: every gap an older installation can have, with the command that fixes i
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
@@ -43,7 +44,8 @@ def test_old_install_reports_what_is_missing_and_how_to_fix(fake_machine, tmp_pa
 def test_complete_install_reports_ok(fake_machine, tmp_path):
     repo = make_repo(tmp_path / "app")
     install_global(repo)  # also sets the repository up (invariants file)
-    levels = {r["item"]: r["level"] for r in setup_health(repo)}
+    with patch("guard.core.repo_setup.shutil.which", return_value="ocr"):
+        levels = {r["item"]: r["level"] for r in setup_health(repo)}
     assert levels["Git hooks"] == "ok"
     assert levels["Agent directives"] == "ok"
     assert "missing" not in levels.values()
@@ -107,3 +109,38 @@ def test_doctor_shows_the_setup_table(fake_machine, tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Installation & Repository Setup" in result.output
     assert "MISSING" in result.output and "guard install" in result.output
+
+
+def test_commit_mode_is_asked_until_chosen(fake_machine, tmp_path):
+    repo = make_repo(tmp_path / "app")
+    rows = by_item(setup_health(repo))
+    assert rows[("Commit messages", "warn")]["fix"] == "guard config commit auto   (or: guard config commit ask)"
+
+    result = CliRunner().invoke(app, ["config", "commit", "ask"])
+    assert result.exit_code == 0
+    rows = by_item(setup_health(repo))
+    assert "mode `ask`" in rows[("Commit messages", "ok")]["detail"]
+    assert CliRunner().invoke(app, ["config", "commit", "sometimes"]).exit_code == 1
+
+
+def test_missing_ocr_is_reported_with_the_install_command(fake_machine, tmp_path):
+    repo = make_repo(tmp_path / "app")
+    with patch("guard.core.repo_setup.shutil.which", return_value=None):
+        rows = by_item(setup_health(repo))
+    assert rows[("Alibaba OCR", "warn")]["fix"].startswith("npm install -g @alibaba-group/open-code-review")
+
+
+def test_install_shows_what_is_left_to_choose(fake_machine, tmp_path, monkeypatch):
+    repo = make_repo(tmp_path / "app")
+    monkeypatch.chdir(repo)
+    from guard.cli import console
+    monkeypatch.setattr(console, "width", 250)  # keep table cells on one line
+    result = CliRunner().invoke(app, ["install"])
+    assert result.exit_code == 0
+    assert "Commit messages" in result.output and "guard config commit auto" in result.output
+
+    # Once chosen, install no longer asks (only what is left to choose is listed); doctor still shows it
+    assert CliRunner().invoke(app, ["config", "commit", "auto"]).exit_code == 0
+    assert "Commit messages" not in CliRunner().invoke(app, ["install"]).output
+    doctor = CliRunner().invoke(app, ["doctor", "--no-updates"])
+    assert "Commit messages" in doctor.output and "mode `auto`" in doctor.output

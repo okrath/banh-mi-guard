@@ -27,3 +27,10 @@ def isolate_global_guard_config(tmp_path_factory):
     with patch("guard.core.config.get_global_config_path", return_value=dummy_config), \
          patch("guard.core.session.SessionManager._get_global_active_session_file", return_value=dummy_session):
         yield
+
+
+@pytest.fixture(autouse=True)
+def fake_ocr_review():
+    """guard post never calls the real Alibaba OCR in tests; tests of the runner call it directly."""
+    with patch("guard.cli.run_ocr_review", return_value=("complete: 0 finding(s) (test double)", [])) as fake:
+        yield fake

@@ -30,11 +30,18 @@ from rich.panel import Panel
 from rich.table import Table
 
 from guard import __app_name__, __version__
-from guard.core.config import get_global_config_path, get_local_config_path, load_config, print_config_table
+from guard.core.config import (
+    get_global_config_path,
+    get_local_config_path,
+    load_config,
+    load_global_config,
+    print_config_table,
+    save_config,
+)
 from guard.core.invariant_eval import DomainType, evaluate_invariants
 from guard.core.hygiene_engine import HygieneEngine
 from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
-from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner, RuleViolation
+from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner, RuleViolation, run_ocr_review
 from guard.core.removal_check import check_removed_symbols
 from guard.core.repo_setup import (
     ensure_repo_setup,
@@ -288,6 +295,7 @@ def execute_post_task(
     auto_fix: bool = False,
     focus: str = "all",
     hook: bool = False,
+    full: bool = False,
 ) -> bool:
     target_repo = Path(repo_path or Path.cwd()).resolve()
     for msg in ensure_repo_setup(target_repo, create_invariants=not hook):
@@ -435,6 +443,26 @@ def execute_post_task(
     else:
         simplicity_violations = simplicity.scan_diff_level(task_diff, task_summary)
     violations.extend(simplicity_violations)
+
+    # Alibaba OCR (an LLM review that reads the repository) runs only for a full review (--full, never
+    # in a Git hook); then OCR not running blocks like a HIGH finding. Without it the report says so.
+    ocr_status = "not run (optional: guard post --full adds it)"
+    if full and not hook and not task_diff.strip():
+        ocr_status = "skipped: no changes"
+    elif full and not hook:
+        console.print("[cyan]🔎 Alibaba OCR is reviewing the changes (no time limit; it ends when OCR finishes or reports an error, Ctrl+C stops it)...[/cyan]")
+        ocr_status, ocr_violations = run_ocr_review(
+            target_repo,
+            base_ref=pre.base_ref if pre else None,
+            background=pre.prompt if pre else "Post-task verification",
+            skip_files=preexisting_files,
+            binary=config.ocr.binary_path,
+            concurrency=config.ocr.concurrency,
+        )
+        violations.extend(ocr_violations)
+
+    evidence.append(f"Alibaba OCR review: {ocr_status}")
+
     # 3. Deterministic Build Check (0 token)
     build_cmd = detect_build_command(target_repo)
     build_res: Optional[BuildCheckResult] = None
@@ -565,6 +593,8 @@ def execute_post_task(
         ),
         learned_invariants=learned,
         rejected_invariant_proposals=rejected_props,
+        ocr_status=ocr_status,
+        commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
 
     session_mgr.complete_post_session(post_rec)
@@ -623,11 +653,12 @@ def post_cmd(
     auto_fix: bool = typer.Option(False, "--auto-fix", help="Trigger self-healing suggestions"),
     focus: str = typer.Option("all", "--focus", "-f", help="Quality pillar focus: 'all', 'security', 'memory', 'performance', 'ux', 'dead-code', 'simplicity'"),
     hook: bool = typer.Option(False, "--hook", help="Git-hook mode: skip when this repository has no guard session"),
+    full: bool = typer.Option(False, "--full", help="Full review: also run the Alibaba OCR review (minutes, no time limit); OCR failing or a high/critical finding blocks"),
 ):
     """
     Run Post-Task Guard: diff audit, build checks, invariant checks & LLM final verification.
     """
-    passed = execute_post_task(repo_path=Path(repo) if repo else None, auto_fix=auto_fix, focus=focus, hook=hook)
+    passed = execute_post_task(repo_path=Path(repo) if repo else None, auto_fix=auto_fix, focus=focus, hook=hook, full=full)
     if not passed:
         raise typer.Exit(code=1)
 
@@ -799,11 +830,28 @@ def config_sync_cmd(
     """
     from guard.core.config import sync_to_alibaba_ocr
     cfg = load_config(Path(repo) if repo else None)
-    synced, msg = sync_to_alibaba_ocr(cfg.llm)
+    synced, msg = sync_to_alibaba_ocr(cfg.llm, cfg.ocr.binary_path)
     if synced:
         console.print(f"[bold green]✅ {msg}[/bold green]")
     else:
         console.print(f"[yellow]⚠️ {msg}[/yellow]")
+
+
+@config_app.command("commit")
+def config_commit_cmd(
+    mode: str = typer.Argument(..., help="auto: the agent writes commit messages; ask: the agent asks you for each one"),
+):
+    """
+    Choose who writes commit messages for approved work (machine-wide, ~/.guard/config.json).
+    """
+    if mode not in ("auto", "ask"):
+        console.print("[bold red]❌ The mode is `auto` or `ask`.[/bold red]")
+        raise typer.Exit(code=1)
+    cfg = load_global_config()
+    cfg.commit_mode = mode
+    path = save_config(cfg)
+    who = "the agent writes commit messages" if mode == "auto" else "the agent asks you for every commit message"
+    console.print(f"[bold green]✅ Commit mode `{mode}`: {who}.[/bold green] [dim]Saved to {path}[/dim]")
 
 
 def print_setup_health(cwd: Path, title: str, only_problems: bool = False) -> int:
@@ -848,9 +896,11 @@ def install_cmd(
     if workspace:
         _print_install(install_workspace(Path(workspace)))
         console.print("[bold green]✅ Guard active in this workspace only.[/bold green]")
-        return
-    _print_install(install_global(Path.cwd()))
-    console.print("[bold green]✅ Guard active on this machine. Agents read the directives; repositories set themselves up on first use.[/bold green]")
+    else:
+        _print_install(install_global(Path.cwd()))
+        console.print("[bold green]✅ Guard active on this machine. Agents read the directives; repositories set themselves up on first use.[/bold green]")
+    # What is still to be chosen or installed (e.g. the commit mode, Alibaba OCR)
+    print_setup_health(Path(workspace) if workspace else Path.cwd(), "🧩 guard setup check", only_problems=True)
 
 
 @app.command("uninstall")

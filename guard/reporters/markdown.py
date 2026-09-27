@@ -28,6 +28,41 @@ def gate_label(post: PostTaskRecord) -> str:
     return "LLM Gate" if post.review_mode == "llm_deep" else "Heuristic Gate (no LLM review)"
 
 
+COMMIT_INSTRUCTIONS = {
+    "auto": "Commit mode `auto`: write the commit message yourself (conventional commit describing the change; never mention guard, its gates or scores).",
+    "ask": "Commit mode `ask`: before committing, ask the user for the commit message and use it as given.",
+}
+
+
+def commit_instruction(post: PostTaskRecord) -> str:
+    """What the agent does before and for the commit; the choices are the user's (guard config commit, --full)."""
+    message = COMMIT_INSTRUCTIONS.get(post.commit_mode or "", (
+        "Commit mode not set: ask the user whether you write commit messages (`auto`) or they type them (`ask`), "
+        "then run `guard config commit auto` or `guard config commit ask`."
+    ))
+    if post.ocr_status.startswith("not run"):
+        # Approved by the gate alone: the user decides whether a full Alibaba OCR review comes first
+        message = (
+            "Before committing, ask the user whether they want a full review with Alibaba OCR first "
+            "(`guard post --full`, takes minutes). If yes, run it and follow its report; if no, this gate approval is enough. "
+            + message
+        )
+    return message
+
+
+def inert(text: str) -> str:
+    """
+    OCR output is written by an LLM that read the diff: shown as one line of inline code so it can
+    never add a report section, a link, HTML or an instruction to the report the agent reads.
+    """
+    flat = " ".join(str(text).split()).replace("`", "'")
+    return f"`{flat}`" if flat else "*(empty)*"
+
+
+def ocr_findings(post: PostTaskRecord) -> list:
+    return [v for v in post.rule_violations if v.rule_id.startswith("OCR-")]
+
+
 def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     """
     Generate standard Pre-Task Impact Note.
@@ -123,13 +158,13 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
 
     # Rule Violations (OCR, Hygiene & Simplicity)
     if post.rule_violations:
-        ocr_viols = [v for v in post.rule_violations if not v.rule_id.startswith("DEAD-") and not v.rule_id.startswith("LAZY-")]
+        rule_viols = [v for v in post.rule_violations if not v.rule_id.startswith(("DEAD-", "LAZY-", "OCR-"))]
         dead_viols = [v for v in post.rule_violations if v.rule_id.startswith("DEAD-")]
         lazy_viols = [v for v in post.rule_violations if v.rule_id.startswith("LAZY-")]
 
-        if ocr_viols:
-            md.append("\n* **Alibaba OCR Rulebook Alerts:**")
-            for v in ocr_viols:
+        if rule_viols:
+            md.append("\n* **Built-in Rulebook Alerts:**")
+            for v in rule_viols:
                 md.append(f"  - `[{v.severity}]` **{v.rule_id}**: {v.message} at `{v.file_path}`")
 
         if dead_viols:
@@ -141,6 +176,12 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
             md.append("\n* **Engineering Frugality & Simplicity Alerts (KISS / YAGNI):**")
             for v in lazy_viols:
                 md.append(f"  - `[{v.severity}]` **{v.rule_id}**: {v.message} at `{v.file_path}`")
+
+    if post.ocr_status:
+        md.append(f"\n* **Alibaba OCR Review:** {inert(post.ocr_status)}")
+        for v in ocr_findings(post):
+            loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
+            md.append(f"  - `[{v.severity}]` {inert(v.rule_id)} at {inert(loc)}: {inert(v.message)}")
 
     if post.invariant_result:
         md.append("\n* **Invariant Verification (deterministic checks):**")
@@ -158,10 +199,15 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         md.append(f"  - ⚠️ *LLM review did not run:* {post.llm_error}")
 
     if post.learned_invariants or post.rejected_invariant_proposals:
-        md.append("\n* **Invariants learned in this review (`guard.invariants.json`):**")
+        md.append("\n* **Invariants learned in this review (`.guard/invariants.json`, local):**")
         for i in post.learned_invariants:
             md.append(f"  - ➕ `{i}` added (passes on the current code; enforced from the next `guard pre`)")
         for r in post.rejected_invariant_proposals:
             md.append(f"  - ✖️ proposal not added: {r}")
+
+    if post.all_passed:
+        md.append(f"\n* **Commit:** {commit_instruction(post)}")
+    else:
+        md.append(f"\n* **Commit:** nothing to commit until the gate approves (commit mode: `{post.commit_mode or 'not set'}`).")
 
     return "\n".join(md)

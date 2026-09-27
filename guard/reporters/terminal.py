@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from guard.core.session import PostTaskRecord, PreTaskRecord
-from guard.reporters.markdown import gate_label
+from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
 
 console = Console()
 
@@ -137,12 +137,12 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
 
     # Rule Violations (OCR, Code Hygiene & Simplicity)
     if post.rule_violations:
-        ocr_viols = [v for v in post.rule_violations if not v.rule_id.startswith("DEAD-") and not v.rule_id.startswith("LAZY-")]
+        ocr_viols = [v for v in post.rule_violations if not v.rule_id.startswith(("DEAD-", "LAZY-", "OCR-"))]
         dead_viols = [v for v in post.rule_violations if v.rule_id.startswith("DEAD-")]
         lazy_viols = [v for v in post.rule_violations if v.rule_id.startswith("LAZY-")]
 
         if ocr_viols:
-            viol_table = Table(title="🚨 Alibaba OCR Rulebook Violations", show_header=True, header_style="bold red")
+            viol_table = Table(title="🚨 Built-in Rulebook Violations", show_header=True, header_style="bold red")
             viol_table.add_column("Rule ID", style="bold red", width=10)
             viol_table.add_column("Severity", width=10)
             viol_table.add_column("Location")
@@ -177,11 +177,23 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
                 simplicity_table.add_row(v.rule_id, v.severity, loc, v.message)
             console.print(simplicity_table)
 
+    if post.ocr_status:
+        style = "red" if post.ocr_status.startswith("did not run") else "cyan"
+        console.print(f"[bold {style}]🔎 Alibaba OCR review:[/bold {style}] ", end="")
+        console.print(post.ocr_status, markup=False)
+        for v in ocr_findings(post):
+            loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
+            console.print(f"  [{v.severity}] {v.rule_id} {loc}: {v.message}", markup=False)
+
     for i in post.learned_invariants:
-        console.print(f"[bold green]➕ Learned invariant {i} → guard.invariants.json (enforced from next guard pre)[/bold green]")
+        console.print(f"[bold green]➕ Learned invariant {i} → .guard/invariants.json (enforced from next guard pre)[/bold green]")
     for r in post.rejected_invariant_proposals:
         console.print(f"[dim]✖️ Invariant proposal not added: {r}[/dim]")
 
     if post.diff_summary:
         net = post.diff_summary.total_insertions - post.diff_summary.total_deletions
         console.print(f"[dim]Net change: {net:+d} LOC (informational, not scored).[/dim]")
+
+    if post.all_passed:
+        console.print("[bold cyan]📝 Commit:[/bold cyan] ", end="")
+        console.print(commit_instruction(post), markup=False)

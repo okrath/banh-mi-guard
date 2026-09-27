@@ -92,6 +92,8 @@ class PostTaskRecord(BaseModel):
     approved_fingerprints: Dict[str, str] = Field(default_factory=dict)
     learned_invariants: List[str] = Field(default_factory=list)  # ids the LLM added to guard.invariants.json
     rejected_invariant_proposals: List[str] = Field(default_factory=list)
+    ocr_status: str = ""  # "complete: N finding(s) ..." or "did not run: <reason>"
+    commit_mode: Optional[str] = None  # "auto" | "ask" | None (not chosen yet)
 
 
 class GuardSession(BaseModel):
@@ -276,9 +278,16 @@ class SessionManager:
     def _archive(self, session: GuardSession) -> Path:
         history = self.guard_dir / "history"
         history.mkdir(parents=True, exist_ok=True)
-        archived = history / f"{session.session_id}.json"
-        archived.write_text(session.model_dump_json(indent=2), encoding="utf-8")
-        return archived
+        content = session.model_dump_json(indent=2)
+        n = 0
+        while True:  # ids have 1 s resolution: never overwrite an earlier record, even under concurrent runs
+            archived = history / (f"{session.session_id}.json" if n == 0 else f"{session.session_id}-{n}.json")
+            try:
+                with open(archived, "x", encoding="utf-8") as f:  # exclusive create reserves the name
+                    f.write(content)
+                return archived
+            except FileExistsError:
+                n += 1
 
     def clear(self):
         if self.session_file.exists():

@@ -25,7 +25,6 @@ from guard.core.llm_client import call_llm
 from guard.core.ocr_engine import DiffSummary, RuleViolation
 from guard.core.session import BuildCheckResult, DomainContract, LockedInvariant
 
-REVIEW_MIN_TIMEOUT_S = 180.0
 REVIEW_BATCH_CHARS = 80000
 REVIEW_MAX_BATCHES = 6
 FORMAT_REMINDER = (
@@ -240,6 +239,8 @@ class LLMReviewerEngine:
             or (diff_summary is not None and bool(diff_summary.out_of_scope_files))
             or hygiene_blocked
             or simplicity_blocked
+            # Alibaba OCR not running, or reporting a high/critical finding, blocks
+            or any(v.rule_id.startswith("OCR-") and v.severity in ("HIGH", "CRITICAL") for v in violations)
         )
         verdict = ReviewVerdict.APPROVED if (score >= 7.5 and not is_hard_blocked) else ReviewVerdict.REVISE
 
@@ -359,8 +360,9 @@ Verified evidence (computed by guard over the whole repository, valid for every 
 {evidence_info}
 """
 
-        # llm.timeout is tuned for `guard config test` pings; a full diff review needs far longer
-        review_cfg = self.config.llm.model_copy(update={"timeout": max(self.config.llm.timeout, REVIEW_MIN_TIMEOUT_S)})
+        # No time limit on a review: it ends when the LLM answers or its provider returns an error.
+        # llm.timeout is only for `guard config test` pings.
+        review_cfg = self.config.llm.model_copy(update={"timeout": None})
 
         # A large diff is reviewed in parts instead of being truncated, so no change goes unreviewed.
         batches = self._prepare_diff_batches(diff_summary)
@@ -413,7 +415,8 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             return ["No diff"]
         # Filter out asset files, binary/data files, and large non-code JSON tables
         code_chunks = []
-        for c in diff_summary.raw_diff.split("diff --git "):
+        # File headers start a line; "diff --git " inside a changed line (a test fixture, a doc) is content
+        for c in re.split(r"(?m)^diff --git ", diff_summary.raw_diff):
             if not c.strip():
                 continue
             first_line = c.splitlines()[0] if c.splitlines() else ""
@@ -426,9 +429,12 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                 head = chunk.split("\n@@", 1)[0]
                 removed = sum(1 for line in chunk.splitlines() if line.startswith("-") and not line.startswith("---"))
                 chunk = f"{head}\n[file deleted: {removed} lines removed; content omitted]\n"
-            # A single oversized file is split too, never cut off
-            for k in range(0, len(chunk), REVIEW_BATCH_CHARS):
-                code_chunks.append(chunk[k:k + REVIEW_BATCH_CHARS])
+            # A single oversized file is split too, never cut off; every piece names its file
+            prefix = f"{chunk.splitlines()[0]}\n[continued: next part of this file's diff]\n"
+            code_chunks.append(chunk[:REVIEW_BATCH_CHARS])
+            step = max(1, REVIEW_BATCH_CHARS - len(prefix))  # the prefix counts toward the part limit
+            for k in range(REVIEW_BATCH_CHARS, len(chunk), step):
+                code_chunks.append(prefix + chunk[k:k + step])
         if not code_chunks:
             return ["No code diff (only lockfiles/assets changed)"]
         batches, current = [], ""

@@ -4,16 +4,19 @@ Provides:
 1. Deterministic Git Diff Parsing (added/modified/deleted files, +/- line counts)
 2. Blast Radius & Out-of-Scope File Audit
 3. Built-in Multi-Language OCR Rulebook Runner (Secrets, NPE, Memory Leaks, SQLi, XSS, Sync I/O)
-4. Subprocess Bridge to Alibaba OCR CLI (`ocr review`)
+4. Alibaba OCR CLI review (`ocr review`, LLM-based) of the task's changes
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -43,15 +46,6 @@ class RuleViolation(BaseModel):
     line_number: Optional[int] = None
     message: str
     snippet: str = ""
-
-
-class OCRReviewResult(BaseModel):
-    success: bool
-    summary: DiffSummary
-    violations: List[RuleViolation] = Field(default_factory=list)
-    ocr_cli_output: Optional[str] = None
-    passed_all_rules: bool = True
-    error_message: Optional[str] = None
 
 
 class GitDiffInspector:
@@ -207,6 +201,34 @@ class GitDiffInspector:
             return sha
         except Exception:
             return None
+
+    def snapshot_worktree(self) -> Optional[str]:
+        """
+        Commit object (parent HEAD) of the whole working tree, untracked files included and
+        ignored ones (.guard/) left out, built in a throwaway index: the user's index, working
+        tree and refs are not touched. None without a HEAD commit.
+        """
+        head = self.get_head()
+        if not head:
+            return None
+        fd, index = tempfile.mkstemp(prefix="guard-index-")
+        os.close(fd)
+        env = {**os.environ, "GIT_INDEX_FILE": index}
+        git = ["git", "-C", str(self.repo_path)]
+        try:
+            for args in (["read-tree", head], ["add", "-A"]):
+                if subprocess.run(git + args, env=env, capture_output=True, check=False).returncode != 0:
+                    return None
+            tree = subprocess.run(git + ["write-tree"], env=env, capture_output=True, text=True, check=False).stdout.strip()
+            ident = {"GIT_AUTHOR_NAME": "guard", "GIT_AUTHOR_EMAIL": "guard@localhost",
+                     "GIT_COMMITTER_NAME": "guard", "GIT_COMMITTER_EMAIL": "guard@localhost"}
+            res = subprocess.run(git + ["commit-tree", tree, "-p", head, "-m", "guard review snapshot"],
+                                 env={**os.environ, **ident}, capture_output=True, text=True, check=False)
+            return res.stdout.strip() or None
+        except OSError:
+            return None
+        finally:
+            Path(index).unlink(missing_ok=True)
 
     def get_head(self) -> Optional[str]:
         try:
@@ -513,54 +535,171 @@ class OCRRulebookRunner:
         return violations
 
 
-def run_ocr_audit(
-    repo_path: Optional[Path] = None,
-    expected_files: Optional[List[str]] = None,
-    background_context: Optional[str] = None,
-) -> OCRReviewResult:
+OCR_SEVERITY = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "LOW"}
+# Terminal statuses OCR reports as a successful review (its IDE extension treats completed_with_errors,
+# partial and failed as failures, and so does guard, together with any status it does not know)
+OCR_SUCCESS = {"success", "complete", "completed_with_warnings", "skipped"}
+OCR_REQUEST_TIMEOUT_S = 10 * 365 * 24 * 3600
+
+
+def _complete(data: dict, returncode: int = 0) -> bool:
+    """
+    A successful status, exit code 0 and coverage evidence that every file OCR selected was reviewed
+    (completed, reused or waived) and none failed: a warning status can still list failed files.
+    A result without readable coverage (manifest.coverage) is not accepted as a review.
+    """
+    manifest = data.get("manifest")
+    coverage = manifest.get("coverage") if isinstance(manifest, dict) else None
+    status = data.get("status")
+    if status == "skipped" and returncode == 0:  # OCR reviewed nothing on purpose; reported as skipped
+        return True
+    if not isinstance(coverage, dict):
+        return False
+    # "selected" and "completed" must be present: a missing list is no evidence, not an empty one
+    if not all(isinstance(coverage.get(k), list) for k in ("selected", "completed")):
+        return False
+    lists = {k: coverage.get(k) or [] for k in ("selected", "completed", "reused", "waived", "failed")}
+    if not lists["selected"]:  # a review of a non-empty diff selected nothing
+        return False
+
+    def valid_item(i):  # every coverage entry must say which item it is
+        return isinstance(i, dict) and isinstance(i.get("item_id") or i.get("path"), str)
+
+    if not all(isinstance(v, list) and all(valid_item(i) for i in v) for v in lists.values()):
+        return False
+
+    def ids(items):
+        return {i.get("item_id") or i.get("path") for i in items}
+
+    reviewed = ids(lists["completed"]) | ids(lists["reused"]) | ids(lists["waived"])
+    return (returncode == 0 and isinstance(status, str) and status in OCR_SUCCESS
+            and not lists["failed"] and ids(lists["selected"]) <= reviewed)
+
+
+def run_ocr_review(
+    repo_path: Path,
+    base_ref: Optional[str],
+    background: str,
+    skip_files: Optional[List[str]] = None,
+    binary: str = "ocr",
+    concurrency: int = 0,
+) -> Tuple[str, List[RuleViolation]]:
+    """
+    Review the task's changes with Alibaba OCR (`ocr review`, an LLM review) and return
+    (status line, violations). The range is base_ref..snapshot of the working tree, so mid-task
+    commits, unstaged and untracked files are all reviewed. OCR not running is an OCR-RUN HIGH
+    violation, never a silent pass. There is no time limit: AI review takes as long as it takes, it
+    ends when OCR finishes or reports the provider's error, and only the user stops it (Ctrl+C). Findings on `skip_files` (pre-existing changes) are dropped.
+    """
+    def failed(reason: str) -> Tuple[str, List[RuleViolation]]:
+        reason = reason.rstrip(". ")
+        return f"did not run: {reason}", [RuleViolation(
+            rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)",
+            message=f"Alibaba OCR review did not run: {reason}. Fix the cause above (for a provider or configuration error: guard config sync, then ocr llm test) and run guard post --full again.",
+        )]
+
+    ocr_bin = shutil.which(binary)
+    if not ocr_bin:
+        return failed(f"'{binary}' not found on PATH (npm install -g @alibaba-group/open-code-review)")
     inspector = GitDiffInspector(repo_path)
-    raw_diff = inspector.get_diff() or ""
-    summary = inspector.parse_diff(raw_diff, expected_files=expected_files)
+    snapshot = inspector.snapshot_worktree()
+    # Without the exact base..current range OCR would review only its default diff and miss the
+    # task's commits: that is not a review of the task. Only a repository without any commit yet
+    # (everything uncommitted) is fully covered by OCR's workspace mode.
+    if base_ref and not snapshot:
+        return failed("the working tree could not be snapshotted, so base..current changes cannot be reviewed")
+    if not base_ref and inspector.get_head():
+        return failed("no base commit was recorded at pre, so the task's commits cannot be reviewed")
+    # OCR diffs from the merge-base: after a rebase or reset past the base it would review another change set
+    if base_ref and snapshot and subprocess.run(
+        ["git", "-C", str(repo_path), "merge-base", "--is-ancestor", base_ref, snapshot], capture_output=True, check=False,
+    ).returncode != 0:
+        return failed("the base commit recorded at pre is no longer an ancestor of the working tree (history was rewritten)")
+    guard_dir = repo_path / ".guard"
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    # Each run writes its own file (concurrent posts never read each other's result); the last one
+    # is kept as .guard/ocr-review.json for inspection
+    fd, name = tempfile.mkstemp(dir=guard_dir, prefix="ocr-review-", suffix=".json")
+    os.close(fd)
+    out_file = Path(name)
+    try:
+        return _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed)
+    finally:
+        if out_file.exists():
+            os.replace(out_file, guard_dir / "ocr-review.json")
 
-    rulebook = OCRRulebookRunner()
-    violations = rulebook.scan_diff(raw_diff)
 
-    for oos in summary.out_of_scope_files:
-        violations.append(RuleViolation(
-            rule_id="SCOPE-001",
-            severity="HIGH",
-            file_path=oos,
-            line_number=None,
-            message="Out-of-scope file modified. Not declared in Pre-Task Impact Note.",
-            snippet=f"File: {oos}",
-        ))
+def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed):
+    # --timeout 0: OCR's own per-group limit (15 min by default) is off. Its per-request HTTP limit
+    # cannot be switched off (0 means its 300 s default), so it is set to ten years: no limit in practice.
+    cmd = [ocr_bin, "review", "--repo", str(repo_path), "--format", "json", "--audience", "agent",
+           "--color", "never", "-o", str(out_file), "--background", background, "--timeout", "0"]
+    env = {**os.environ, "OCR_LLM_TIMEOUT": str(OCR_REQUEST_TIMEOUT_S)}  # never a shorter value from the environment
+    ranged = bool(base_ref and snapshot)
+    if ranged:
+        cmd += ["--from", base_ref, "--to", snapshot]
+    if concurrency > 0:
+        cmd += ["--concurrency", str(concurrency)]
 
-    passed_all = len([v for v in violations if v.severity in ["CRITICAL", "HIGH"]]) == 0
-
-    ocr_bin = shutil.which("ocr")
-    ocr_output: Optional[str] = None
-    if ocr_bin and raw_diff.strip():
+    data: dict = {}
+    for attempt in range(2):
+        # A partial review (the provider failed on some files) is resumed once: only failed items rerun
+        sid = data.get("session_id") if attempt else None
+        resume = ["--resume", sid] if isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid) else []
+        # OCR refuses --resume without --from/--to ("workspace resume is not supported"), so only a
+        # ranged review is resumed; an unresumable partial review stays a blocking OCR-RUN
+        if attempt and not (ranged and resume):
+            break
+        out_file.unlink(missing_ok=True)
         try:
-            cmd = [ocr_bin, "review"]
-            if background_context:
-                cmd.extend(["--background", background_context])
-            res = subprocess.run(
-                cmd,
-                cwd=str(repo_path or Path.cwd()),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=45,
-            )
-            ocr_output = (res.stdout or "") + (res.stderr or "")
-        except Exception as e:
-            ocr_output = f"OCR CLI notice: {str(e)}"
-
-    return OCRReviewResult(
-        success=True,
-        summary=summary,
-        violations=violations,
-        ocr_cli_output=ocr_output,
-        passed_all_rules=passed_all,
-    )
+            # The result goes to out_file; stdout is not kept, stderr only for the failure reason
+            res = subprocess.run(cmd + resume, cwd=str(repo_path), env=env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        except OSError as e:
+            return failed(str(e))
+        try:
+            data = json.loads(out_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            tail = (res.stderr or "").strip()[-300:]
+            return failed(f"exit code {res.returncode}, no JSON result ({tail or 'no output'})")
+        # "comments" must be present: a list of findings, or null (OCR writes null when there are none)
+        if not isinstance(data, dict) or "comments" not in data or not isinstance(data["comments"] or [], list):
+            return failed("OCR returned a result guard cannot read (unexpected JSON shape)")
+        if _complete(data, res.returncode):
+            break
+    skip = set(skip_files or [])
+    violations = []
+    dropped = 0
+    for c in data.get("comments") or []:
+        line_no = c.get("start_line") if isinstance(c, dict) else None
+        if (not isinstance(c, dict) or not isinstance(c.get("path"), (str, type(None)))
+                or not (line_no is None or (isinstance(line_no, int) and not isinstance(line_no, bool)))):
+            return failed("OCR returned a finding guard cannot read (unexpected JSON shape)")
+        if c.get("path") in skip:  # dirty before pre and not touched by this task since
+            dropped += 1
+            continue
+        raw = str(c.get("severity") or "").lower()
+        message = str(c.get("content") or "").strip()[:600]
+        if raw not in OCR_SEVERITY:  # a finding without a known severity is not assumed harmless
+            message = f"(OCR gave no known severity: {raw or 'none'}) {message}"
+        violations.append(RuleViolation(
+            rule_id=f"OCR-{str(c.get('category') or 'finding').upper()}",
+            severity=OCR_SEVERITY.get(raw, "HIGH"),
+            file_path=c.get("path") or "(unknown)",
+            line_number=c.get("start_line"),
+            message=message,
+            snippet=str(c.get("existing_code") or "")[:120],
+        ))
+    status = data.get("status")
+    if not _complete(data, res.returncode):  # partial, failed, with errors or unknown: blocks, but findings are still reported
+        line, run_violation = failed(str(data.get("message") or f"status {status}"))
+        return line, run_violation + violations
+    if status == "skipped":
+        return "complete: OCR reported status skipped (it reviewed no file)", violations
+    llm = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+    note = f"; {dropped} finding(s) dropped: on files dirty before pre and unchanged by this task" if dropped else ""
+    # Coverage is the evidence of a finished review; failed tool calls while exploring are only shown
+    tool_calls = data.get("tool_calls") if isinstance(data.get("tool_calls"), dict) else {}
+    if isinstance(tool_calls.get("failure"), int) and tool_calls["failure"] > 0:
+        note += f"; {tool_calls['failure']} of {tool_calls.get('total', '?')} OCR tool call(s) failed while exploring"
+    return f"complete: {len(violations)} finding(s) (model {llm.get('model', '?')}, status {status}){note}", violations

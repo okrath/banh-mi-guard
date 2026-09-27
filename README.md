@@ -20,7 +20,7 @@
 
 `guard` wraps coding workflows in an automated safety harness by uniting three distinct pillars:
 1. **Deterministic gates** (0 token): declared scope, base-commit diff audit, build/test command, project invariants (`guard.invariants.json`) and removed-symbol reference checks
-2. **Alibaba Open Code Review - OCR** (Deterministic git diff blast-radius & static rules engine, 0-cost)
+2. **Alibaba Open Code Review - OCR** (optional full review: `guard post --full` adds an LLM code review of the task's changes that reads the repository; it uses your configured LLM, costs tokens and takes minutes)
 3. **Your Configured LLM** (Claude, GPT, DeepSeek, Ollama...): Acting as the Architectural Brain & **Final Safety Gatekeeper**.
 
 Automates and enforces the rigorous **Impact & Regression Protocol** pioneered in `oh-my-ainovel`.
@@ -33,7 +33,7 @@ Automates and enforces the rigorous **Impact & Regression Protocol** pioneered i
 > Just like a crisp Vietnamese Bánh Mì, `guard` sandwiches code modifications between two protective crusts:
 > * **Top Crust (`guard pre`):** Scope declaration, baseline snapshot, invariant locking & domain contract extraction.
 > * **Core Filling (Developer / AI Agent edits):** Safe, scoped code implementation within contract boundaries.
-> * **Bottom Crust (`guard post`):** Deterministic diff blast-radius audit, OCR static rulebook, project build/test command, `guard.invariants.json` checks, and LLM Gatekeeper approval.
+> * **Bottom Crust (`guard post`):** Deterministic diff blast-radius audit, built-in static rulebook, Alibaba OCR review (with `--full`), project build/test command, `guard.invariants.json` checks, and LLM Gatekeeper approval.
 
 ```text
                [User Task / Issue Prompt]
@@ -51,8 +51,9 @@ Automates and enforces the rigorous **Impact & Regression Protocol** pioneered i
                            │
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
-│ • OCR Inspector (0-cost): Diff audit & blast radius check   │
+│ • Diff Inspector (0-cost): Diff audit & blast radius check  │
 │ • Static Rulebook: Detect Secrets, SQLi, Memory Leaks, NPE  │
+│ • Alibaba OCR (LLM, --full): Reviews the task's changes     │
 │ • Hygiene Engine (0-cost): Detects orphan files & dead code │
 │ • Project Health Check: Automated compile & test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
@@ -106,8 +107,8 @@ pip install -e .
 
 **No model download.** Earlier versions shipped the "Laya" neural triage (a 554 MB ONNX model plus numpy, onnxruntime and tokenizers). It only produced informational domain / intent / risk guesses, never changed a gate decision, and scored at chance level, so it was removed in 0.11. If `~/.guard/models` exists from an older version, it can be deleted.
 
-### Optional: Install Alibaba OCR CLI
-`guard` bundles a built-in deterministic diff inspector and multi-language rules engine (0-cost). If you also want to enable the official Alibaba OCR CLI tool:
+### Optional: Install Alibaba OCR CLI (for full reviews)
+`guard post --full` adds an Alibaba OCR review and cannot approve without it; plain `guard post` does not need it:
 ```bash
 npm install -g @alibaba-group/open-code-review
 ```
@@ -121,7 +122,7 @@ guard doctor
 
 ## ⚙️ LLM Configuration & OCR Auto-Sync
 
-Configure your LLM credentials once; `guard` automatically synchronizes settings with the Alibaba OCR CLI:
+Configure your LLM credentials once; `guard` writes them into the Alibaba OCR CLI as the custom provider `guard` (same URL, protocol, key and model), so OCR reviews with the same LLM. OCR keeps that key in plain text in its own configuration file (`~/.opencodereview/config.json`), as guard does in `~/.guard/config.json`. `guard config llm --local` does not touch OCR, because OCR's settings apply to the whole machine; run `guard config sync --repo <repository>` if that repository's LLM should serve OCR. `guard config sync` repeats that step, and `ocr llm test` checks it:
 
 ```bash
 guard config llm
@@ -286,9 +287,13 @@ guard post --focus dead-code
 # Deep focus on KISS, YAGNI & over-engineering:
 guard post --focus simplicity
 ```
-*Output:* Inspects git diff, detects out-of-scope and deleted files, scans Alibaba OCR rules and code hygiene, executes the build command, runs invariant checks, and requests **Final Gate Approval from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
+*Output:* Inspects git diff, detects out-of-scope and deleted files, scans the built-in rules and code hygiene, runs the Alibaba OCR review (only with `--full`), executes the build command, runs invariant checks, and requests **Final Gate Approval from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
 
-The report names the gate that actually ran. It says "LLM Gate" only when the LLM answered. Otherwise it says "Heuristic Gate (no LLM review)" and records the reason (`llm_error`, `review_mode` in `.guard/session.json`), for example a timeout or a model that refused to review a part. A heuristic REVISE (failed build, violated invariant, CRITICAL rule, out-of-scope file, or a score below 7.5) is final; otherwise the LLM decides. Large diffs are reviewed in parts of up to 80k characters (one REVISE rejects the whole diff); deleted files are sent as a one-line note; an answer that ignores the SCORE/VERDICT format is retried once. A review request waits at least 180 s, whatever `llm.timeout` is (that value is sized for `guard config test` pings). Deleting code earns no score bonus.
+The report names the gate that actually ran. It says "LLM Gate" only when the LLM answered. Otherwise it says "Heuristic Gate (no LLM review)" and records the reason (`llm_error`, `review_mode` in `.guard/session.json`), for example a timeout or a model that refused to review a part. A heuristic REVISE (failed build, violated invariant, CRITICAL rule, out-of-scope file, with `--full` an OCR review that did not run or a high/critical OCR finding, or a score below 7.5) is final; otherwise the LLM decides. Large diffs are reviewed in parts of up to 80k characters (one REVISE rejects the whole diff); deleted files are sent as a one-line note; an answer that ignores the SCORE/VERDICT format is retried once. A review request has no time limit: AI review takes as long as it takes, and it ends when the LLM answers or its provider returns an error (`llm.timeout` applies only to `guard config test` pings). Deleting code earns no score bonus.
+
+**Alibaba OCR review (`guard post --full`).** OCR is optional: a plain `guard post` does not run it and the report says "Alibaba OCR: not run". When a plain `guard post` is approved, the report tells the agent to ask you before committing whether you want a full review with OCR: say yes and it runs `guard post --full`, say no and the gate approval is enough. Asking for a full review at any time also runs it; Git hooks never run it. With `--full`, guard runs `ocr review` from the base commit recorded at pre to a snapshot of the working tree, so commits made mid-task, unstaged edits and new files are all reviewed (the snapshot is a Git object built in a throwaway index; your index, working tree and branches are not touched). The task prompt is passed as `--background`. It takes minutes, not seconds, and has no time limit: guard passes `--timeout 0` and sets OCR's per-request limit, which OCR cannot switch off, to ten years (`OCR_LLM_TIMEOUT`, overriding a shorter value in the environment), so the review ends only when OCR finishes or reports the provider's error; Ctrl+C stops it. A high or critical OCR finding blocks (REVISE); medium and low findings are listed and passed to the LLM gate. OCR not running (not installed, a provider error, a partial review) is `OCR-RUN` (HIGH) and also blocks: the report says "did not run" with the reason, never a pass. Findings on files that were already dirty before pre and that the task left untouched are dropped, and the report counts them; a dirty file the task edits is reviewed like any other. A partial review (the provider failed on some files) is resumed once with `--resume`, so only the failed files run again. A gateway that drops parallel requests needs a lower `ocr.concurrency` in `~/.guard/config.json` (0 keeps OCR's default of 8).
+
+**Commit messages.** Who writes them is your choice, saved machine-wide: `guard config commit auto` lets the agent write them (a conventional message that never mentions guard), `guard config commit ask` makes the agent ask you for every one. The post report of approved work ends with a **Commit** line that tells the agent which mode is set; while none is set, it tells the agent to ask you which one you want. `guard install` and `guard doctor` show the choice as "Commit messages".
 
 Removals that a compiler cannot see are checked over the whole repository: every string key (`case 'edit':`), export and CSS class deleted by the diff is searched for. One that is no longer defined but still referenced raises `DEAD-REF` (HIGH) with the locations. The summary line goes into every LLM review part as verified evidence, so a batched review does not have to guess about references in another part.
 
@@ -352,6 +357,8 @@ Guard tells you what is still missing after an upgrade:
 | Repository agent doc has an older or unmarked guard section | update or remove it yourself (guard does not edit repository files) |
 | Guard directives without START/END markers | wrap the guard section as shown below, or delete it and run `guard install` |
 | No `guard.invariants.json` / invariants without checks | `guard invariants init`, then add checks and run `guard invariants check` |
+| Alibaba OCR not on PATH (needed only by `guard post --full`) | `npm install -g @alibaba-group/open-code-review`, then `guard config sync` |
+| Commit messages: not chosen yet | `guard config commit auto` (or `guard config commit ask`) |
 | Old Laya model files left by guard <= 0.10 | delete `~/.guard/models` |
 
 Markers that let guard refresh a pasted directive section:

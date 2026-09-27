@@ -12,7 +12,7 @@ from guard.cli import execute_post_task, execute_pre_task
 from guard.core.config import GuardConfig, LLMConfig
 from guard.core.invariant_eval import DomainType, evaluate_invariants
 from guard.core.llm_reviewer import LLMReviewerEngine
-from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner
+from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner, RuleViolation
 from guard.core.session import SessionManager
 
 
@@ -296,6 +296,61 @@ def test_new_pre_archives_the_finished_session_it_replaces(tmp_path):
     archived = repo / ".guard" / "history" / f"{finished.session_id}.json"
     assert archived.is_file()
     assert json.loads(archived.read_text(encoding="utf-8"))["status"] == finished.status.value
+
+
+def test_archives_never_overwrite_each_other(tmp_path):
+    repo = make_repo(tmp_path)
+    mgr = SessionManager(repo)
+    with patch("guard.core.session.time.time", return_value=1790000000):  # two sessions in the same second
+        for prompt in ("Fix src/chat.ts", "Fix src/other.ts"):
+            mgr.start_pre_session(prompt=prompt, expected_files=[], contracts=[], invariants=[])
+        mgr.archive_and_clear()
+    prompts = {json.loads(p.read_text(encoding="utf-8"))["pre"]["prompt"] for p in (repo / ".guard" / "history").glob("*.json")}
+    assert prompts == {"Fix src/chat.ts", "Fix src/other.ts"}
+
+
+def test_ocr_that_fails_or_finds_a_high_issue_blocks_post(tmp_path, fake_ocr_review):
+    repo = make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
+
+    fake_ocr_review.return_value = ("did not run: timed out after 900s", [
+        RuleViolation(rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)", message="Alibaba OCR review did not run")])
+    assert execute_post_task(repo_path=repo, full=True) is False
+    report = (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+    assert "**Alibaba OCR Review:** `did not run: timed out" in report and "nothing to commit until the gate approves" in report
+    assert fake_ocr_review.call_args.kwargs["background"] == "Fix src/chat.ts"
+
+    for severity in ("HIGH", "CRITICAL"):
+        assert execute_pre_task("Fix src/chat.ts", repo_path=repo, force=True) is True
+        fake_ocr_review.return_value = ("complete: 1 finding(s)", [
+            RuleViolation(rule_id="OCR-BUG", severity=severity, file_path="src/chat.ts", message="wrong endpoint")])
+        assert execute_post_task(repo_path=repo, full=True) is False, severity
+
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, force=True) is True
+    fake_ocr_review.return_value = ("complete: 0 finding(s)", [])
+    assert execute_post_task(repo_path=repo, full=True) is True
+    assert "Commit mode not set" in (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+
+
+def test_ocr_skips_only_dirty_files_the_task_left_untouched(tmp_path, fake_ocr_review):
+    repo = make_repo(tmp_path)
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/dirty'); }\n", encoding="utf-8")
+    (repo / "src" / "other.ts").write_text("export const x = 2;\n", encoding="utf-8")  # unrelated, stays as is
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is True
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
+    execute_post_task(repo_path=repo, full=True)
+    assert fake_ocr_review.call_args.kwargs["skip_files"] == ["src/other.ts"]  # chat.ts: dirty, but edited by the task
+
+
+def test_plain_post_does_not_run_ocr_and_says_so(tmp_path, fake_ocr_review):
+    repo = make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo) is True
+    fake_ocr_review.assert_not_called()
+    assert "**Alibaba OCR Review:** `not run (optional: guard post --full adds it)`" in (
+        repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
 
 
 def test_prompt_globs_do_not_widen_scope(tmp_path):

@@ -236,7 +236,7 @@
       </p>
       <div class="card">
         <strong>Before code is touched (Pre-Task):</strong> guard records the declared scope and a baseline snapshot, detects the repository domain, extracts existing baseline contracts, and locks the project invariants.<br><br>
-        <strong>After code is written (Post-Task):</strong> Alibaba Open Code Review (OCR) measures the exact diff blast radius and scans static rulebooks, the project build/test command runs, the invariant checks verify the locked rules, and <strong>your configured LLM</strong> issues the final authoritative verdict (<code>APPROVED</code> or <code>REVISE</code>).
+        <strong>After code is written (Post-Task):</strong> guard measures the exact diff blast radius and scans its static rulebook, on request (<code>guard post --full</code>) Alibaba Open Code Review (OCR) reviews the changes with your LLM (with <code>--full</code>, a high or critical finding, OCR not running or a review OCR did not complete blocks approval; lower findings are reported, and an OCR status of skipped is reported without blocking. A plain <code>guard post</code> reports OCR as "not run", which never blocks), the project build/test command runs, the invariant checks verify the locked rules, and <strong>your configured LLM</strong> issues the final authoritative verdict (<code>APPROVED</code> or <code>REVISE</code>).
       </div>
     </section>
 
@@ -257,8 +257,9 @@
                            │
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
-│ • OCR Inspector (0-cost): Diff audit &amp; blast radius check   │
+│ • Diff Inspector (0-cost): Diff audit &amp; blast radius check  │
 │ • Static Rulebook: Detect Secrets, SQLi, Memory Leaks, NPE  │
+│ • Alibaba OCR (LLM, --full): Reviews the task's changes     │
 │ • Project Health Check: Automated compile &amp; test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
 │ ➔ Compiles: "### 🧪 POST-TASK VERIFICATION"                 │
@@ -378,7 +379,7 @@ guard doctor</code></pre>
     <section id="llm-setup">
       <h2>5. LLM Setup Wizard &amp; Auto-Sync</h2>
       <p>
-        Run the interactive step-by-step wizard to configure your preferred LLM provider. Settings automatically synchronize to Alibaba OCR CLI:
+        Run the interactive step-by-step wizard to configure your preferred LLM provider. The settings are written into the Alibaba OCR CLI as its custom provider <code>guard</code>, so the optional OCR review that <code>guard post --full</code> adds uses the same LLM:
       </p>
       <pre><code>guard config llm</code></pre>
       <ul>
@@ -387,6 +388,8 @@ guard doctor</code></pre>
       </ul>
       <p>Test your connection with an instant sub-second verification ping:</p>
       <pre><code>guard config test</code></pre>
+      <p>Choose who writes commit messages for approved work: <code>auto</code> lets the agent write them, <code>ask</code> makes it ask you for each one. <code>guard doctor</code> always shows the choice as "Commit messages" (<code>guard install</code> lists it only while it is still unset), and an approved post report ends with a <strong>Commit</strong> line that tells the agent what to do.</p>
+      <pre><code>guard config commit auto</code></pre>
     </section>
 
     <section id="agent-automation">
@@ -435,7 +438,7 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
           <tr>
             <td><code>guard post</code></td>
             <td>Run Post-Task Guard: diff audit, rules, build, invariants, LLM final gate</td>
-            <td><code>--focus &lt;area&gt;</code>, <code>--hook</code></td>
+            <td><code>--focus &lt;area&gt;</code>, <code>--hook</code>, <code>--full</code></td>
           </tr>
           <tr>
             <td><code>guard run "&lt;prompt&gt;" -- &lt;cmd&gt;</code></td>
@@ -466,6 +469,16 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
             <td><code>guard config test</code></td>
             <td>Send instant token-free ping test to configured LLM</td>
             <td>—</td>
+          </tr>
+          <tr>
+            <td><code>guard config sync</code></td>
+            <td>Write the LLM settings into Alibaba OCR (custom provider <code>guard</code>)</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td><code>guard config commit</code></td>
+            <td>Choose who writes commit messages: the agent (<code>auto</code>) or you (<code>ask</code>)</td>
+            <td><code>auto</code> | <code>ask</code></td>
           </tr>
           <tr>
             <td><code>guard hook refresh</code></td>

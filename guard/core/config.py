@@ -13,7 +13,7 @@ import shutil
 import subprocess
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -48,12 +48,14 @@ class LLMConfig(BaseModel):
 class OCRConfig(BaseModel):
     auto_sync: bool = Field(default=True, description="Auto synchronize config to Alibaba OCR CLI")
     binary_path: str = Field(default="ocr", description="Command or path for Alibaba OCR CLI")
-    review_timeout: int = Field(default=60, description="Timeout for OCR review in seconds")
+    concurrency: int = Field(default=0, description="Parallel OCR requests (0 = OCR's default of 8); lower it for a gateway that drops parallel calls")
 
 
 class GuardConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     ocr: OCRConfig = Field(default_factory=OCRConfig)
+    # How the agent gets commit messages: "auto" (it writes them) or "ask" (it asks the user). None: not chosen yet
+    commit_mode: Optional[Literal["auto", "ask"]] = None
 
 
 def get_global_config_path() -> Path:
@@ -66,6 +68,7 @@ def get_local_config_path(start_path: Optional[Path] = None) -> Path:
 
 
 def load_config(repo_path: Optional[Path] = None) -> GuardConfig:
+    """The repository's .guard/config.json when it exists, otherwise the machine-wide config."""
     local_path = get_local_config_path(repo_path)
     if local_path.is_file():
         try:
@@ -75,6 +78,10 @@ def load_config(repo_path: Optional[Path] = None) -> GuardConfig:
         except Exception as e:
             console.print(f"[yellow]Warning: Could not read local config at {local_path}: {e}[/yellow]")
 
+    return load_global_config()
+
+
+def load_global_config() -> GuardConfig:
     global_path = get_global_config_path()
     if global_path.is_file():
         try:
@@ -95,15 +102,26 @@ def save_config(config: GuardConfig, local: bool = False, repo_path: Optional[Pa
     return target_path
 
 
-def sync_to_alibaba_ocr(llm: LLMConfig) -> Tuple[bool, str]:
-    ocr_bin = shutil.which("ocr")
-    if not ocr_bin:
-        return False, "CLI 'ocr' (@alibaba-group/open-code-review) not found in PATH."
+OCR_PROVIDER = "guard"
 
+
+def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]:
+    ocr_bin = shutil.which(binary)
+    if not ocr_bin:
+        return False, f"CLI '{binary}' (@alibaba-group/open-code-review) not found in PATH."
+
+    # A custom provider keeps guard's protocol: OCR's legacy llm.url is always called as Anthropic
+    settings = [
+        ("provider", OCR_PROVIDER),
+        (f"custom_providers.{OCR_PROVIDER}.url", llm.base_url),
+        (f"custom_providers.{OCR_PROVIDER}.protocol", llm.protocol.value),
+        (f"custom_providers.{OCR_PROVIDER}.api_key", llm.api_key or "none"),
+        (f"custom_providers.{OCR_PROVIDER}.model", llm.model),  # a provider-level model overrides the global one
+        ("model", llm.model),
+    ]
     try:
-        subprocess.run([ocr_bin, "config", "set", "llm.url", llm.base_url], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        subprocess.run([ocr_bin, "config", "set", "llm.auth_token", llm.api_key or "none"], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        subprocess.run([ocr_bin, "config", "set", "llm.model", llm.model], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        for key, value in settings:
+            subprocess.run([ocr_bin, "config", "set", key, value], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
         return True, "Successfully synced configuration to Alibaba OCR CLI."
     except subprocess.CalledProcessError as e:
         err_out = (e.stderr or "") + (e.stdout or "")
@@ -208,8 +226,14 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     scope_str = "Local (Repo)" if local else "Global"
     console.print(f"[bold green]💾 Saved {scope_str} configuration at:[/bold green] [dim]{target_path}[/dim]")
 
-    if current_cfg.ocr.auto_sync:
-        synced, ocr_msg = sync_to_alibaba_ocr(new_llm)
+    if current_cfg.ocr.auto_sync and local:
+        # OCR's configuration is machine-wide: a repository's credentials never reach it as a side effect
+        console.print(
+            "[dim yellow]ℹ️  Alibaba OCR was not updated: its settings apply to the whole machine. "
+            "Run `guard config sync --repo <this repository>` to use this LLM for every OCR review.[/dim yellow]"
+        )
+    elif current_cfg.ocr.auto_sync:
+        synced, ocr_msg = sync_to_alibaba_ocr(new_llm, current_cfg.ocr.binary_path)
         if synced:
             console.print(f"[bold cyan]🔗 {ocr_msg}[/bold cyan]")
         else:
@@ -233,5 +257,7 @@ def print_config_table(config: GuardConfig, path_info: str):
 
     table.add_row("Alibaba OCR", "Auto-Sync", str(config.ocr.auto_sync))
     table.add_row("Alibaba OCR", "CLI Binary", config.ocr.binary_path)
+    # The commit mode is machine-wide: show the global value even when a local config is active
+    table.add_row("Commit", "Mode", load_global_config().commit_mode or "(not set: guard config commit auto|ask)")
     
     console.print(table)

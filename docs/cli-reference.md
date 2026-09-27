@@ -39,7 +39,8 @@ guard post [options]
 * `-r, --repo <path>`: Target repository directory.
 * `-f, --focus <area>`: Quality pillar to focus scrutiny on (`all`, `security`, `memory`, `performance`, `ux`, `dead-code`, `simplicity`). Default: `all`.
 * `--auto-fix`: Trigger self-healing remediation suggestions if verification fails.
-* `--hook`: Git-hook mode. Skips when the repository has no guard session; with an approved session, passes only when the changes match what was approved.
+* `--hook`: Git-hook mode. Skips when the repository has no guard session; with an approved session, passes only when the changes match what was approved. Never runs OCR.
+* `--full`: Full review. Also runs the Alibaba OCR review of the task's changes (it reads the repository, takes minutes and has no time limit). OCR not running, or a high/critical finding, blocks (REVISE). Without it the report says "Alibaba OCR: not run", and an approved report tells the agent to ask you before committing whether you want this full review.
 
 Post audits against the base commit recorded at pre, runs the build command, invariant checks and the removed-symbol reference check, then asks the LLM. A new or edited `guard.invariants.json` is self-checked on the current tree; a declared edit that removes or changes rules shows them as RETIRED / re-evaluated and reports `INV-WEAKENED` (MEDIUM), an undeclared one blocks (CRITICAL). Rules the LLM discovers are written, after validation, into the local `.guard/invariants.json` (never into the repository's file).
 
@@ -90,9 +91,15 @@ guard config llm [--local]
 # Test LLM connection with token-free latency ping:
 guard config test
 
-# Manually synchronize credentials to Alibaba OCR CLI:
+# Write the LLM settings into Alibaba OCR as its custom provider `guard` (check with `ocr llm test`):
 guard config sync
+
+# Choose who writes commit messages for approved work (machine-wide):
+guard config commit auto   # the agent writes them (conventional, never mentions guard)
+guard config commit ask    # the agent asks you for every commit message
 ```
+
+`guard post` reports the chosen mode in the **Commit** line of an approved report; while no mode is set, the agent is told to ask you which one you want. `guard install` and `guard doctor` list it as "Commit messages".
 
 ---
 

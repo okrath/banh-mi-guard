@@ -206,6 +206,7 @@ def test_unparseable_llm_answer_is_retried_once():
     with patch("guard.core.llm_reviewer.call_llm", side_effect=lambda **kw: next(answers)) as llm:
         verdict = LLMReviewerEngine(config=_llm_config()).review(prompt="p", domain=DomainType.BACKEND)
     assert llm.call_count == 2 and verdict.review_mode == "llm_deep" and verdict.score == 8.5
+    assert llm.call_args.kwargs["cfg"].timeout is None  # a review waits for the answer, however long
 
 
 def test_refusal_is_reported_as_such():
@@ -224,3 +225,36 @@ def test_deleted_files_are_sent_as_a_one_line_note():
     batch = LLMReviewerEngine()._prepare_diff_batches(DiffSummary(raw_diff=diff))[0]
     assert "[file deleted: 3 lines removed; content omitted]" in batch
     assert "-a\n" not in batch and "+x = 2" in batch
+
+
+@pytest.mark.parametrize("severity, expected", [
+    ("HIGH", ReviewVerdict.REVISE),
+    ("CRITICAL", ReviewVerdict.REVISE),
+    ("MEDIUM", ReviewVerdict.APPROVED),
+])
+def test_ocr_high_or_critical_finding_blocks(reviewer, severity, expected):
+    finding = RuleViolation(rule_id="OCR-BUG", severity=severity, file_path="src/App.tsx", message="race")
+    diff = DiffSummary(files=[FileDiffStat(path="src/App.tsx", status="modified", insertions=1)], total_insertions=1)
+    verdict = reviewer.review(prompt="Fix src/App.tsx", domain=DomainType.FRONTEND, diff_summary=diff,
+                              build_check=None, violations=[finding], invariant_result=None, use_llm=False)
+    assert verdict.verdict == expected
+
+
+def test_diff_text_inside_a_changed_line_does_not_start_a_new_file():
+    raw = (
+        "diff --git a/tests/test_x.py b/tests/test_x.py\n--- a/tests/test_x.py\n+++ b/tests/test_x.py\n"
+        "@@ -1 +1,2 @@\n+SAMPLE = \"\"\"diff --git a/src/Fake.tsx b/src/Fake.tsx\n+diff --git a/src/Other.ts b/src/Other.ts\n"
+    )
+    batches = LLMReviewerEngine(config=None)._prepare_diff_batches(DiffSummary(raw_diff=raw))
+    assert len(batches) == 1 and batches[0] == raw  # one file, its fixture lines left as content
+
+
+def test_every_piece_of_an_oversized_file_names_the_file(monkeypatch):
+    import guard.core.llm_reviewer as reviewer_module
+    monkeypatch.setattr(reviewer_module, "REVIEW_BATCH_CHARS", 200)
+    raw = "diff --git a/big.py b/big.py\n@@ -0,0 +1,40 @@\n" + "".join(f"+line_{i} = {i}\n" for i in range(40))
+    batches = LLMReviewerEngine(config=None)._prepare_diff_batches(DiffSummary(raw_diff=raw))
+    assert len(batches) > 1 and all(b.startswith("diff --git a/big.py b/big.py") for b in batches)
+    assert all(len(b) <= 200 for b in batches)  # the continuation header counts toward the limit
+    prefix = "diff --git a/big.py b/big.py\n[continued: next part of this file's diff]\n"
+    assert batches[0] + "".join(b[len(prefix):] for b in batches[1:]) == raw  # nothing lost or repeated
