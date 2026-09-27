@@ -95,6 +95,11 @@ app = typer.Typer(
 )
 
 console = Console()
+# The project's build and test command: a hung command must not hold the gate forever, but a
+# test suite routinely takes longer than a minute
+BUILD_TIMEOUT_S = 1800
+# A hook payload is a small JSON object; anything bigger is not read (and the action is allowed, logged)
+MAX_EVENT_BYTES = 5_000_000
 
 
 def version_callback(value: bool):
@@ -262,7 +267,20 @@ def execute_pre_task(
         invariants = list(superseded.pre.locked_invariants)
 
     # 4. Save Session
+    # What the agent hook recorded before this pre: the user's own prompt, files changed early
+    from guard.agent.events import update_state
+
+    def take(state):  # consumed by this pre: never reused for a later task
+        taken = {k: state.pop(k, None) for k in ("user_prompt", "prompt_at", "pre_edit_changes")}  # in-flight "bash" stays
+        return taken["user_prompt"], taken["pre_edit_changes"] or []
+
+    recorded_prompt, recorded_changes = update_state(target_repo, take)
+    user_prompt = recorded_prompt or (superseded.pre.user_prompt if superseded else None)  # a new prompt wins
+    pre_edit_changes = sorted(set(recorded_changes) | set(superseded.pre.pre_edit_changes if superseded else []))
+
     session = session_mgr.start_pre_session(
+        user_prompt=user_prompt,
+        pre_edit_changes=pre_edit_changes,
         prompt=prompt,
         expected_files=candidate_files,
         contracts=contracts,
@@ -477,7 +495,7 @@ def execute_post_task(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=60,
+                timeout=BUILD_TIMEOUT_S,
             )
             duration = time.perf_counter() - start_t
             stdout_str = p.stdout or ""
@@ -546,6 +564,11 @@ def execute_post_task(
     reviewer = LLMReviewerEngine(config=config)
     domain = pre.domain if pre else DomainType.BACKEND
     prompt = pre.prompt if pre else "Post-task verification"
+    if pre and pre.user_prompt and pre.user_prompt.strip() != pre.prompt.strip():
+        # The agent wrote `prompt`; the hook recorded what the user actually asked
+        prompt = f"{pre.prompt}\n\nThe user's own message before this pre (verbatim, recorded by the agent hook; judge the task against it): {pre.user_prompt}"
+    if pre and pre.pre_edit_changes:
+        evidence.append(f"Files an agent command changed before guard pre ran: {', '.join(pre.pre_edit_changes)}")
 
     review_verdict = reviewer.review(
         prompt=prompt,
@@ -594,6 +617,7 @@ def execute_post_task(
         learned_invariants=learned,
         rejected_invariant_proposals=rejected_props,
         ocr_status=ocr_status,
+        ocr_complete=ocr_status.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in violations),
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
 
@@ -1202,6 +1226,60 @@ def hook_status_cmd(
                     "✅ Active" if sub_stat["prepare_commit_msg_installed"] else "⚪ Inactive",
                 )
             console.print(sub_table)
+
+
+@app.command("agent-event")
+def agent_event_cmd(
+    event: str = typer.Argument(..., help="prompt | before-edit | after-bash | stop | before-commit"),
+    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Adapter whose field mapping and output style to use"),
+):
+    """
+    Called by an agent harness hook with the hook payload (JSON) on stdin. Prints the decision as
+    JSON; a block also exits 2 with the reason on stderr. A payload guard cannot read is allowed and
+    logged: a broken adapter must never lock the user out of their agent.
+    """
+    from guard.agent.events import EVENTS, Decision, decide, normalise
+    from guard.core.repo_setup import guard_home
+
+    if event not in EVENTS:
+        console.print(f"[bold red]❌ Unknown event {event!r}; expected one of: {', '.join(EVENTS)}[/bold red]")
+        raise typer.Exit(code=1)
+    def log(message: str) -> None:
+        try:
+            path = guard_home() / "agent-events.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now(timezone.utc).isoformat()} {agent or '-'} {event} {message}\n")
+        except OSError:
+            pass
+
+    try:
+        raw = sys.stdin.read(MAX_EVENT_BYTES + 1)
+        if len(raw) > MAX_EVENT_BYTES:
+            raise ValueError(f"payload larger than {MAX_EVENT_BYTES} characters")
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"payload is a JSON {type(payload).__name__}, not an object")
+        fields = None
+        if agent:  # the adapter says where this harness puts each field
+            adapter = json.loads((guard_home() / "agents" / f"{agent}.json").read_text(encoding="utf-8"))
+            fields = adapter.get("fields") if isinstance(adapter, dict) else None
+        ev = normalise(event, payload, fields)
+        if event != "stop" and not (ev.prompt or ev.tool or ev.file_paths or ev.command):
+            log(f"INCOMPLETE payload without the fields this event needs (keys: {sorted(payload)[:12]})")
+    except Exception as e:  # a payload guard cannot read: never break the agent because of guard
+        ev, decision = None, Decision()
+        log(f"UNREADABLE {type(e).__name__}: {e}")
+    if ev is not None:
+        try:
+            decision = decide(ev)
+        except Exception as e:  # guard's own failure: allowed, but the agent is told it was not checked
+            decision = Decision(action="notify", reason=f"Guard could not check this action ({type(e).__name__}: {e}); it was allowed. Tell the user.")
+            log(f"ERROR {type(e).__name__}: {e}")
+    sys.stdout.write(json.dumps({"decision": decision.action, "reason": decision.reason}) + "\n")
+    if decision.action == "block":
+        sys.stderr.write(decision.reason + "\n")
+        raise typer.Exit(code=2)
 
 
 @app.command("review")

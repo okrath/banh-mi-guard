@@ -61,6 +61,10 @@ class PreTaskRecord(BaseModel):
     baseline_snapshot: Optional[str] = None
     late_scope: List[str] = Field(default_factory=list)  # Scope added by a restart after edits began
     restarts: List[Dict[str, str]] = Field(default_factory=list)  # Superseded sessions: id, status, at
+    # Recorded by the agent hook (guard agent-event): the user's own words, and files an agent
+    # command changed before this pre ran
+    user_prompt: Optional[str] = None
+    pre_edit_changes: List[str] = Field(default_factory=list)
 
 
 class BuildCheckResult(BaseModel):
@@ -93,6 +97,7 @@ class PostTaskRecord(BaseModel):
     learned_invariants: List[str] = Field(default_factory=list)  # ids the LLM added to guard.invariants.json
     rejected_invariant_proposals: List[str] = Field(default_factory=list)
     ocr_status: str = ""  # "complete: N finding(s) ..." or "did not run: <reason>"
+    ocr_complete: bool = False  # OCR reviewed the whole task and did not fail (what an agent commit requires)
     commit_mode: Optional[str] = None  # "auto" | "ask" | None (not chosen yet)
 
 
@@ -219,6 +224,8 @@ class SessionManager:
         late_scope: Optional[List[str]] = None,
         baseline_snapshot: Optional[str] = None,
         restarts: Optional[List[Dict[str, str]]] = None,
+        user_prompt: Optional[str] = None,
+        pre_edit_changes: Optional[List[str]] = None,
     ) -> GuardSession:
         self.guard_dir.mkdir(parents=True, exist_ok=True)
         self.ensure_gitignore()
@@ -236,6 +243,8 @@ class SessionManager:
             late_scope=late_scope or [],
             baseline_snapshot=baseline_snapshot,
             restarts=restarts or [],
+            user_prompt=user_prompt,
+            pre_edit_changes=pre_edit_changes or [],
             expected_files=expected_files,
             existing_contracts=contracts,
             locked_invariants=invariants,
