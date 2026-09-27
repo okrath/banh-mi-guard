@@ -412,16 +412,8 @@ def _add_workspace_doc(folder: Path, doc: Path) -> str:
 
 def _exclude_path(repo: Path, path: Path) -> None:
     """Add `path` to the repository's info/exclude (works in linked worktrees too)."""
-    common = _git(repo, "rev-parse", "--git-common-dir")
-    if not common:
-        return
-    git_dir = Path(common) if Path(common).is_absolute() else repo / common
-    exclude = git_dir / "info" / "exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    rel = "/" + path.resolve().relative_to(repo.resolve()).as_posix()
-    text = exclude.read_text(encoding="utf-8", errors="ignore") if exclude.exists() else ""
-    if rel not in [line.strip() for line in text.splitlines()]:
-        exclude.write_text(text.rstrip() + ("\n" if text else "") + rel + "\n", encoding="utf-8")
+    from guard.core.git_exclude import ensure_excluded
+    ensure_excluded(repo, "/" + path.resolve().relative_to(repo.resolve()).as_posix())
 
 
 def uninstall_workspace(folder: Path) -> List[str]:

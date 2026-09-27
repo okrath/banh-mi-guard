@@ -176,9 +176,11 @@ class GitDiffInspector:
         """
         Returns all files currently touched in the working directory (staged, modified, or untracked).
         """
+        from guard.core.untracked_names import is_guard_dir
+        # only guard's own .guard/ directory is left out: .guardian/ is the user's
         return [
             path for _, path in self._porcelain_entries()
-            if not path.startswith(".guard") and path != ".gitignore"
+            if not is_guard_dir(path) and path != ".gitignore"
         ]
 
     def create_baseline_snapshot(self) -> Optional[str]:

@@ -13,10 +13,11 @@ runner = CliRunner()
 
 @pytest.fixture
 def mock_git_repo(tmp_path):
+    import subprocess
     repo = tmp_path / "target_repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
-    (repo / ".git" / "hooks").mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)  # info/exclude lives where Git says
+    (repo / ".git" / "hooks").mkdir(exist_ok=True)
     return repo
 
 

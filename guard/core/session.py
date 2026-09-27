@@ -140,25 +140,10 @@ class SessionManager:
         `.gitignore`). Works in linked worktrees, where `.git` is a file. Outside Git there is
         nothing to keep clean, so nothing is written.
         """
-        import subprocess
+        from guard.core.git_exclude import ensure_excluded
 
         try:
-            res = subprocess.run(["git", "-C", str(self.repo_path), "rev-parse", "--git-common-dir"],
-                                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-        except OSError:
-            return
-        common = res.stdout.strip()
-        if res.returncode != 0 or not common:
-            return
-        git_dir = Path(common) if Path(common).is_absolute() else self.repo_path / common
-        exclude_file = git_dir / "info" / "exclude"
-        try:
-            exclude_file.parent.mkdir(parents=True, exist_ok=True)
-            content = exclude_file.read_text(encoding="utf-8", errors="ignore") if exclude_file.exists() else ""
-            lines = [line.strip() for line in content.splitlines()]
-            if ".guard/" not in lines and ".guard" not in lines:
-                new_content = content.rstrip() + ("\n" if content else "") + "\n# Banh-Mi-Guard local exclude\n.guard/\n"
-                exclude_file.write_text(new_content, encoding="utf-8")
+            ensure_excluded(self.repo_path, ".guard/", "# Banh-Mi-Guard local exclude", same=(".guard",))
         except OSError:
             pass
 

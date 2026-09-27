@@ -32,8 +32,6 @@ class HookInstaller:
     def __init__(self, repo_path: Optional[Path] = None):
         self.repo_path = Path(repo_path or Path.cwd()).resolve()
         self.git_hooks_dir = self.repo_path / ".git" / "hooks"
-        self.git_info_dir = self.repo_path / ".git" / "info"
-        self.git_exclude_file = self.git_info_dir / "exclude"
         self.guard_bin_dir = self.repo_path / ".guard" / "bin"
         self.claude_md_path = self.repo_path / "CLAUDE.md"
         self.agent_md_path = self.repo_path / "AGENT.md"
@@ -176,42 +174,26 @@ class HookInstaller:
         Ensure .guard/ directory is ignored in .git/info/exclude (Stealth local ignore).
         Zero workspace footprint: never touches workspace .gitignore or triggers remote push.
         """
+        from guard.core.git_exclude import ensure_excluded
+
         if not self.is_git_repo():
             return False
         try:
-            self.git_info_dir.mkdir(parents=True, exist_ok=True)
-            content = ""
-            if self.git_exclude_file.exists():
-                content = self.git_exclude_file.read_text(encoding="utf-8", errors="ignore")
-            lines = [line.strip() for line in content.splitlines()]
-            if ".guard/" not in lines and ".guard" not in lines:
-                new_content = content.rstrip() + ("\n" if content else "") + "\n# Banh-Mi-Guard stealth local exclude\n.guard/\n"
-                self.git_exclude_file.write_text(new_content, encoding="utf-8")
-                return True
-        except Exception:
-            pass
-        return False
+            return ensure_excluded(self.repo_path, ".guard/", "# Banh-Mi-Guard stealth local exclude", same=(".guard",))
+        except OSError:
+            return False
 
     def _remove_git_exclude(self) -> bool:
         """
         Remove .guard/ entry from .git/info/exclude if it exists.
         """
-        if not self.is_git_repo() or not self.git_exclude_file.exists():
+        from guard.core.git_exclude import remove_excluded
+
+        if not self.is_git_repo():
             return False
         try:
-            content = self.git_exclude_file.read_text(encoding="utf-8", errors="ignore")
-            lines = content.splitlines()
-            new_lines = [
-                line for line in lines
-                if line.strip() not in (".guard/", ".guard", "# Banh-Mi-Guard stealth local exclude")
-            ]
-            if len(new_lines) != len(lines):
-                new_content = "\n".join(new_lines).strip()
-                if new_content:
-                    new_content += "\n"
-                self.git_exclude_file.write_text(new_content, encoding="utf-8")
-                return True
-        except Exception:
+            return remove_excluded(self.repo_path, (".guard/", ".guard", "# Banh-Mi-Guard stealth local exclude"))
+        except OSError:
             pass
         return False
 
@@ -228,10 +210,11 @@ class HookInstaller:
         pre_commit_installed = pre_commit.exists() and "BANH-MI-GUARD" in pre_commit.read_text(encoding="utf-8", errors="ignore")
         prep_msg_installed = prep_msg.exists() and "BANH-MI-GUARD" in prep_msg.read_text(encoding="utf-8", errors="ignore")
 
-        git_exclude_active = False
-        if self.git_exclude_file.exists():
-            exclude_text = self.git_exclude_file.read_text(encoding="utf-8", errors="ignore")
-            git_exclude_active = ".guard" in exclude_text
+        from guard.core.git_exclude import exclude_file
+
+        exclude = exclude_file(self.repo_path)  # the common Git directory's, as the writers use
+        git_exclude_active = bool(exclude and exclude.is_file()
+                                  and ".guard" in exclude.read_text(encoding="utf-8", errors="ignore"))
 
         has_git = pre_commit_installed or prep_msg_installed
         has_agent = claude_active or agent_active

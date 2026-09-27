@@ -1429,7 +1429,7 @@ def untracked_cmd(
     Decide once, per path, whether an untracked file or folder is part of the repository or always
     ignored. Run it again with the other flag to change the decision. Without a path: list them.
     """
-    from guard.core.untracked import RegistryError, decide, load_decisions, printable, shown, suggest, undecided
+    from guard.core.untracked import RegistryError, covers, decide, load_decisions, printable, shown, suggest, undecided
     target = git_root(Path(repo).resolve() if repo else Path.cwd().resolve())
     if target is None:
         console.print("[bold red]❌ Not inside a Git repository.[/bold red]")
@@ -1437,16 +1437,16 @@ def untracked_cmd(
     if path is None:
         try:
             decisions = load_decisions(target)
-        except RegistryError as e:
-            console.print(f"[bold red]❌ {shown(str(e))}[/bold red]")
-            raise typer.Exit(code=1)
-        for entry, choice in decisions.items():
-            console.print(f"  {shown(entry)}: always {'included' if choice == 'include' else 'ignored'}")
-        try:
             pending = undecided(target)
         except (RuntimeError, RegistryError) as e:
             console.print(f"[bold red]❌ Cannot list untracked paths: {shown(str(e))}[/bold red]")
             raise typer.Exit(code=1)
+        for entry, choice in decisions.items():
+            # Git still listing a path an "ignore" covers, or the same name as a file/folder in its
+            # place, means that rule is not in effect for what is there now
+            stale = choice == "ignore" and any(covers(entry, p) or p.rstrip("/") == entry.rstrip("/") for p in pending)
+            note = " [yellow](not in effect: Git still lists it, decide again)[/yellow]" if stale else ""
+            console.print(f"  {shown(entry)}: always {'included' if choice == 'include' else 'ignored'}{note}")
         for entry in pending:
             console.print(f"  {shown(entry)}: [yellow]not decided[/yellow] ({suggest(entry)})")
         return
