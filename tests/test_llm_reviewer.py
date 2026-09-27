@@ -102,6 +102,7 @@ def test_reviewer_llm_response_parsing(reviewer):
 SCORE: 9.2
 VERDICT: APPROVED
 SUMMARY: Source code is architecturally sound and clean of memory leaks.
+FINDINGS: None
 TECHNICAL:
 * No orphaned listeners
 * Build verification passed
@@ -202,7 +203,7 @@ def _llm_config():
 def test_unparseable_llm_answer_is_retried_once():
     from unittest.mock import patch
 
-    answers = iter(["I think this looks fine overall.", "SCORE: 8.5\nVERDICT: APPROVED\nSUMMARY: ok"])
+    answers = iter(["I think this looks fine overall.", "SCORE: 8.5\nSUMMARY: ok\nFINDINGS: None"])
     with patch("guard.core.llm_reviewer.call_llm", side_effect=lambda **kw: next(answers)) as llm:
         verdict = LLMReviewerEngine(config=_llm_config()).review(prompt="p", domain=DomainType.BACKEND)
     assert llm.call_count == 2 and verdict.review_mode == "llm_deep" and verdict.score == 8.5

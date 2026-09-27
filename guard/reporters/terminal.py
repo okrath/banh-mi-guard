@@ -177,6 +177,16 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
                 simplicity_table.add_row(v.rule_id, v.severity, loc, v.message)
             console.print(simplicity_table)
 
+    for f in post.findings:
+        label = "[bold red]BLOCKING[/bold red]" if f.get("blocking") else "[dim]advisory[/dim]"
+        console.print(f"{label} [{f.get('id')}] {f.get('severity')} {f.get('kind')} ", end="")
+        console.print(f"{f.get('location') or '-'}: {f.get('description', '')}", markup=False)
+    for f in post.followups:
+        console.print(f"[dim]follow-up [{f.get('id')}] {f.get('status', 'open')}[/dim] ", end="")
+        console.print(f"{f.get('location') or '-'}: {f.get('description', '')}", markup=False)
+    if post.needs_user:
+        console.print("[bold yellow]🧑 needs_user: stop and ask the user to run guard accept in their terminal.[/bold yellow]")
+
     if post.ocr_status:
         style = "red" if post.ocr_status.startswith("did not run") else "cyan"
         console.print(f"[bold {style}]🔎 Alibaba OCR review:[/bold {style}] ", end="")

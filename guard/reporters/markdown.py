@@ -198,6 +198,32 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
     if post.llm_error:
         md.append(f"  - ⚠️ *LLM review did not run:* {post.llm_error}")
 
+    blocking = [f for f in post.findings if f.get("blocking")]
+    advisory = [f for f in post.findings if not f.get("blocking")]
+    if blocking:
+        md.append("\n* **Blocking findings** (guard's rule: critical/high correctness or security, or a stated requirement):")
+        for f in blocking:
+            md.append(f"  - `[{f.get('id')}]` {f.get('severity')} {f.get('kind')} at {inert(f.get('location') or '-')} "
+                      f"({f.get('why_blocking')}): {inert(f.get('description', ''))}")
+    if advisory:
+        md.append("\n* **Advisory findings** (not blocking; kept as follow-ups):")
+        for f in advisory:
+            md.append(f"  - `[{f.get('id')}]` {f.get('severity')} {f.get('kind')} at {inert(f.get('location') or '-')}: "
+                      f"{inert(f.get('description', ''))}")
+    if blocking or advisory:
+        md.append("  - A finding you will not fix now: `guard finding <id> --defer \"<why, where it is handled>\"`, "
+                  "or `--reject \"<evidence>\"` when it is wrong; the next review sees the reason.")
+    if post.needs_user:
+        md.append("\n* **needs_user:** this task used its review rounds. Stop and ask the user: they read the findings "
+                  "above and run `guard accept` in their own terminal (accept them as follow-ups, or allow more rounds).")
+    if post.accepted_by_user:
+        md.append("\n* **Approved by the user** (`guard accept`); the remaining findings are follow-ups.")
+    if post.followups:
+        md.append("\n* **Follow-ups of this task** (advisory or deferred, from every round):")
+        for f in post.followups:
+            md.append(f"  - `[{f.get('id')}]` {f.get('status', 'open')} {f.get('severity')} {f.get('kind')} at "
+                      f"{inert(f.get('location') or '-')}: {inert(f.get('description', ''))}")
+
     if post.learned_invariants or post.rejected_invariant_proposals:
         md.append("\n* **Invariants learned in this review (`.guard/invariants.json`, local):**")
         for i in post.learned_invariants:

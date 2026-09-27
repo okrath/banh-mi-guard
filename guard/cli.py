@@ -189,10 +189,19 @@ def execute_pre_task(
     #    never turn the task's own edits into "pre-existing" baseline or widen the audited scope.
     previous = session_mgr.load_local_session()
     superseded = previous if (
-        previous and previous.pre and previous.status in (SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX)
+        previous and previous.pre and previous.status in (
+            SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX, SessionStatus.NEEDS_USER)
     ) else None
+    if superseded and superseded.status == SessionStatus.NEEDS_USER:
+        # A restart would take back the decision the round budget handed to the user
+        console.print(
+            f"[bold red]❌ The guard session {superseded.session_id} is waiting for the user.[/bold red] "
+            "Stop and ask the user to run [bold]guard accept[/bold] in their own terminal."
+        )
+        return False
     if superseded and not force:
-        state = "unfinished" if superseded.status == SessionStatus.AWAITING_POST else "rejected (REVISE)"
+        state = {SessionStatus.AWAITING_POST: "unfinished", SessionStatus.NEEDS_USER: "waiting for the user (guard accept)"}.get(
+            superseded.status, "rejected (REVISE)")
         console.print(
             f"[bold red]❌ The previous guard session {superseded.session_id} is {state}.[/bold red]\n"
             "Finish it with [bold]guard post[/bold]. [bold]guard pre --force[/bold] restarts it, keeping its baseline and scope; "
@@ -300,6 +309,7 @@ def execute_pre_task(
     session = session_mgr.start_pre_session(
         user_prompt=user_prompt,
         pre_edit_changes=pre_edit_changes,
+        carry=superseded,  # a restart keeps the task's findings ledger and round count
         prompt=prompt,
         expected_files=candidate_files,
         contracts=contracts,
@@ -360,6 +370,14 @@ def execute_post_task(
             f"({session.session_id}):[/bold red]\n{listing}\n"
             "Run [bold]guard pre \"<task>\"[/bold] before editing and [bold]guard post[/bold] after, or "
             "[bold]guard reset[/bold] to stop guarding this work."
+        )
+        return False
+
+    if session is not None and session.status == SessionStatus.NEEDS_USER:
+        # Another round would take back the decision the round budget handed to the user
+        console.print(
+            f"[bold red]❌ Guard session {session.session_id} is waiting for the user.[/bold red] "
+            "Stop and ask the user to run [bold]guard accept[/bold] in their own terminal."
         )
         return False
 
@@ -600,6 +618,7 @@ def execute_post_task(
         use_llm=True,
         focus=focus,
         evidence=evidence,
+        ledger=session.findings_ledger if session else [],
     )
 
     all_passed = (review_verdict.verdict == ReviewVerdict.APPROVED)
@@ -633,6 +652,8 @@ def execute_post_task(
                 for p in {f.path for f in diff_summary.files}
             } if all_passed else {}
         ),
+        reviewed_fingerprints={p: _fingerprint(target_repo / p) for p in {f.path for f in diff_summary.files}},
+        findings=[f.model_dump() for f in review_verdict.findings],
         learned_invariants=learned,
         rejected_invariant_proposals=rejected_props,
         ocr_status=ocr_status,
@@ -641,16 +662,11 @@ def execute_post_task(
     )
 
     session_mgr.complete_post_session(post_rec)
+    post_rec.needs_user = _record_round(session_mgr, review_verdict, post_rec)
 
     # 7. Render Terminal & Markdown
     render_post_task_terminal(post_rec, pre)
-    md_content = generate_post_task_markdown(post_rec, pre)
-    post_report_path = target_repo / ".guard" / "POST_TASK_REPORT.md"
-    try:
-        post_report_path.write_text(md_content, encoding="utf-8")
-        console.print(f"\n[dim]📄 Post-Task Report written to: {post_report_path}[/dim]")
-    except Exception:
-        pass
+    _write_post_report(target_repo, post_rec, pre)
 
     if not all_passed and review_verdict.remediation_steps:
         console.print(Panel(
@@ -660,6 +676,70 @@ def execute_post_task(
         ))
 
     return all_passed
+
+
+def _write_post_report(target_repo: Path, post_rec, pre) -> None:
+    post_report_path = target_repo / ".guard" / "POST_TASK_REPORT.md"
+    try:
+        post_report_path.write_text(generate_post_task_markdown(post_rec, pre), encoding="utf-8")
+        console.print(f"\n[dim]📄 Post-Task Report written to: {post_report_path}[/dim]")
+    except Exception:
+        pass
+
+
+def _followups(ledger: list) -> list:
+    """Every advisory of the task and every deferral stays a follow-up, not only the last round's."""
+    return [e for e in ledger if e.get("status") != "rejected" and (not e.get("blocking") or e.get("status") == "deferred")]
+
+
+def _record_round(session_mgr: SessionManager, verdict, post_rec) -> bool:
+    """
+    Keep the task's findings ledger and round count, and stop at the round budget: after that many
+    LLM REVISE rounds the session waits for the user (needs_user) instead of starting another round.
+    """
+    session = session_mgr.load_local_session()
+    if session is None:
+        return False
+    if verdict.review_mode != "llm_deep":
+        # No LLM round to count, but an approval still carries the task's follow-ups
+        if post_rec.all_passed and session.post:
+            post_rec.followups = session.post.followups = _followups(session.findings_ledger)
+            session_mgr._save(session)
+        return False
+    session.llm_rounds += 1
+    raised = {f.id for f in verdict.findings}
+    by_id = {entry.get("id"): entry for entry in session.findings_ledger}
+    for entry in session.findings_ledger:  # earlier findings this round did not raise again
+        if entry.get("status") == "open" and entry.get("id") not in raised:
+            entry["status"], entry["note"] = "not raised again", f"round {session.llm_rounds}"
+    for f in verdict.findings:
+        entry = by_id.get(f.id)
+        record = {**f.model_dump(), "round": session.llm_rounds}
+        if entry is None:
+            session.findings_ledger.append({**record, "status": "open", "note": ""})
+        elif entry.get("status") in ("deferred", "rejected"):
+            entry["round"] = session.llm_rounds
+            entry["note"] = f"{entry.get('note', '')}; raised again in round {session.llm_rounds}".lstrip("; ")
+        else:
+            entry.update({**record, "status": "open", "note": ""})
+    if verdict.verdict == ReviewVerdict.REVISE:
+        session.llm_revise_rounds += 1
+        if session.llm_revise_rounds >= session.revise_budget:
+            session.status = SessionStatus.NEEDS_USER
+    if post_rec.all_passed:
+        post_rec.followups = _followups(session.findings_ledger)
+    if session.post:
+        session.post.needs_user = session.status == SessionStatus.NEEDS_USER
+        session.post.followups = post_rec.followups
+    session_mgr._save(session)
+    if session.status == SessionStatus.NEEDS_USER:
+        console.print(Panel(
+            f"{session.llm_revise_rounds} review rounds said REVISE. Guard stops here: stop and ask the user. They read "
+            "the remaining findings in the report and run [bold]guard accept[/bold] in their own terminal to accept "
+            "them as follow-ups or to allow three more rounds.",
+            title="🧑 needs_user", border_style="yellow",
+        ))
+    return session.status == SessionStatus.NEEDS_USER
 
 
 # ---------------------------------------------------------
@@ -720,6 +800,10 @@ def reset_cmd(
     if session is None:
         console.print("[yellow]No guard session in this repository.[/yellow]")
         return
+    if session.status == SessionStatus.NEEDS_USER:
+        # Only guard accept clears needs_user; to drop the task, allow more rounds there (c), then reset
+        console.print("[bold red]❌ This session is waiting for the user's decision: run guard accept in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
     archived = mgr.archive_and_clear()
     console.print(
         f"[bold yellow]Guard session {session.session_id} ({session.status.value}) closed.[/bold yellow] "
@@ -1245,6 +1329,93 @@ def hook_status_cmd(
                     "✅ Active" if sub_stat["prepare_commit_msg_installed"] else "⚪ Inactive",
                 )
             console.print(sub_table)
+
+
+@app.command("finding")
+def finding_cmd(
+    finding_id: str = typer.Argument(..., help="Id shown in the post report, e.g. 3f9a1c2b"),
+    defer: Optional[str] = typer.Option(None, "--defer", help="Deferred: why, and where it will be handled"),
+    reject: Optional[str] = typer.Option(None, "--reject", help="Rejected: the evidence that the finding is wrong"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Target repository directory"),
+):
+    """
+    Record a deferral or a rejection of a finding for the next review of this task. The next review
+    sees the reason; a finding still blocks until the review agrees or it is fixed.
+    """
+    if (defer is None) == (reject is None) or not (defer or reject or "").strip():
+        console.print("[bold red]❌ Give exactly one of --defer or --reject, with a reason.[/bold red]")
+        raise typer.Exit(code=1)
+    mgr = SessionManager(Path(repo).resolve() if repo else Path.cwd().resolve())
+    session = mgr.load_local_session()
+    entry = next((e for e in (session.findings_ledger if session else []) if e.get("id") == finding_id), None)
+    if entry is None:
+        console.print(f"[bold red]❌ No finding {finding_id!r} in this session's ledger.[/bold red]")
+        raise typer.Exit(code=1)
+    entry["status"], entry["note"] = ("deferred", defer) if defer is not None else ("rejected", reject)
+    mgr._save(session)
+    console.print(f"[bold green]✅ Finding {finding_id} {entry['status']}; the next review sees why.[/bold green]")
+
+
+@app.command("accept")
+def accept_cmd(
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Target repository directory"),
+):
+    """
+    For the user, in an interactive terminal: decide a task that used its review rounds (needs_user).
+    Accept the remaining findings as follow-ups (approves exactly the files last reviewed), or allow
+    three more rounds. An agent cannot run it: it needs a terminal.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ guard accept is the user's decision: run it yourself in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
+    target = Path(repo).resolve() if repo else Path.cwd().resolve()
+    mgr = SessionManager(target)
+    session = mgr.load_local_session()
+    if session is None or session.status != SessionStatus.NEEDS_USER or not session.post:
+        console.print("[yellow]No task is waiting for a decision (status needs_user).[/yellow]")
+        return
+    post = session.post
+    reviewed = post.reviewed_fingerprints
+    # Every reviewed file is as it was reviewed, and nothing unreviewed has changed since
+    changed = [f for f, h in reviewed.items() if _fingerprint(target / f) != h]
+    changed += [f for f in GitDiffInspector(target).get_working_files() if f not in reviewed]
+    # Accepting covers the LLM's findings only: the LLM reviews only after build, invariants and scope
+    # passed, and they must still show passed in the round being accepted
+    gates_failed = (post.review_mode != "llm_deep" or (post.build_check is not None and not post.build_check.passed)
+                    or bool(post.out_of_scope_files)
+                    or any(v.rule_id.startswith("OCR-") and v.severity in ("HIGH", "CRITICAL") for v in post.rule_violations)
+                    or (post.invariant_result is not None and any(c.status == "failed" for c in post.invariant_result.checks)))
+    # Everything the task still carries: every follow-up, what is still open, and any raised again last round
+    carried = _followups(session.findings_ledger)
+    remaining = [e for e in session.findings_ledger if e in carried or e.get("status") == "open"
+                 or e.get("round") == session.llm_rounds]
+    for e in remaining:
+        console.print(f"  • [{e.get('id')}] {e.get('status')} {e.get('severity')} {e.get('kind')} {e.get('location')}: {e.get('description')}", markup=False)
+    choice = typer.prompt("Accept these as follow-ups and approve (a), allow three more rounds (c), or quit (q)?", default="q").strip().lower()
+    if choice == "a" and (changed or gates_failed):
+        if changed:
+            console.print("[bold red]❌ Changed since the last review:[/bold red] ", end="")
+            console.print(", ".join(changed[:10]), markup=False)
+        else:
+            console.print("[bold red]❌ The last round did not pass build, invariants and scope; only the LLM's findings can be accepted.[/bold red]")
+        console.print("Restore the reviewed files, or allow more rounds (c) and run guard post.")
+        raise typer.Exit(code=1)
+    if choice == "a":
+        session.status = SessionStatus.COMPLETED
+        session.post.approved_fingerprints = dict(reviewed)
+        session.post.all_passed, session.post.accepted_by_user = True, True
+        session.post.followups, session.post.needs_user = remaining, False
+        mgr._save(session)
+        _write_post_report(target, session.post, session.pre)
+        console.print("[bold green]✅ Approved by you; the remaining findings are kept as follow-ups.[/bold green]")
+    elif choice == "c":
+        session.revise_budget += 3
+        session.status, session.post.needs_user = SessionStatus.NEEDS_FIX, False
+        mgr._save(session)
+        _write_post_report(target, session.post, session.pre)
+        console.print(f"[bold green]✅ Three more review rounds allowed (budget {session.revise_budget}).[/bold green]")
+    else:
+        console.print("[dim]Nothing changed.[/dim]")
 
 
 @app.command("untracked")

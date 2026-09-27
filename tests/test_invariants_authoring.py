@@ -113,7 +113,7 @@ def test_llm_discovered_invariants_are_validated_then_written(tmp_path):
     (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
 
     reply = (
-        "SCORE: 9\nVERDICT: APPROVED\nSUMMARY: ok\nREMEDIATION: None\nINVARIANTS:\n"
+        "SCORE: 9\nSUMMARY: ok\nFINDINGS: None\nINVARIANTS:\n"
         "- API-01 | chat calls go through /api | src/chat.ts | require | fetch\\('/api\n"
         "- API-02 | never uses axios | src/chat.ts | require | axios\n"
         "- SEND-01 | duplicate id | src/chat.ts | require | send\n"

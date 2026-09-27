@@ -398,9 +398,9 @@ def test_large_diff_is_reviewed_in_parts_not_truncated():
     big = "".join(f"diff --git a/src/f{i}.ts b/src/f{i}.ts\n+++ b/src/f{i}.ts\n" + "+x\n" * 20000 for i in range(3))
     cfg = GuardConfig(llm=LLMConfig(base_url="http://127.0.0.1:9/v1", api_key="k", model="m"))
     replies = iter([
-        "SCORE: 9\nVERDICT: APPROVED\nSUMMARY: ok",
-        "SCORE: 5\nVERDICT: REVISE\nSUMMARY: bad\nREMEDIATION: - fix f1",
-        "SCORE: 8\nVERDICT: APPROVED\nSUMMARY: ok",
+        "SCORE: 9\nSUMMARY: ok\nFINDINGS: None",
+        "SCORE: 5\nSUMMARY: bad\nFINDINGS:\n- high | correctness | src/f1.ts:1 | - | breaks f1",
+        "SCORE: 8\nSUMMARY: ok\nFINDINGS: None",
     ])
     prompts = []
 

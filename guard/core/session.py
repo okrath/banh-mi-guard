@@ -28,6 +28,7 @@ class SessionStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     NEEDS_FIX = "needs_fix"
+    NEEDS_USER = "needs_user"  # the round budget is spent: only the user decides (guard accept)
 
 
 class DomainContract(BaseModel):
@@ -99,6 +100,12 @@ class PostTaskRecord(BaseModel):
     ocr_status: str = ""  # "complete: N finding(s) ..." or "did not run: <reason>"
     ocr_complete: bool = False  # OCR reviewed the whole task and did not fail (what an agent commit requires)
     commit_mode: Optional[str] = None  # "auto" | "ask" | None (not chosen yet)
+    findings: List[Dict] = Field(default_factory=list)  # this round's structured LLM findings
+    followups: List[Dict] = Field(default_factory=list)  # findings approved without being fixed
+    # Content of every file this post reviewed, whatever the verdict (what guard accept can approve)
+    reviewed_fingerprints: Dict[str, str] = Field(default_factory=dict)
+    accepted_by_user: bool = False  # approved by `guard accept`, not by the gate
+    needs_user: bool = False  # this post used the last review round: the user decides next
 
 
 class GuardSession(BaseModel):
@@ -109,6 +116,12 @@ class GuardSession(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     pre: Optional[PreTaskRecord] = None
     post: Optional[PostTaskRecord] = None
+    # Across the posts of one task (kept by a --force restart): every finding raised with its status,
+    # how many LLM reviews said REVISE, and how many are allowed before the user decides
+    findings_ledger: List[Dict] = Field(default_factory=list)
+    llm_rounds: int = 0
+    llm_revise_rounds: int = 0
+    revise_budget: int = 3
 
 
 class SessionManager:
@@ -226,6 +239,7 @@ class SessionManager:
         restarts: Optional[List[Dict[str, str]]] = None,
         user_prompt: Optional[str] = None,
         pre_edit_changes: Optional[List[str]] = None,
+        carry: Optional["GuardSession"] = None,
     ) -> GuardSession:
         self.guard_dir.mkdir(parents=True, exist_ok=True)
         self.ensure_gitignore()
@@ -257,6 +271,10 @@ class SessionManager:
             repo_path=str(self.repo_path),
             pre=pre_rec,
         )
+        if carry is not None:  # a restart continues the same task: its findings and round count stay
+            session.findings_ledger = list(carry.findings_ledger)
+            session.llm_rounds, session.llm_revise_rounds = carry.llm_rounds, carry.llm_revise_rounds
+            session.revise_budget = carry.revise_budget
 
         self._save(session)
         return session

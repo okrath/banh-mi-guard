@@ -158,7 +158,8 @@ def _relative(repo: Path, file_path: str) -> Optional[str]:
 
 
 def _active_pre(session) -> bool:
-    return bool(session and session.pre and session.status in (SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX))
+    return bool(session and session.pre and session.status in (
+        SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX, SessionStatus.NEEDS_USER))
 
 
 def _staged_differs(repo: Path) -> List[str]:
@@ -300,6 +301,8 @@ def _after_bash(repo: Path, session, ev: AgentEvent) -> Decision:
 def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
     if ev.loop:
         return Decision()  # the harness already blocked once; never trap the agent
+    if session and session.status == SessionStatus.NEEDS_USER:
+        return Decision()  # stopping is right: the user decides (guard accept) before anything else
     if _active_pre(session):
         if _task_edits(repo, session) or session.status == SessionStatus.NEEDS_FIX:
             return Decision(action="block", reason="Guard: the task has edits without an approved guard post. Run `guard post` and fix what its report lists.")
@@ -318,6 +321,10 @@ def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
 
 
 def _commit_decision(repo: Path, session) -> Decision:
+    if session and session.status == SessionStatus.NEEDS_USER:
+        return Decision(action="block", reason=(
+            "Guard: this task used its review rounds and waits for the user. Stop and ask them: they run "
+            "`guard accept` in their own terminal (accept the remaining findings, or allow more rounds)."))
     if not session or session.status != SessionStatus.COMPLETED or not session.post:
         return Decision(action="block", reason="Guard: commit only approved work. Run `guard post` until it approves, then commit.")
     uncovered = _uncovered(repo, session, staged=True)

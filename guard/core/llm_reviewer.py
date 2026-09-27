@@ -29,8 +29,79 @@ REVIEW_BATCH_CHARS = 80000
 REVIEW_MAX_BATCHES = 6
 FORMAT_REMINDER = (
     "\nYour previous answer could not be parsed. Answer again, starting with exactly these lines:\n"
-    "SCORE: <0.0-10.0>\nVERDICT: <APPROVED or REVISE>\nSUMMARY: <one paragraph>\n"
+    "SCORE: <0.0-10.0>\nSUMMARY: <one paragraph>\n"
+    "FINDINGS: <'None', or one line per issue: - severity | kind | file:line | requirement | description>\n"
+    "severity is one of critical, high, medium, low; kind is one of correctness, security, requirement, "
+    "maintainability, style, documentation, other; requirement is '-' or a verbatim quote from the task.\n"
 )
+SEVERITIES = ("critical", "high", "medium", "low")
+KINDS = ("correctness", "security", "requirement", "maintainability", "style", "documentation", "other")
+BLOCKING_KINDS = {"correctness", "security"}
+
+
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[`'\"“”‘’]", "", text).lower().split())
+
+
+def finding_id(kind: str, location: str, description: str) -> str:
+    """Stable id of a finding across rounds: its kind, file and the start of its wording."""
+    import hashlib
+    file_part = location.split(":", 1)[0].strip().lower()
+    return hashlib.sha1(f"{kind}|{file_part}|{_norm(description)[:60]}".encode("utf-8")).hexdigest()[:8]
+
+
+class Finding(BaseModel):
+    id: str
+    severity: str
+    kind: str
+    location: str = ""
+    requirement: str = ""  # a verbatim quote from the task, when the finding says the task asked for it
+    description: str
+    blocking: bool = False
+    why_blocking: str = ""
+
+
+def classify(finding: "Finding", task_text: str) -> "Finding":
+    """
+    The verdict rule, applied by guard and not by the model: a finding blocks when it is
+    critical/high and about correctness or security, or when the requirement it quotes is really in
+    the task. Everything else is advisory.
+    """
+    # Word for word (case and punctuation aside), at least two whole words: never a fragment of a word
+    quote = " ".join(re.findall(r"\w+", finding.requirement.lower()))
+    task = " ".join(re.findall(r"\w+", task_text.lower()))
+    if finding.severity in ("critical", "high") and finding.kind in BLOCKING_KINDS:
+        finding.blocking, finding.why_blocking = True, f"{finding.severity} {finding.kind}"
+    elif len(quote.split()) >= 2 and f" {quote} " in f" {task} ":
+        finding.blocking, finding.why_blocking = True, "violates a stated requirement"
+    return finding
+
+
+def parse_findings(text: str, task_text: str) -> Optional[List[Finding]]:
+    """
+    `FINDINGS:` lines -> classified findings. None when the section is missing or any line is malformed
+    (too few fields, an unknown severity or kind): a finding guard cannot read is never dropped or
+    demoted into an approval.
+    """
+    m = re.search(r"FINDINGS:\s*(.*?)(?=\n[A-Z]{3,}:|\Z)", text, re.DOTALL)
+    if not m:
+        return None
+    out: List[Finding] = []
+    for line in m.group(1).splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        if not line or line.lower() == "none":
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) < 5 or parts[0].lower() not in SEVERITIES or parts[1].lower() not in KINDS:
+            return None
+        severity, kind, location, requirement = parts[0].lower(), parts[1].lower(), parts[2], parts[3]
+        description = " | ".join(parts[4:])
+        requirement = "" if requirement in ("-", "none", "None", "") else requirement
+        out.append(classify(Finding(
+            id=finding_id(kind, location, description), severity=severity, kind=kind,
+            location=location, requirement=requirement, description=description,
+        ), task_text))
+    return out
 
 
 def _parse_invariant_proposals(text: str) -> List[dict]:
@@ -81,6 +152,7 @@ class LLMReviewVerdict(BaseModel):
     remediation_steps: List[str] = Field(default_factory=list)
     # Durable project rules the reviewer found, for guard.invariants.json (validated before writing)
     proposed_invariants: List[dict] = Field(default_factory=list)
+    findings: List[Finding] = Field(default_factory=list)  # structured; the verdict is computed from them
     review_mode: str = "heuristic"  # "heuristic" or "llm_deep"
     llm_error: Optional[str] = None  # Why the LLM review did not run or failed
 
@@ -106,6 +178,7 @@ class LLMReviewerEngine:
         use_llm: bool = True,
         focus: Optional[str] = "all",
         evidence: Optional[List[str]] = None,
+        ledger: Optional[List[dict]] = None,
     ) -> LLMReviewVerdict:
         violations = violations or []
         focus_str = (focus or "all").lower()
@@ -137,6 +210,7 @@ class LLMReviewerEngine:
                     contracts=contracts,
                     focus=focus_str,
                     evidence=evidence or [],
+                    ledger=ledger or [],
                 )
                 if llm_verdict:
                     return llm_verdict
@@ -277,9 +351,11 @@ class LLMReviewerEngine:
         contracts: Optional[List[DomainContract]],
         focus: str = "all",
         evidence: Optional[List[str]] = None,
+        ledger: Optional[List[dict]] = None,
     ) -> Optional[LLMReviewVerdict]:
         if not self.config or not self.config.llm:
             return None
+        self._task_text = prompt  # what a quoted requirement is checked against
 
         model_name = self.config.llm.model
         domain_str = domain.value if hasattr(domain, "value") else str(domain)
@@ -317,13 +393,20 @@ class LLMReviewerEngine:
             "1. Technical Audit (Code integrity, memory leaks, dangling listeners, breaking API changes, security vulnerabilities)\n"
             "2. Invariants & Contracts (Ensure baseline UI states, interactions, and DB schemas are preserved)\n"
             "3. Ergonomics Polish (UX, responsive styling, accessibility across technical domains)\n"
+            "You do not decide the verdict: guard computes it from your findings. A finding blocks only when it is "
+            "critical or high AND about correctness or security, or when it quotes, verbatim, a requirement from the "
+            "Task Prompt that the change violates. Rate severity honestly; do not inflate a nice-to-have.\n"
+            "Findings already raised in this session are listed under 'Findings so far'. Do not raise one of them "
+            "again unless the current diff gives new evidence; then say what is new. A deferral or rejection the "
+            "agent recorded is a decision to respect unless you can show it is wrong.\n"
             "Mandatory Output Format:\n"
-            "SCORE: <float between 0.0 and 10.0>\n"
-            "VERDICT: <APPROVED or REVISE>\n"
+            "SCORE: <float between 0.0 and 10.0, informational>\n"
             "SUMMARY: <concise summary>\n"
+            "FINDINGS: <'None', or one line per issue: `- severity | kind | file:line | requirement | description` "
+            "with severity critical/high/medium/low, kind correctness/security/requirement/maintainability/style/"
+            "documentation/other, requirement = a short verbatim quote from the Task Prompt the change violates or '-'>\n"
             "TECHNICAL: <bullet points>\n"
             "ERGONOMICS: <bullet points>\n"
-            "REMEDIATION: <bullet points of required fixes if REVISE, or 'None' if APPROVED>\n"
             "INVARIANTS: <'None', or one line per DURABLE project rule this diff reveals that is not already in the "
             "Invariants list above and that the current code satisfies. Format: "
             "`- ID | description | files-glob | forbid-or-require | python-regex` for a machine check, or "
@@ -344,6 +427,12 @@ class LLMReviewerEngine:
             f"- [{c.status.upper()}] {c.id}: {c.description} ({c.notes})" for c in (invariant_result.checks if invariant_result else [])
         ) or "- none declared"
         evidence_info = "\n".join(f"- {e}" for e in (evidence or [])) or "- none"
+        ledger_info = "\n".join(
+            f"- [{f.get('id')}] round {f.get('round')}, {f.get('status', 'open')}"
+            + (f" ({f.get('note')})" if f.get("note") else "")
+            + f": {f.get('severity')} {f.get('kind')} {f.get('location')}: {f.get('description')}"
+            for f in (ledger or [])
+        ) or "- none"
 
         header = f"""
 Domain: {domain_str}
@@ -358,6 +447,8 @@ Invariants:
 {invariants_info}
 Verified evidence (computed by guard over the whole repository, valid for every diff part):
 {evidence_info}
+Findings so far in this session (id, round, status, your earlier wording):
+{ledger_info}
 """
 
         # No time limit on a review: it ends when the LLM answers or its provider returns an error.
@@ -371,13 +462,13 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             part = f"Diff part {i}/{len(batches)} (other parts are reviewed separately; judge only this part):\n" if len(batches) > 1 else ""
             prompt_text = f"{header}\n{part}Git Diff:\n```\n{batch}\n```\n"
             verdict = None
-            for attempt in range(2):  # one retry when the answer ignores the SCORE/VERDICT format
+            for attempt in range(2):  # one retry when the answer ignores the SCORE/FINDINGS format
                 raw_response = call_llm(
                     cfg=review_cfg,
                     prompt=prompt_text if attempt == 0 else prompt_text + FORMAT_REMINDER,
                     system_prompt=system_prompt,
                     temperature=0.1,
-                    max_tokens=1000,
+                    max_tokens=2000,  # room for one line per finding
                 )
                 verdict = self._parse_llm_response(raw_response, model_name=model_name, focus=focus)
                 if verdict is not None:
@@ -394,7 +485,8 @@ Verified evidence (computed by guard over the whole repository, valid for every 
         if len(verdicts) == 1:
             return verdicts[0]
         first = verdicts[0]
-        rejected = any(v.verdict == ReviewVerdict.REVISE for v in verdicts)
+        findings = [f for v in verdicts for f in v.findings]
+        rejected = any(v.verdict == ReviewVerdict.REVISE for v in verdicts) or any(f.blocking for f in findings)
         return LLMReviewVerdict(
             verdict=ReviewVerdict.REVISE if rejected else ReviewVerdict.APPROVED,
             score=min(v.score for v in verdicts),
@@ -404,6 +496,7 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             technical_audit=[t for v in verdicts for t in v.technical_audit],
             ergonomics_ux=[t for v in verdicts for t in v.ergonomics_ux],
             remediation_steps=[t for v in verdicts for t in v.remediation_steps],
+            findings=findings,
             proposed_invariants=[t for v in verdicts for t in v.proposed_invariants],
             review_mode="llm_deep",
         )
@@ -452,13 +545,15 @@ Verified evidence (computed by guard over the whole repository, valid for every 
     def _parse_llm_response(self, text: str, model_name: str = "LLM", focus: str = "all") -> Optional[LLMReviewVerdict]:
         try:
             score_match = re.search(r"SCORE:\s*([\d\.]+)", text)
-            verdict_match = re.search(r"VERDICT:\s*(APPROVED|REVISE)", text, re.IGNORECASE)
-            if not score_match and not verdict_match:
+            findings = parse_findings(text, getattr(self, "_task_text", ""))
+            if findings is None:
+                # No readable FINDINGS list is no LLM review: asked again once (format reminder), then
+                # reported as not run. Only structured findings approve or block
                 return None
 
             score = float(score_match.group(1)) if score_match else 8.0
             score = max(0.0, min(10.0, score))
-            verdict = ReviewVerdict.APPROVED if (verdict_match and verdict_match.group(1).upper() == "APPROVED") else ReviewVerdict.REVISE
+            verdict = ReviewVerdict.REVISE if any(f.blocking for f in findings) else ReviewVerdict.APPROVED
 
             summary_match = re.search(r"SUMMARY:\s*(.+?)(?=\n[A-Z]+:|$)", text, re.DOTALL)
             summary = summary_match.group(1).strip() if summary_match else "LLM Review completed."
@@ -469,6 +564,8 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             proposals = _parse_invariant_proposals(text)
             if any(item.lower() == "none" for item in remed_items):
                 remed_items = []
+            # What to fix is what blocks; advisory findings are follow-ups, not remediation
+            remed_items = [f"[{f.id}] {f.location}: {f.description}" for f in findings if f.blocking]
 
             return LLMReviewVerdict(
                 verdict=verdict,
@@ -480,6 +577,7 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                 ergonomics_ux=ergo_items,
                 remediation_steps=remed_items,
                 proposed_invariants=proposals,
+                findings=findings,
                 review_mode="llm_deep",
             )
         except Exception:
