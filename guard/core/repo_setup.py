@@ -332,8 +332,23 @@ def install_global(cwd: Path) -> Tuple[bool, List[str]]:
     if not docs:
         messages.append("WARN no agent config directory found (~/.claude, ~/.codex, ~/.gemini, ~/.config/opencode); "
                         "use `guard install --workspace <dir>` so agents see the guard directives")
+    for adapter in _detected_adapters(installed_too=False):
+        # Offered, not done: the agent's own config changes only after the user saw the diff
+        messages.append(f"WARN {adapter['title']} found: `guard agent add {adapter['name']}` makes it call guard through "
+                        "its hooks (edits blocked before guard pre, no stop or commit without an approval)")
     messages.extend(ensure_repo_setup(cwd))
     return ok, messages
+
+
+def _detected_adapters(installed_too: bool = True) -> List[dict]:
+    """Built-in adapters whose agent is on this machine; without `installed_too`, only those not set up yet."""
+    from guard.agent.adapter import BUILT_IN, installed, load_adapter
+    found = []
+    for name in BUILT_IN:
+        adapter = load_adapter(name)
+        if adapter and Path(os.path.expanduser(adapter["detect"])).is_dir() and (installed_too or not installed(adapter)):
+            found.append(adapter)
+    return found
 
 
 def uninstall_global() -> List[str]:
@@ -535,6 +550,15 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         add("ok", "Agent directives", ", ".join(str(d) for d in marked))
     elif not any(s == "unmarked" for s in states.values()):
         add("missing", "Agent directives", "no agent instruction file tells the agent to run guard pre/post", install_fix)
+
+    # 2b. Agent hooks: the directives ask; the hooks enforce
+    from guard.agent.adapter import installed
+    for adapter in _detected_adapters():
+        if installed(adapter):
+            add("ok", "Agent hooks", f"{adapter['title']} calls guard on prompt, edit, shell command and stop")
+        else:
+            add("warn", "Agent hooks", f"{adapter['title']} only reads the directives; nothing stops an edit before guard pre",
+                f"guard agent add {adapter['name']}")
 
     # 3. Project invariants
     if repo:

@@ -57,6 +57,19 @@ def test_edits_need_guard_pre_and_stay_in_scope(tmp_path):
     assert outside.action == "block" and "--scope src/other.ts" in outside.reason
 
 
+def test_edits_git_ignores_are_not_guarded(tmp_path):
+    from guard.core.untracked import decide as record
+    repo = make_repo(tmp_path)
+    (repo / "plans").mkdir()
+    (repo / "plans" / "plan.md").write_text("# plan\n", encoding="utf-8")
+    record(repo, "plans", "ignore")  # the user's choice: never part of the repository
+    assert edit(repo, "plans/plan.md").action == "allow"  # no session needed: it never reaches a commit
+    assert edit(repo, "plans/new-phase.md").action == "allow"  # new files in it too
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    assert edit(repo, "plans/plan.md").action == "allow"  # and it is not "outside the scope"
+    assert edit(repo, "src/other.ts").action == "block"  # the repository's own files stay guarded
+
+
 def test_the_users_prompt_is_recorded_and_reaches_the_gate(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     hint = decide(AgentEvent(event="prompt", cwd=str(repo), prompt="Make chat retry once on 503"))

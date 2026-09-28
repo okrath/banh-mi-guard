@@ -173,17 +173,17 @@ def test_guard_accept_is_the_users_and_approves_only_what_was_reviewed(tmp_path,
     import guard.cli as cli
 
     def accept(answer):
-        monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: answer)
-        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
-        monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
-        try:
-            cli.accept_cmd(repo=str(repo))
-            return 0
-        except cli.typer.Exit as e:
-            return e.exit_code
-        finally:
-            monkeypatch.undo()
-            monkeypatch.chdir(repo)
+        import pytest
+        # a local patch: monkeypatch.undo() would also undo conftest's HOME / GUARD_HOME isolation
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cli.typer, "prompt", lambda *a, **k: answer)
+            mp.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+            mp.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+            try:
+                cli.accept_cmd(repo=str(repo))
+                return 0
+            except cli.typer.Exit as e:
+                return e.exit_code
 
     (repo / "src" / "chat.ts").write_text("export const a = 3;\n", encoding="utf-8")  # edited after the review
     assert accept("a") == 1

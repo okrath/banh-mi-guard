@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from guard.cli import app, execute_post_task, execute_pre_task
 from guard.core.untracked import MARK, decide, load_decisions, undecided
+from guard.core.untracked import _save as REAL_SAVE  # restored by hand: monkeypatch.undo() would also undo conftest's isolation
 
 
 def make_repo(tmp_path: Path) -> Path:
@@ -156,7 +157,7 @@ def test_a_failed_update_leaves_the_path_undecided(tmp_path, monkeypatch):
         decide(repo, "plans", "ignore")  # the exclude write works, recording fails: rolled back
     assert exclude_text(repo) == before and undecided(repo) == ["plans/"]
 
-    monkeypatch.undo()
+    monkeypatch.setattr(untracked, "_save", REAL_SAVE)
     decide(repo, "plans", "ignore")
     monkeypatch.setattr(untracked, "_save", lambda r, d: (_ for _ in ()).throw(OSError("read-only")))
     ignored = exclude_text(repo)
@@ -300,7 +301,8 @@ def test_a_failed_undo_is_reported_and_a_stale_ignore_hides_nothing(tmp_path, mo
     monkeypatch.setattr(untracked, "_save", lambda r, d: (_ for _ in ()).throw(OSError("read-only")))
     with pytest.raises(ValueError, match="could not be recorded .* or undone"):
         decide(repo, "plans", "include")  # the block is gone, the registry still says ignore
-    monkeypatch.undo()
+    monkeypatch.setattr(untracked, "_write_bytes_atomic", real_write)
+    monkeypatch.setattr(untracked, "_save", REAL_SAVE)
     assert load_decisions(repo) == {} and undecided(repo) == ["plans/"]  # visible again, and asked about
 
 

@@ -245,8 +245,23 @@ def decide(ev: AgentEvent) -> Decision:
     return Decision()
 
 
+def _ignored_by_the_user(repo: Path, paths: List[str]) -> set:
+    """
+    Paths the user chose to always ignore (`guard untracked <path> --ignore`, e.g. an agent's plans/):
+    never part of the repository, so an edit there is not guarded. Only that choice counts: a file
+    .gitignore hides (.env, build output) stays guarded. An unreadable registry ignores nothing.
+    """
+    from guard.core.untracked import RegistryError, covers, load_decisions
+    try:
+        ignored = [d for d, choice in load_decisions(repo).items() if choice == "ignore"]
+    except (RegistryError, OSError, ValueError):
+        return set()
+    return {p for p in paths if any(covers(d, p) for d in ignored)}
+
+
 def _edit_decision(repo: Path, session, ev: AgentEvent) -> Decision:
     targets = [r for r in (_relative(repo, p) for p in ev.file_paths) if r and not r.startswith(".guard/")]
+    targets = [t for t in targets if t not in _ignored_by_the_user(repo, targets)]
     if not targets:
         return Decision()
     if not _active_pre(session):

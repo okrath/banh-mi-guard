@@ -1514,6 +1514,170 @@ def untracked_cmd(
         raise typer.Exit(code=1)
 
 
+AGENT_TEST_FLAG = "agent-test.json"  # present while `guard agent test` listens: every event is logged
+
+agent_app = typer.Typer(name="agent", help="🤖 Put guard on an agent's path through its hooks", no_args_is_help=True)
+app.add_typer(agent_app, name="agent")
+
+
+def _adapter_or_exit(name: str) -> dict:
+    from guard.agent.adapter import BUILT_IN, load_adapter
+    adapter = load_adapter(name)
+    if adapter is None:
+        console.print(f"[bold red]❌ No adapter named {name!r}.[/bold red] Built in: {', '.join(BUILT_IN)}")
+        raise typer.Exit(code=1)
+    return adapter
+
+
+def _unchanged_since_diff(path: Path, shown: dict) -> None:
+    """The config is written only as confirmed: if it changed while the diff was on screen, nothing is written."""
+    from guard.agent.adapter import AdapterError, read_config
+    try:
+        now = read_config(path)
+    except AdapterError as e:
+        now = str(e)
+    if now != shown:
+        console.print(f"[bold red]❌ {path} changed while you were reading the diff; nothing was written. Run the command again.[/bold red]")
+        raise typer.Exit(code=1)
+
+
+def _test_listening() -> bool:
+    """`guard agent test` started less than an hour ago (an abandoned test stops logging by itself)."""
+    from guard.core.repo_setup import guard_home
+    try:
+        since = datetime.fromisoformat(json.loads((guard_home() / AGENT_TEST_FLAG).read_text(encoding="utf-8"))["since"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (datetime.now(timezone.utc) - since).total_seconds() < 3600
+
+
+def _show_diff(text: str) -> None:
+    for line in text.splitlines():
+        style = "green" if line.startswith("+") and not line.startswith("+++") else (
+            "red" if line.startswith("-") and not line.startswith("---") else "dim")
+        console.print(line, style=style, markup=False, highlight=False)
+
+
+@agent_app.command("add")
+def agent_add_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-code")):
+    """
+    Add guard's hooks to the agent's own config (global, never a repository file): shows the diff,
+    asks you to confirm, keeps the original as <file>.guard.bak, and changes only guard's entries.
+    """
+    from guard.agent.adapter import AdapterError, config_path, diff, read_config, save_adapter, with_guard, write_config
+    adapter = _adapter_or_exit(name)
+    path = config_path(adapter)
+    try:
+        before = read_config(path)
+    except AdapterError as e:
+        console.print(f"[bold red]❌ {e}[/bold red]")
+        raise typer.Exit(code=1)
+    after = with_guard(before, adapter)
+    change = diff(path, before, after)
+    if not change:
+        save_adapter(adapter)
+        console.print(f"[green]✅ {adapter['title']} already runs guard's hooks ({path}).[/green]")
+        return
+    _show_diff(change)
+    if not typer.confirm(f"Write these hooks to {path}?", default=False):
+        console.print("[dim]Nothing changed.[/dim]")
+        raise typer.Exit(code=1)
+    _unchanged_since_diff(path, before)
+    backup = write_config(path, after)
+    save_adapter(adapter)
+    console.print(f"[bold green]✅ {adapter['title']} now calls guard on prompt, edit, shell command and stop.[/bold green]")
+    if backup:
+        console.print(f"[dim]Original kept as {backup}.[/dim]")
+    console.print(f"Check it with [bold]guard agent test {name}[/bold]; undo with [bold]guard agent remove {name}[/bold].")
+
+
+@agent_app.command("remove")
+def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-code")):
+    """
+    For the user, in an interactive terminal: take guard's hooks out of the agent's config (only
+    guard's entries; everything else stays as it is). An agent cannot remove its own guard.
+    """
+    from guard.agent.adapter import AdapterError, config_path, diff, read_config, without_guard, write_config
+    adapter = _adapter_or_exit(name)
+    path = config_path(adapter)
+    try:
+        before = read_config(path)
+    except AdapterError as e:
+        console.print(f"[bold red]❌ {e}[/bold red]")
+        raise typer.Exit(code=1)
+    after = without_guard(before)
+    change = diff(path, before, after)
+    if not change:
+        console.print(f"[green]No guard hooks in {path}.[/green]")
+        return
+    _show_diff(change)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ Removing guard's hooks is the user's decision: run it yourself in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
+    if not typer.confirm(f"Remove guard's hooks from {path}?", default=False):
+        console.print("[dim]Nothing changed.[/dim]")
+        raise typer.Exit(code=1)
+    _unchanged_since_diff(path, before)
+    write_config(path, after)
+    console.print(f"[bold green]✅ Guard's hooks removed from {path}.[/bold green]")
+
+
+@agent_app.command("test")
+def agent_test_cmd(
+    name: str = typer.Argument(..., help="Adapter, e.g. claude-code"),
+    report: bool = typer.Option(False, "--report", help="Report the events that arrived since the test started, and stop listening"),
+):
+    """
+    Check that the agent really calls guard. Step 1 starts listening; then, in the agent, ask for one
+    small file edit in a repository with no guard session. Step 2 (--report) lists the events that
+    arrived and whether the edit was blocked.
+    """
+    from guard.agent.adapter import installed
+    from guard.core.repo_setup import guard_home
+    adapter = _adapter_or_exit(name)
+    flag, log_path = guard_home() / AGENT_TEST_FLAG, guard_home() / "agent-events.log"
+    if not report:
+        if not installed(adapter):
+            console.print(f"[yellow]⚠️ {adapter['title']} does not run guard's hooks yet: guard agent add {name}[/yellow]")
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(json.dumps({"agent": name, "since": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        console.print(f"[bold cyan]Listening.[/bold cyan] In {adapter['title']}, in a repository without a guard session, ask it to "
+                      "create or edit one small file. Then run [bold]guard agent test " + name + " --report[/bold].")
+        return
+    try:
+        since = json.loads(flag.read_text(encoding="utf-8"))["since"]
+    except (OSError, ValueError, KeyError):
+        console.print(f"[bold red]❌ No test is running: start it with guard agent test {name}[/bold red]")
+        raise typer.Exit(code=1)
+    lines = []
+    if log_path.is_file():
+        lines = [l for l in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                 if l[:32] >= since[:32] and f" {name} " in l and " EVENT " in l]
+    flag.unlink(missing_ok=True)
+    seen = {h["harness_event"]: [] for h in adapter["hooks"]}
+    for line in lines:
+        parts = line.split(" EVENT ", 1)[1].split()
+        seen.setdefault(parts[0], []).append(" ".join(parts[1:]))
+    table = Table(title=f"🤖 {adapter['title']}: events since {since[:19]}", show_header=True)
+    table.add_column("Harness event", style="bold")
+    table.add_column("Arrived", justify="right")
+    table.add_column("Decisions")
+    for event, results in seen.items():
+        table.add_row(event, str(len(results)), ", ".join(sorted(set(results))) or "[yellow]none[/yellow]")
+    console.print(table)
+    blocked_edit = any("-> block" in r for r in seen.get("PreToolUse", []))
+    missing = [e for e, r in seen.items() if not r]
+    if not lines:
+        console.print("[bold red]❌ No event arrived: the agent is not calling guard (restart it, or check its hooks).[/bold red]")
+        raise typer.Exit(code=1)
+    if blocked_edit:
+        console.print("[green]✅ The edit was blocked by guard. Confirm the agent showed guard's reason (run guard pre first).[/green]")
+    else:
+        console.print("[yellow]⚠️ No edit was blocked: ask for a file edit in a repository without a guard session.[/yellow]")
+    if missing:
+        console.print(f"[yellow]Events that did not arrive: {', '.join(missing)} (a stop arrives when the agent finishes its turn).[/yellow]")
+
+
 @app.command("agent-event")
 def agent_event_cmd(
     event: str = typer.Argument(..., help="prompt | before-edit | after-bash | stop | before-commit"),
@@ -1524,6 +1688,7 @@ def agent_event_cmd(
     JSON; a block also exits 2 with the reason on stderr. A payload guard cannot read is allowed and
     logged: a broken adapter must never lock the user out of their agent.
     """
+    from guard.agent.adapter import harness_event, load_adapter, render
     from guard.agent.events import EVENTS, Decision, decide, normalise
     from guard.core.repo_setup import guard_home
 
@@ -1539,6 +1704,8 @@ def agent_event_cmd(
         except OSError:
             pass
 
+    adapter = load_adapter(agent) if agent else None  # where this harness puts each field, how it reads answers
+    payload: dict = {}
     try:
         raw = sys.stdin.read(MAX_EVENT_BYTES + 1)
         if len(raw) > MAX_EVENT_BYTES:
@@ -1546,10 +1713,7 @@ def agent_event_cmd(
         payload = json.loads(raw) if raw.strip() else {}
         if not isinstance(payload, dict):
             raise ValueError(f"payload is a JSON {type(payload).__name__}, not an object")
-        fields = None
-        if agent:  # the adapter says where this harness puts each field
-            adapter = json.loads((guard_home() / "agents" / f"{agent}.json").read_text(encoding="utf-8"))
-            fields = adapter.get("fields") if isinstance(adapter, dict) else None
+        fields = adapter.get("fields") if adapter else None
         ev = normalise(event, payload, fields)
         if event != "stop" and not (ev.prompt or ev.tool or ev.file_paths or ev.command):
             log(f"INCOMPLETE payload without the fields this event needs (keys: {sorted(payload)[:12]})")
@@ -1562,10 +1726,15 @@ def agent_event_cmd(
         except Exception as e:  # guard's own failure: allowed, but the agent is told it was not checked
             decision = Decision(action="notify", reason=f"Guard could not check this action ({type(e).__name__}: {e}); it was allowed. Tell the user.")
             log(f"ERROR {type(e).__name__}: {e}")
-    sys.stdout.write(json.dumps({"decision": decision.action, "reason": decision.reason}) + "\n")
-    if decision.action == "block":
-        sys.stderr.write(decision.reason + "\n")
-        raise typer.Exit(code=2)
+    harness = harness_event(adapter, event, payload if isinstance(payload, dict) else {})
+    if _test_listening():  # `guard agent test` is listening
+        tool = f" tool={ev.tool}" if ev is not None and ev.tool else ""
+        log(f"EVENT {harness or '-'}{tool} -> {decision.action}")
+    out, err, code = render((adapter or {}).get("output"), harness, decision)
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    if code:
+        raise typer.Exit(code=code)
 
 
 @app.command("review")
