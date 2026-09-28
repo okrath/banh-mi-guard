@@ -597,14 +597,23 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
 
     # 4b. Alibaba OCR: only `guard post --full` runs it
     ocr_binary = load_config(repo or cwd).ocr.binary_path  # the config guard post uses here
+    always = load_global_config().ocr.always
+    # Every row for an installed OCR says when it runs, and how to change that
+    when = {None: "runs only with guard post --full; it can run on every post (not chosen yet: guard config ocr always|optional)",
+            True: "runs on every guard post (guard config ocr optional: only with --full)",
+            False: "runs only with guard post --full (guard config ocr always: on every post)"}[always]
     if shutil.which(ocr_binary) and not llm.api_key:
-        add("warn", "Alibaba OCR", f"{ocr_binary} found, not synced: there is no LLM to give it yet", "guard config llm")
+        add("warn", "Alibaba OCR", f"{ocr_binary} found, not synced: there is no LLM to give it yet; {when}", "guard config llm")
     elif shutil.which(ocr_binary) and not ocr_in_sync(llm, ocr_binary):
-        add("warn", "Alibaba OCR", f"{ocr_binary} found, but guard has not given it the current LLM", "guard config sync")
+        add("warn", "Alibaba OCR", f"{ocr_binary} found, but guard has not given it the current LLM; {when}", "guard config sync")
     elif shutil.which(ocr_binary):
-        add("ok", "Alibaba OCR", f"{ocr_binary} found; guard post --full adds its review")
+        if always is None:  # installed, never chosen: the user should know it can run on every post
+            add("warn", "Alibaba OCR", f"{ocr_binary} found; {when}", "guard config ocr always   (or: guard config ocr optional)")
+        else:
+            add("ok", "Alibaba OCR", f"{ocr_binary} found; {when}")
     else:
-        add("warn", "Alibaba OCR", f"'{ocr_binary}' is not on PATH: guard post works, guard post --full (full review) cannot approve",
+        add("warn", "Alibaba OCR", f"'{ocr_binary}' is not on PATH: guard post works, guard post --full (full review) cannot approve; "
+            f"once installed it {when}",
             "npm install -g @alibaba-group/open-code-review   then: guard config sync")
 
     # 5. Commit messages: the user decides who writes them (machine-wide)

@@ -585,6 +585,8 @@ def run_ocr_review(
     skip_files: Optional[List[str]] = None,
     binary: str = "ocr",
     concurrency: int = 0,
+    on_snapshot=None,
+    cache_key: Optional[str] = None,
 ) -> Tuple[str, List[RuleViolation]]:
     """
     Review the task's changes with Alibaba OCR (`ocr review`, an LLM review) and return
@@ -605,6 +607,8 @@ def run_ocr_review(
         return failed(f"'{binary}' not found on PATH (npm install -g @alibaba-group/open-code-review)")
     inspector = GitDiffInspector(repo_path)
     snapshot = inspector.snapshot_worktree()
+    if on_snapshot:  # the reviewed tree is fixed now: work that writes files (a build) may start
+        on_snapshot()
     # Without the exact base..current range OCR would review only its default diff and miss the
     # task's commits: that is not a review of the task. Only a repository without any commit yet
     # (everything uncommitted) is fully covered by OCR's workspace mode.
@@ -621,17 +625,86 @@ def run_ocr_review(
     guard_dir.mkdir(parents=True, exist_ok=True)
     # Each run writes its own file (concurrent posts never read each other's result); the last one
     # is kept as .guard/ocr-review.json for inspection
+    # Files unchanged since an earlier complete review (same content, LLM, OCR version and base) are
+    # not reviewed again: their cached findings are merged and OCR is told to leave them out
+    fps = _reviewed_fingerprints(repo_path, base_ref, snapshot, skip_files) if cache_key and base_ref and snapshot else {}
+    cache = _load_cache(guard_dir, cache_key) if fps else {}
+    reused = {path: cache[path] for path, fp in fps.items()
+              if isinstance(cache.get(path), dict) and cache[path].get("fp") == fp and "," not in path}
+    cached = [RuleViolation(**v) for entry in reused.values() for v in entry.get("findings") or [] if isinstance(v, dict)]
+    if fps and len(reused) == len(fps):
+        return (f"complete: {len(cached)} finding(s); all {len(reused)} file(s) reused from earlier reviews "
+                "(unchanged since)"), cached
     fd, name = tempfile.mkstemp(dir=guard_dir, prefix="ocr-review-", suffix=".json")
     os.close(fd)
     out_file = Path(name)
     try:
-        return _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed)
+        line, violations = _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files,
+                                    concurrency, failed, exclude=sorted(reused))
+        if fps and line.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in violations):
+            covered = _covered_paths(out_file)
+            fresh = {path: {"fp": fps[path], "findings": [v.model_dump() for v in violations if v.file_path == path]}
+                     for path in fps if path in covered and path not in reused}
+            _save_cache(guard_dir, cache_key, {**reused, **fresh})  # files no longer in the task are dropped
+        if reused:
+            line += f"; {len(reused)} file(s) reused from earlier reviews (unchanged since)"
+        return line, cached + violations
     finally:
         if out_file.exists():
             os.replace(out_file, guard_dir / "ocr-review.json")
 
 
-def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed):
+OCR_CACHE = "ocr-cache.json"
+
+
+def _reviewed_fingerprints(repo_path: Path, base_ref: str, snapshot: str, skip_files) -> dict:
+    """{path: blob id at the snapshot, or "deleted"} for every file the review covers."""
+    git = ["git", "-C", str(repo_path)]
+    names = subprocess.run(git + ["diff", "--name-only", "-z", base_ref, snapshot], capture_output=True, check=False)
+    if names.returncode != 0:
+        return {}
+    skip = set(skip_files or [])
+    paths = [n.decode("utf-8", "surrogateescape") for n in names.stdout.split(b"\0") if n]
+    paths = [path for path in paths if path not in skip]
+    tree = subprocess.run(git + ["ls-tree", "-r", "-z", snapshot], capture_output=True, check=False)
+    blobs = {}
+    for entry in tree.stdout.split(b"\0"):
+        meta, _, name = entry.partition(b"\t")
+        if name:
+            blobs[name.decode("utf-8", "surrogateescape")] = meta.split()[-1].decode("ascii", "replace")
+    return {path: blobs.get(path, "deleted") for path in paths}
+
+
+def _covered_paths(out_file: Path) -> set:
+    """Paths OCR's coverage says it reviewed (completed, reused or waived); nothing when unreadable."""
+    try:
+        coverage = json.loads(out_file.read_text(encoding="utf-8")).get("manifest", {}).get("coverage", {})
+    except (OSError, ValueError, AttributeError):
+        return set()
+    return {i["path"] for k in ("completed", "reused", "waived") for i in coverage.get(k) or []
+            if isinstance(i, dict) and isinstance(i.get("path"), str)}
+
+
+def _load_cache(guard_dir: Path, key: Optional[str]) -> dict:
+    try:
+        data = json.loads((guard_dir / OCR_CACHE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("key") != key or not isinstance(data.get("files"), dict):
+        return {}  # another LLM, OCR version or base: nothing is reused
+    return data["files"]
+
+
+def _save_cache(guard_dir: Path, key: Optional[str], files: dict) -> None:
+    try:
+        tmp = guard_dir / (OCR_CACHE + ".tmp")
+        tmp.write_text(json.dumps({"key": key, "files": files}), encoding="utf-8")
+        os.replace(tmp, guard_dir / OCR_CACHE)
+    except OSError:
+        pass  # only means the next review covers these files again
+
+
+def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed, exclude=()):
     # --timeout 0: OCR's own per-group limit (15 min by default) is off. Its per-request HTTP limit
     # cannot be switched off (0 means its 300 s default), so it is set to ten years: no limit in practice.
     cmd = [ocr_bin, "review", "--repo", str(repo_path), "--format", "json", "--audience", "agent",
@@ -642,6 +715,9 @@ def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_
         cmd += ["--from", base_ref, "--to", snapshot]
     if concurrency > 0:
         cmd += ["--concurrency", str(concurrency)]
+    if exclude:  # files whose earlier review is reused: anchored, literal gitignore patterns
+        from guard.core.untracked_names import pattern
+        cmd += ["--exclude", ",".join(pattern(path) for path in exclude)]
 
     data: dict = {}
     for attempt in range(2):

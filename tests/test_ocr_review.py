@@ -332,3 +332,56 @@ def test_result_without_a_comments_field_is_not_accepted(tmp_path):
          patch("guard.core.ocr_engine.subprocess.run", side_effect=_fake_ocr({"status": "complete", "comments": None}, [])):
         line, violations = run_ocr_review(repo, base, "task")  # null: OCR's way of saying no findings
     assert line.startswith("complete: 0 finding(s)") and violations == []
+
+
+def test_ocr_reviews_only_files_changed_since_its_last_complete_review(tmp_path):
+    repo, base = _task_repo(tmp_path)
+    findings = {"status": "complete", "comments": [
+        {"path": "a.py", "content": "wrong value", "start_line": 1, "category": "bug", "severity": "high"},
+        {"path": "c.py", "content": "naming", "start_line": 1, "category": "style", "severity": "low"},
+    ]}
+
+    def review(result, key="k1"):
+        calls = []
+        with patch("guard.core.ocr_engine.shutil.which", return_value="ocr"), \
+             patch("guard.core.ocr_engine.subprocess.run", side_effect=_fake_ocr(result, calls)):
+            line, violations = run_ocr_review(repo, base, "Fix a.py", cache_key=key)
+        return calls, line, sorted((v.file_path, v.message) for v in violations)
+
+    calls, line, first = review(dict(findings))
+    assert len(calls) == 1 and "--exclude" not in calls[0]  # nothing cached yet: every file reviewed
+    calls, line, again = review(dict(findings))
+    assert calls == [] and "all 3 file(s) reused" in line and again == first  # unchanged: OCR is not started
+
+    (repo / "a.py").write_text("a = 3\n", encoding="utf-8")  # one file changes
+    fresh = {"status": "complete", "comments": [{"path": "a.py", "content": "still wrong", "start_line": 1,
+                                                 "category": "bug", "severity": "high"}]}
+    calls, line, merged = review(fresh)
+    excluded = calls[0][calls[0].index("--exclude") + 1].split(",")
+    assert sorted(excluded) == ["/b.py", "/c.py"] and "2 file(s) reused" in line
+    assert merged == [("a.py", "still wrong"), ("c.py", "naming")]  # c.py's cached finding kept, a.py's is new
+
+    calls, line, _ = review(dict(findings), key="another-llm")  # another LLM, OCR version, base or task
+    assert len(calls) == 1 and "--exclude" not in calls[0]
+
+
+def test_the_cache_is_off_when_the_ocr_version_is_unknown():
+    from types import SimpleNamespace
+    from guard.cli import _ocr_cache_key
+    cfg = SimpleNamespace(ocr=SimpleNamespace(binary_path="ocr"))
+    pre = SimpleNamespace(base_ref="abc")
+    with patch("guard.core.updater.get_installed_ocr_version", return_value="1.4.2"):
+        assert _ocr_cache_key(cfg, pre)
+    for unknown in (None, "installed"):  # an unknown version could hide an upgrade: nothing is reused
+        with patch("guard.core.updater.get_installed_ocr_version", return_value=unknown):
+            assert _ocr_cache_key(cfg, pre) is None
+    with patch("guard.core.updater.get_installed_ocr_version", return_value="1.4.2"):
+        assert _ocr_cache_key(SimpleNamespace(ocr=SimpleNamespace(binary_path="my-ocr")), pre) is None  # not its version
+
+
+def test_an_incomplete_ocr_review_is_never_cached(tmp_path):
+    repo, base = _task_repo(tmp_path)
+    with patch("guard.core.ocr_engine.shutil.which", return_value="ocr"), \
+         patch("guard.core.ocr_engine.subprocess.run", side_effect=_fake_ocr({"status": "failed", "comments": []}, [])):
+        line, _ = run_ocr_review(repo, base, "task", cache_key="k1")
+    assert line.startswith("did not run") and not (repo / ".guard" / "ocr-cache.json").exists()

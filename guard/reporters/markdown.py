@@ -45,6 +45,7 @@ def commit_instruction(post: PostTaskRecord) -> str:
         message = (
             "Before committing, ask the user whether they want a full review with Alibaba OCR first "
             "(`guard post --full`, takes minutes). If yes, run it and follow its report; if no, this gate approval is enough. "
+            "Tell them `guard config ocr always` runs it on every post, if they want that. "
             + message
         )
     return message

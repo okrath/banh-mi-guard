@@ -42,7 +42,7 @@ def terminal(monkeypatch, answers=True, mode="auto"):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: answers(a[0]) if callable(answers) else answers)
-    monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: mode)
+    monkeypatch.setattr(cli.typer, "prompt", lambda q, *a, **k: "optional" if "Alibaba OCR review" in q else mode)
 
 
 def fake_wizard():
@@ -174,6 +174,7 @@ def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
     def row(item):
         return next(r for r in setup_health(tmp_path) if r["item"] == item)
     assert row("LLM")["level"] == "missing" and row("LLM")["fix"] == "guard config llm"
+    assert "once installed it runs only with guard post --full" in row("Alibaba OCR")["detail"]  # not installed: still named
     machine["ocr"] = True  # OCR without an LLM: said plainly, not "OK"
     assert row("Alibaba OCR")["level"] == "warn" and "no LLM" in row("Alibaba OCR")["detail"]
     machine["ocr"] = False
@@ -188,5 +189,31 @@ def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
     assert "invalid URL" in row("LLM")["detail"]  # a malformed URL never stops doctor
     save_config(cfg)
     assert row("Alibaba OCR")["level"] == "warn" and row("Alibaba OCR")["fix"] == "guard config sync"
+    assert "not chosen yet: guard config ocr always|optional" in row("Alibaba OCR")["detail"]  # even when out of sync
     cli.finish_setup(tmp_path)  # syncs
-    assert row("Alibaba OCR")["level"] == "ok"
+    row_ocr = row("Alibaba OCR")  # synced; the setting is not chosen yet, so doctor says it can run on every post
+    assert row_ocr["level"] == "warn" and row_ocr["fix"].startswith("guard config ocr always")
+    cli.config_ocr_cmd("always")
+    assert row("Alibaba OCR")["level"] == "ok" and "every guard post" in row("Alibaba OCR")["detail"]
+
+
+def test_ocr_always_runs_the_review_on_a_plain_post_but_never_in_the_hook(tmp_path, fake_ocr_review):
+    from guard.cli import execute_post_task, execute_pre_task
+    from test_agent_events import make_repo
+    repo = make_repo(tmp_path)
+    cli.config_ocr_cmd("always")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    execute_post_task(repo_path=repo, hook=True)
+    fake_ocr_review.assert_not_called()  # the Git hook stays fast
+    from guard.core.session import SessionManager
+    status = SessionManager(repo).load_local_session().post.ocr_status
+    assert status.startswith("not run in the Git hook") and "always` is on" in status  # the setting is named
+    execute_post_task(repo_path=repo)
+    fake_ocr_review.assert_called_once()  # a plain post now runs it, as --full does
+    from guard.core.ocr_engine import RuleViolation
+    fake_ocr_review.return_value = ("did not run: provider down", [RuleViolation(
+        rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)", message="down")])
+    execute_post_task(repo_path=repo)
+    status = SessionManager(repo).load_local_session().post.ocr_status
+    assert status.startswith("did not run: provider down") and "always` is on" in status  # a failure names it too

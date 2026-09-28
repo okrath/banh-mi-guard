@@ -47,6 +47,7 @@ def test_complete_install_reports_ok(fake_machine, tmp_path):
     install_global(repo)  # also sets the repository up (invariants file)
     cfg = load_global_config()  # a complete install has an LLM, given to OCR
     cfg.llm = LLMConfig(base_url="http://llm.local/v1", api_key="k", model="m")
+    cfg.ocr.always = False  # and the user chose when OCR runs
     save_config(cfg)
     _remember_ocr_sync(cfg.llm)
     with patch("guard.core.repo_setup.shutil.which", return_value="ocr"):

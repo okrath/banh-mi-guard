@@ -148,6 +148,30 @@ def test_sanitize_comment_no_longer_bypasses_xss_rule():
     assert found == [(1, "HIGH"), (4, "LOW")]
 
 
+def test_a_failing_build_rejects_even_when_the_parallel_llm_approves(tmp_path):
+    from guard.core.config import load_global_config, save_config
+    repo = make_repo(tmp_path)
+    (repo / "package.json").write_text('{"name": "fe", "scripts": {"build": "node -e \\"process.exit(3)\\""}}', encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "failing build"], cwd=repo, check=True, capture_output=True)
+    cfg = load_global_config()
+    cfg.llm = LLMConfig(base_url="http://127.0.0.1:9/v1", api_key="k", model="m")
+    save_config(cfg)
+    prompts = []
+
+    def approve(**kw):
+        prompts.append(kw["prompt"])
+        return "SCORE: 9\nSUMMARY: fine\nFINDINGS: None"
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
+    with patch("guard.core.llm_reviewer.call_llm", side_effect=approve):
+        assert execute_post_task(repo_path=repo) is False  # the build decides
+    assert prompts and "run in parallel with this review" in prompts[0]  # the LLM reviewed while it ran
+    session = SessionManager(repo).load_local_session()
+    assert session.post.build_check and not session.post.build_check.passed
+    assert session.llm_rounds == 0  # the discarded LLM verdict is not a review round
+    assert "failing build decides" in session.post.muse_notes
+
+
 def test_failed_llm_call_is_reported_not_disguised():
     cfg = GuardConfig(llm=LLMConfig(base_url="http://127.0.0.1:9/v1", api_key="k", model="m"))
     with patch("guard.core.llm_reviewer.call_llm", side_effect=TimeoutError("read timeout")):
@@ -361,8 +385,9 @@ def test_plain_post_does_not_run_ocr_and_says_so(tmp_path, fake_ocr_review):
     (repo / "src" / "chat.ts").write_text("export function send() { return fetch('/api/v2'); }\n", encoding="utf-8")
     assert execute_post_task(repo_path=repo) is True
     fake_ocr_review.assert_not_called()
-    assert "**Alibaba OCR Review:** `not run (optional: guard post --full adds it)`" in (
-        repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+    report = (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+    assert "**Alibaba OCR Review:** `not run (optional: guard post --full adds it;" in report
+    assert "guard config ocr always" in report  # the user learns it can run on every post
 
 
 def test_prompt_globs_do_not_widen_scope(tmp_path):

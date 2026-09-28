@@ -49,6 +49,9 @@ class OCRConfig(BaseModel):
     auto_sync: bool = Field(default=True, description="Auto synchronize config to Alibaba OCR CLI")
     binary_path: str = Field(default="ocr", description="Command or path for Alibaba OCR CLI")
     concurrency: int = Field(default=0, description="Parallel OCR requests (0 = OCR's default of 8); lower it for a gateway that drops parallel calls")
+    # Whether every guard post runs the OCR review, as --full does (True), or only on request (False).
+    # None: the user has not chosen yet (optional, and guard setup asks)
+    always: Optional[bool] = Field(default=None, description="Run the Alibaba OCR review on every guard post")
 
 
 class GuardConfig(BaseModel):

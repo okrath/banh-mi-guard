@@ -518,9 +518,25 @@ def _execute_post_task(
 
     # Alibaba OCR (an LLM review that reads the repository) runs only for a full review (--full, never
     # in a Git hook); then OCR not running blocks like a HIGH finding. Without it the report says so.
-    ocr_status = "not run (optional: guard post --full adds it)"
+    # The user can make it permanent: `guard config ocr always` (machine-wide) runs it on every post
+    always = bool(load_global_config().ocr.always)
+    full = full or always
+
+    # The build (tests) runs in parallel with the reviews: with OCR it starts once OCR has taken its
+    # snapshot (build output never enters the reviewed tree), without OCR it starts now
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=1)
+    build = {}
+
+    def start_build() -> None:
+        if "future" not in build:
+            build["future"] = pool.submit(_run_build, target_repo)
+    # The status always names the setting, so the user knows when OCR runs and how to change it
+    setting = ("`guard config ocr always` is on: every guard post runs it" if always else
+               "optional: guard post --full adds it; `guard config ocr always` runs it on every post")
+    ocr_status = f"not run in the Git hook ({setting})" if hook else f"not run ({setting})"
     if full and not hook and not task_diff.strip():
-        ocr_status = "skipped: no changes"
+        ocr_status = f"skipped: no changes ({setting})"
     elif full and not hook:
         console.print("[cyan]🔎 Alibaba OCR is reviewing the changes (no time limit; it ends when OCR finishes or reports an error, Ctrl+C stops it)...[/cyan]")
         ocr_status, ocr_violations = run_ocr_review(
@@ -530,46 +546,18 @@ def _execute_post_task(
             skip_files=preexisting_files,
             binary=config.ocr.binary_path,
             concurrency=config.ocr.concurrency,
+            on_snapshot=start_build,
+            cache_key=_ocr_cache_key(config, pre),
         )
         violations.extend(ocr_violations)
+        if ocr_status.startswith("did not run"):  # a failed review names the setting too
+            ocr_status += f" ({setting})"
 
     evidence.append(f"Alibaba OCR review: {ocr_status}")
+    with_ocr = full and not hook and bool(task_diff.strip())  # then the gate waits for OCR and the build
+    start_build()  # no OCR (or it stopped before its snapshot): the build starts here
 
-    # 3. Deterministic Build Check (0 token)
-    build_cmd = detect_build_command(target_repo)
-    build_res: Optional[BuildCheckResult] = None
-    if build_cmd:
-        start_t = time.perf_counter()
-        try:
-            p = subprocess.run(
-                build_cmd,
-                shell=True,
-                cwd=str(target_repo),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=BUILD_TIMEOUT_S,
-            )
-            duration = time.perf_counter() - start_t
-            stdout_str = p.stdout or ""
-            stderr_str = p.stderr or ""
-            build_res = BuildCheckResult(
-                command=build_cmd,
-                passed=(p.returncode == 0),
-                exit_code=p.returncode,
-                output=stdout_str + stderr_str,
-                duration_s=duration,
-            )
-        except Exception as e:
-            duration = time.perf_counter() - start_t
-            build_res = BuildCheckResult(
-                command=build_cmd,
-                passed=False,
-                exit_code=1,
-                output=str(e),
-                duration_s=duration,
-            )
+    # 3. Build and tests: running in parallel (see start_build); waited for before the gate decides
 
     # 4. Invariants: project checks run on current files; template invariants only get diff heuristics
     inv_eval = evaluate_invariants(
@@ -624,20 +612,38 @@ def _execute_post_task(
     if pre and pre.pre_edit_changes:
         evidence.append(f"Files an agent command changed before guard pre ran: {', '.join(pre.pre_edit_changes)}")
 
-    review_verdict = reviewer.review(
-        prompt=prompt,
-        domain=domain,
-        diff_summary=diff_summary.model_copy(update={"raw_diff": task_diff}),
-        build_check=build_res,
-        violations=violations,
-        invariant_result=inv_eval,
-        contracts=pre.existing_contracts if pre else None,
-        use_llm=True,
-        focus=focus,
-        evidence=evidence,
-        ledger=session.findings_ledger if session else [],
-        known_rules=_known_rules(target_repo),
-    )
+    def gate(build_res: Optional[BuildCheckResult], use_llm: bool, notes: List[str]):
+        return reviewer.review(
+            prompt=prompt,
+            domain=domain,
+            diff_summary=diff_summary.model_copy(update={"raw_diff": task_diff}),
+            build_check=build_res,
+            violations=violations,
+            invariant_result=inv_eval,
+            contracts=pre.existing_contracts if pre else None,
+            use_llm=use_llm,
+            focus=focus,
+            evidence=evidence + notes,
+            ledger=session.findings_ledger if session else [],
+            known_rules=_known_rules(target_repo),
+        )
+
+    if with_ocr:  # the gate sees OCR's findings and the build result
+        build_res = build["future"].result()
+        review_verdict = gate(build_res, True, [])
+    else:  # the LLM reviews while the build runs; a failing build still rejects on its own
+        build_cmd = detect_build_command(target_repo)
+        review_verdict = gate(None, True, [
+            f"The build and tests ({build_cmd}) run in parallel with this review; guard rejects the change by "
+            "itself if they fail, so do not raise findings about missing test evidence."] if build_cmd else [])
+        build_res = build["future"].result()
+        if build_res is not None and not build_res.passed:
+            # decided by the build, not by the LLM: the heuristic verdict (REVISE), and no LLM round counted
+            llm_ran = review_verdict.review_mode == "llm_deep"
+            review_verdict = gate(build_res, False, [])
+            if llm_ran:
+                review_verdict.summary += " The LLM review ran in parallel; the failing build decides, so it is not counted."
+    pool.shutdown(wait=False)
 
     all_passed = (review_verdict.verdict == ReviewVerdict.APPROVED)
 
@@ -698,6 +704,62 @@ def _execute_post_task(
         ))
 
     return all_passed
+
+
+def _ocr_cache_key(config, pre) -> Optional[str]:
+    """
+    What an earlier OCR result depends on: the LLM OCR has, its version, the binary and the base
+    commit. None (no reuse, every file reviewed) when the OCR version is not known for this binary.
+    """
+    import hashlib
+    import re
+    from guard.core.config import _llm_fingerprint
+    from guard.core.updater import get_installed_ocr_version
+    # the version is read from `ocr`: for another configured binary it says nothing
+    version = get_installed_ocr_version() if config.ocr.binary_path == "ocr" else None
+    if not version or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        return None
+    parts = [_llm_fingerprint(load_global_config().llm), version, config.ocr.binary_path, (pre.base_ref or "") if pre else ""]
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+
+
+def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
+    """The project's build and tests (0 tokens); None when the project has no build command."""
+    build_cmd = detect_build_command(target_repo)
+    build_res: Optional[BuildCheckResult] = None
+    if build_cmd:
+        start_t = time.perf_counter()
+        try:
+            p = subprocess.run(
+                build_cmd,
+                shell=True,
+                cwd=str(target_repo),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=BUILD_TIMEOUT_S,
+            )
+            duration = time.perf_counter() - start_t
+            stdout_str = p.stdout or ""
+            stderr_str = p.stderr or ""
+            build_res = BuildCheckResult(
+                command=build_cmd,
+                passed=(p.returncode == 0),
+                exit_code=p.returncode,
+                output=stdout_str + stderr_str,
+                duration_s=duration,
+            )
+        except Exception as e:
+            duration = time.perf_counter() - start_t
+            build_res = BuildCheckResult(
+                command=build_cmd,
+                passed=False,
+                exit_code=1,
+                output=str(e),
+                duration_s=duration,
+            )
+    return build_res
 
 
 def _known_rules(target_repo: Path) -> List[dict]:
@@ -1030,6 +1092,24 @@ def config_sync_cmd(
         console.print(f"[yellow]⚠️ {msg}[/yellow]")
 
 
+@config_app.command("ocr")
+def config_ocr_cmd(
+    mode: str = typer.Argument(..., help="always: every guard post runs the Alibaba OCR review; optional: only guard post --full"),
+):
+    """
+    Choose whether every guard post runs the Alibaba OCR review (machine-wide, ~/.guard/config.json).
+    It takes minutes; a failed review or a high/critical finding blocks. The Git hook never runs it.
+    """
+    if mode not in ("always", "optional"):
+        console.print("[bold red]❌ The mode is `always` or `optional`.[/bold red]")
+        raise typer.Exit(code=1)
+    cfg = load_global_config()
+    cfg.ocr.always = mode == "always"
+    path = save_config(cfg)
+    what = "every guard post runs it" if cfg.ocr.always else "only guard post --full runs it"
+    console.print(f"[bold green]✅ Alibaba OCR review `{mode}`: {what}.[/bold green] [dim]Saved to {path}[/dim]")
+
+
 @config_app.command("commit")
 def config_commit_cmd(
     mode: str = typer.Argument(..., help="auto: the agent writes commit messages; ask: the agent asks you for each one"),
@@ -1123,6 +1203,18 @@ def finish_setup(cwd: Path) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]
         except Exception as e:  # like every step: a failure is listed and the others still run
             ok, msg = False, f"failed ({type(e).__name__}: {e})"
         (done if ok else left).append(("OCR sync", "synced with the current LLM" if ok else f"{msg}; later: guard config sync"))
+
+    # 3b. Whether every post runs OCR: asked once, once OCR is here (the answer is kept either way)
+    if shutil.which(ocr_binary) and load_global_config().ocr.always is None:
+        def choose_ocr():
+            mode = typer.prompt("Alibaba OCR review: always (on every guard post, minutes each) or optional (only guard post --full)?",
+                                default="optional").strip().lower()
+            if mode not in ("always", "optional"):
+                return False
+            config_ocr_cmd(mode)
+            return f"OCR {mode}"
+        step("OCR on every post", "guard config ocr always   (or: guard config ocr optional)",
+             "Alibaba OCR is installed. Choose whether every guard post runs its review?", choose_ocr)
 
     # 4. Who writes commit messages
     if not load_global_config().commit_mode:
