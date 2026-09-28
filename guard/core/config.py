@@ -105,6 +105,86 @@ def save_config(config: GuardConfig, local: bool = False, repo_path: Optional[Pa
 OCR_PROVIDER = "guard"
 
 
+def _llm_fingerprint(llm: LLMConfig) -> str:
+    """What OCR was given, as a hash (the API key never lands in guard's state in clear)."""
+    import hashlib
+    raw = "\0".join([llm.base_url or "", llm.protocol.value, llm.model or "", llm.api_key or ""])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _sync_state_path() -> Path:
+    from guard.core.repo_setup import guard_home
+    return guard_home() / "ocr-sync.json"
+
+
+def _synced() -> dict:
+    """{OCR binary: fingerprint of the LLM guard last gave it}."""
+    try:
+        data = json.loads(_sync_state_path().read_text(encoding="utf-8")).get("synced")
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _ocr_key(binary: str) -> str:
+    """The executable `binary` resolves to now (a PATH change to another OCR is another key)."""
+    found = shutil.which(binary)
+    return str(Path(found).resolve()) if found else binary
+
+
+def _remember_ocr_sync(llm: LLMConfig, binary: str = "ocr") -> None:
+    try:
+        path = _sync_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"synced": {**_synced(), _ocr_key(binary): _llm_fingerprint(llm)}}), encoding="utf-8")
+    except OSError:
+        pass  # only means the next setup syncs once more
+
+
+def ocr_in_sync(llm: LLMConfig, binary: str = "ocr") -> bool:
+    """
+    This OCR binary was last given exactly this LLM by guard. OCR has no `config get`, so guard
+    remembers what it set, per binary; a change made in OCR by hand is not seen.
+    """
+    return _synced().get(_ocr_key(binary)) == _llm_fingerprint(llm)
+
+
+class _sync_lock:
+    """An OS lock on ~/.guard/ocr-sync.lock (released by the OS if the process dies)."""
+
+    def __enter__(self):
+        path = _sync_state_path().with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(path, "a+b")
+        if os.name == "nt":
+            import msvcrt
+            import time
+            for _ in range(3000):  # msvcrt only offers a non-blocking try: wait up to ~60 s
+                try:
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                    return self
+                except OSError:
+                    time.sleep(0.02)
+            self.f.close()
+            raise OSError("another guard command is syncing Alibaba OCR; try again")
+        import fcntl
+        fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+
+
 def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]:
     ocr_bin = shutil.which(binary)
     if not ocr_bin:
@@ -120,8 +200,10 @@ def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]
         ("model", llm.model),
     ]
     try:
-        for key, value in settings:
-            subprocess.run([ocr_bin, "config", "set", key, value], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        with _sync_lock():  # one sync at a time: the settings and the marker always describe the same LLM
+            for key, value in settings:
+                subprocess.run([ocr_bin, "config", "set", key, value], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            _remember_ocr_sync(llm, binary)
         return True, "Successfully synced configuration to Alibaba OCR CLI."
     except subprocess.CalledProcessError as e:
         err_out = (e.stderr or "") + (e.stdout or "")

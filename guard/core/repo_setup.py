@@ -581,10 +581,27 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
                 else:
                     add("ok", "Invariants", f"{len(items) - unchecked}/{len(items)} invariants have automated checks")
 
-    # 4. Alibaba OCR: only `guard post --full` runs it
-    from guard.core.config import load_config, load_global_config
+    # 4. The LLM behind the review gate (and Alibaba OCR, which guard keeps in sync with it)
+    from guard.core.config import load_config, load_global_config, ocr_in_sync
+    llm = load_global_config().llm
+    if llm.api_key:
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(llm.base_url or "")
+            where = f"{parts.scheme}://{parts.hostname or ''}{f':{parts.port}' if parts.port else ''}{parts.path}" if parts.scheme else "(no URL)"
+        except ValueError:  # e.g. a non-numeric port: doctor still shows every row
+            where = "(invalid URL: check guard config llm)"
+        add("ok", "LLM", f"{llm.model} at {where}")  # no user, password or query from the URL
+    else:
+        add("missing", "LLM", "no LLM configured: guard post falls back to the heuristic gate", "guard config llm")
+
+    # 4b. Alibaba OCR: only `guard post --full` runs it
     ocr_binary = load_config(repo or cwd).ocr.binary_path  # the config guard post uses here
-    if shutil.which(ocr_binary):
+    if shutil.which(ocr_binary) and not llm.api_key:
+        add("warn", "Alibaba OCR", f"{ocr_binary} found, not synced: there is no LLM to give it yet", "guard config llm")
+    elif shutil.which(ocr_binary) and not ocr_in_sync(llm, ocr_binary):
+        add("warn", "Alibaba OCR", f"{ocr_binary} found, but guard has not given it the current LLM", "guard config sync")
+    elif shutil.which(ocr_binary):
         add("ok", "Alibaba OCR", f"{ocr_binary} found; guard post --full adds its review")
     else:
         add("warn", "Alibaba OCR", f"'{ocr_binary}' is not on PATH: guard post works, guard post --full (full review) cannot approve",

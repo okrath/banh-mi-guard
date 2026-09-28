@@ -42,8 +42,13 @@ def test_old_install_reports_what_is_missing_and_how_to_fix(fake_machine, tmp_pa
 
 
 def test_complete_install_reports_ok(fake_machine, tmp_path):
+    from guard.core.config import LLMConfig, _remember_ocr_sync, load_global_config, save_config
     repo = make_repo(tmp_path / "app")
     install_global(repo)  # also sets the repository up (invariants file)
+    cfg = load_global_config()  # a complete install has an LLM, given to OCR
+    cfg.llm = LLMConfig(base_url="http://llm.local/v1", api_key="k", model="m")
+    save_config(cfg)
+    _remember_ocr_sync(cfg.llm)
     with patch("guard.core.repo_setup.shutil.which", return_value="ocr"):
         levels = {r["item"]: r["level"] for r in setup_health(repo)}
     assert levels["Git hooks"] == "ok"

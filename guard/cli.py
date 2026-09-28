@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import typer
 from rich.console import Console
@@ -1065,6 +1065,113 @@ def print_setup_health(cwd: Path, title: str, only_problems: bool = False) -> in
     return sum(1 for r in rows if r["level"] == "missing")
 
 
+def finish_setup(cwd: Path) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """
+    Do what guard still needs on this machine, in order: an LLM, Alibaba OCR, OCR synced with the
+    LLM, the commit mode, and guard's hooks in the agents found here. Steps that need an answer are
+    asked in an interactive terminal and listed otherwise (an agent never types a key or confirms a
+    diff for the user); a declined or failed step is listed and the next one runs. Returns (done, left).
+    """
+    from guard.agent.adapter import installed
+    from guard.core.config import load_global_config, ocr_in_sync, run_llm_wizard, sync_to_alibaba_ocr
+    from guard.core.repo_setup import _detected_adapters
+    from guard.core.updater import perform_ocr_upgrade
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    done, left = [], []  # (item, what happened) / (item, command to run)
+
+    def step(item: str, command: str, question: str, action) -> None:
+        if not interactive:
+            left.append((item, command))
+            return
+        if not typer.confirm(question, default=True):
+            left.append((item, f"declined; later: {command}"))
+            return
+        try:
+            result = action()
+        except (Exception, SystemExit) as e:  # a failing step (or a wizard that exits) never stops the others
+            left.append((item, f"failed ({type(e).__name__}: {e}); later: {command}"))
+            return
+        if result is False:
+            left.append((item, f"not done; later: {command}"))
+        else:
+            done.append((item, result or "done"))
+
+    # 1. An LLM for the review gate (the wizard also gives it to Alibaba OCR)
+    if not load_global_config().llm.api_key:
+        step("LLM", "guard config llm", "No LLM is configured for the review gate. Set one up now?",
+             lambda: bool(run_llm_wizard().llm.api_key) and "configured")
+
+    # 2. Alibaba OCR, for `guard post --full` (installed through the same quarantine as `guard update ocr`).
+    # The binary is the one guard post and doctor use here (a repository may name its own)
+    ocr_binary = load_config(cwd).ocr.binary_path
+    if not shutil.which(ocr_binary):
+        def install_ocr():
+            ok, msg = perform_ocr_upgrade()
+            console.print(msg, markup=False)
+            # done only when the binary guard uses here is now found (the updater installs `ocr`)
+            return ok and bool(shutil.which(ocr_binary)) and "installed"
+        step("Alibaba OCR", "guard update ocr", "Alibaba OCR (the full review, guard post --full) is not installed. Install it with npm now?",
+             install_ocr)
+
+    # 3. OCR uses the current LLM: no question, it only mirrors guard's own setting. The LLM is the
+    # machine-wide one (OCR is machine-wide: a repository's credentials never reach it as a side effect)
+    llm = load_global_config().llm
+    if llm.api_key and shutil.which(ocr_binary) and not ocr_in_sync(llm, ocr_binary):
+        try:
+            ok, msg = sync_to_alibaba_ocr(llm, ocr_binary)
+        except Exception as e:  # like every step: a failure is listed and the others still run
+            ok, msg = False, f"failed ({type(e).__name__}: {e})"
+        (done if ok else left).append(("OCR sync", "synced with the current LLM" if ok else f"{msg}; later: guard config sync"))
+
+    # 4. Who writes commit messages
+    if not load_global_config().commit_mode:
+        def choose_mode():
+            mode = typer.prompt("Commit messages: auto (the agent writes them) or ask (the agent asks you)?", default="auto").strip().lower()
+            if mode not in ("auto", "ask"):
+                return False
+            config_commit_cmd(mode)
+            return f"mode {mode}"
+        step("Commit mode", "guard config commit auto   (or: guard config commit ask)", "Choose who writes commit messages now?", choose_mode)
+
+    # 5. Guard's hooks in the agents found on this machine (the diff is shown and confirmed there)
+    for adapter in _detected_adapters():
+        if not installed(adapter):
+            def add_hooks(name=adapter["name"], adapter=adapter):
+                try:
+                    agent_add_cmd(name)
+                except typer.Exit:
+                    pass  # declined or refused: the check below says so
+                return installed(adapter) and "hooks added"  # what the agent's config really holds
+            step(f"{adapter['title']} hooks", f"guard agent add {adapter['name']}",
+                 f"{adapter['title']} is here without guard's hooks. Add them (you see the diff first)?", add_hooks)
+
+    if not done and not left:
+        console.print("[green]✅ Setup complete: nothing is missing.[/green]")
+        return done, left
+    table = Table(title="🧩 guard setup", show_header=True, header_style="bold magenta")
+    table.add_column("Item", style="bold")
+    table.add_column("Result")
+    for item, what in done:
+        table.add_row(item, f"[green]✅ {what}[/green]")
+    for item, what in left:
+        table.add_row(item, f"[yellow]⏳ {what}[/yellow]")
+    console.print(table)
+    if left and not interactive:
+        console.print("[yellow]Run these yourself in an interactive terminal (or run `guard setup` there).[/yellow]")
+    return done, left
+
+
+@app.command("setup")
+def setup_cmd():
+    """
+    Do what is still missing on this machine: LLM, Alibaba OCR (installed and synced), commit mode,
+    and guard's hooks in the agents found here. Asks before each step; `guard install` and
+    `guard update` run it at the end.
+    """
+    finish_setup(Path.cwd())
+
+
 def _print_install(result) -> None:
     ok, messages = result
     for msg in messages:
@@ -1092,8 +1199,10 @@ def install_cmd(
     else:
         _print_install(install_global(Path.cwd()))
         console.print("[bold green]✅ Guard active on this machine. Agents read the directives; repositories set themselves up on first use.[/bold green]")
-    # What is still to be chosen or installed (e.g. the commit mode, Alibaba OCR)
-    print_setup_health(Path(workspace) if workspace else Path.cwd(), "🧩 guard setup check", only_problems=True)
+    # Do what is still missing (LLM, OCR, commit mode, agent hooks), then show what remains
+    cwd = Path(workspace) if workspace else Path.cwd()
+    finish_setup(cwd)
+    print_setup_health(cwd, "🧩 guard setup check", only_problems=True)
 
 
 @app.command("uninstall")
@@ -1830,6 +1939,7 @@ def update_cmd(
         if success:
             console.print(f"[bold green]{msg}[/bold green]")
             _refresh_with_new_version()
+            _run_new_version("setup")  # what the new version needs, asked by the new version
         else:
             console.print(f"[bold red]{msg}[/bold red]")
             raise typer.Exit(code=1)
@@ -1849,6 +1959,7 @@ def update_cmd(
     success, msg = perform_ocr_upgrade(force=force, quarantine_days=quarantine_days)
     if success:
         console.print(f"[bold green]{msg}[/bold green]")
+        finish_setup(Path.cwd())  # a new OCR gets the current LLM, and anything else missing is offered
     else:
         console.print(f"[bold yellow]{msg}[/bold yellow]")
         if not force and "QUARANTINE" in msg:
@@ -1986,6 +2097,14 @@ def laya_removed_cmd(ctx: typer.Context):
         "The repository domain is detected from the repository itself.\n"
         f"Downloaded model files are no longer used: delete {Path.home() / '.guard' / 'models'} to free the space."
     )
+
+
+def _run_new_version(*args: str) -> None:
+    """Run a guard command with the freshly installed code (this process still runs the old one)."""
+    try:
+        subprocess.run([sys.executable, "-c", "from guard.cli import main; main()", *args], check=False)
+    except OSError as e:
+        console.print(f"[yellow]Could not start the new guard ({e}); run `guard {' '.join(args)}`.[/yellow]")
 
 
 def _refresh_with_new_version() -> None:
