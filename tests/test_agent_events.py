@@ -125,7 +125,7 @@ def test_bash_outside_scope_is_reported_after_pre(tmp_path):
     assert told.action == "notify" and "src/other.ts" in told.reason and "outside the declared scope" in told.reason
 
 
-def test_stop_needs_an_approved_post_and_commit_needs_ocr(tmp_path, fake_ocr_review):
+def test_stop_and_commit_need_an_approved_post(tmp_path, fake_ocr_review):
     repo = make_repo(tmp_path)
     assert stop(repo).action == "allow"  # a chat without edits
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
@@ -136,15 +136,113 @@ def test_stop_needs_an_approved_post_and_commit_needs_ocr(tmp_path, fake_ocr_rev
     assert bash(repo, commit).action == "block"  # not approved yet
     assert execute_post_task(repo_path=repo) is True  # gate approved, OCR not run
     assert stop(repo).action == "allow"
-    no_ocr = bash(repo, commit)
-    assert no_ocr.action == "block" and "guard post --full" in no_ocr.reason
-
-    assert execute_post_task(repo_path=repo, full=True) is True  # same task, now with OCR (conftest's double)
+    # the approval is enough: OCR is optional and the user is asked about it before the commit
     assert bash(repo, commit).action == "allow"
 
     (repo / "src" / "chat.ts").write_text("export const a = 3;\n", encoding="utf-8")  # edited after approval
     assert bash(repo, commit).action == "block"
     assert stop(repo).action == "block"
+
+
+def test_a_quote_in_a_heredoc_message_does_not_hide_a_commit(tmp_path):
+    from guard.agent.bash import is_git_commit
+    repo = make_repo(tmp_path)
+    message = "git add -A && git commit -q -F - <<'EOF'\nfeat: merges guard's hook entries\nEOF\ngit log --oneline -1"
+    assert bash(repo, message).action == "block"  # no approval: the gate sees the commit
+    assert is_git_commit("git commit -m \"it's", repo)  # cannot be parsed: a commit shape counts (fail closed)
+    assert not is_git_commit("cat <<'EOF' > notes.md\ndon't commit this\nEOF", repo)  # text in a heredoc is text
+    # a heredoc-looking comment or string does not swallow the real command after it
+    for hidden in ("# <<EOF\ngit commit -m x", "echo \"<<EOF\"\ngit commit -m x", "echo a#b; git commit -m x"):
+        assert is_git_commit(hidden, repo), hidden
+    assert not is_git_commit("git status # commit later", repo)  # a real comment is not a command
+    assert is_git_commit("echo \\<<EOF\ngit commit -m x", repo)  # an escaped `<` is not a heredoc
+    assert not is_git_commit("cat <<'END HERE'\nnot a commit\nEND HERE\necho ok", repo)  # quoted delimiter
+    # a body line shaped like a commit still counts: a body read wrongly must never hide one (fail closed)
+    assert is_git_commit("cat <<'END HERE'\ngit commit -m x\nEND HERE", repo)
+    assert not is_git_commit("grep x <<< \"git commit\"", repo)  # a here-string is not a heredoc
+    # a misread heredoc can never hide a commit: every line is also scanned as the shell sees it
+    assert is_git_commit("cat <<EOF-1\nx\nEOF-1\ngit commit -m y", repo)  # delimiter with a dash
+    assert is_git_commit("git \\\ncommit -m \"guard's", repo)  # a line continuation, then an open quote
+    assert is_git_commit("git -C /x commit -m y", repo) and is_git_commit("git -c user.name=a commit", repo)
+    for wrapped in ("sudo git commit -m \"guard's", "git --git-dir /tmp commit -m \"guard's"):  # cannot be parsed
+        assert is_git_commit(wrapped, repo), wrapped
+    # ... without false alarms for reading commands or comments
+    for reading in ("git log --grep commit", "git log --oneline | grep commit", "echo \"x\" # git commit\nls 'a"):
+        assert not is_git_commit(reading, repo), reading
+
+
+def test_a_command_with_a_heredoc_is_measured_not_trusted():
+    from guard.agent.bash import is_read_only
+    assert not is_read_only("cat <<EOF\nx\nEOF")  # its effect is measured after it ran
+
+
+def test_concurrent_posts_keep_each_others_marker(tmp_path):
+    import os
+    from guard.agent.events import POST_MARKER, post_running
+    repo = make_repo(tmp_path)
+    marker = repo / ".guard" / POST_MARKER
+    with post_running(repo):
+        assert json.loads(marker.read_text(encoding="utf-8"))["pid"] == os.getpid()
+        marker.write_text(json.dumps({"pid": os.getpid() + 1}), encoding="utf-8")  # a second post started meanwhile
+    assert marker.exists()  # the first post leaves the second one's marker alone
+
+
+def test_a_prompt_in_utf8_survives_a_cp1252_console(tmp_path):
+    import os
+    import sys
+    repo = make_repo(tmp_path)
+    prompt = "đã chọn c, sửa tiếp đi"
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}  # what a Windows console gives the hook
+    payload = json.dumps({"cwd": str(repo), "hook_event_name": "UserPromptSubmit", "prompt": prompt}, ensure_ascii=False)
+    res = subprocess.run([sys.executable, "-m", "guard.cli", "agent-event", "prompt", "--agent", "claude-code"],
+                         input=payload.encode("utf-8"), capture_output=True, env=env)
+    assert res.returncode == 0, res.stderr
+    assert load_state(repo)["user_prompt"] == prompt
+
+
+def test_stop_waits_for_a_running_post_and_a_marker_never_allows_it(tmp_path, monkeypatch):
+    import sys
+    import time
+    import guard.agent.events as events
+    repo = make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    marker = repo / ".guard" / events.POST_MARKER
+
+    # a post that ends: the stop waits for it, then decides on the session (still unapproved here)
+    short = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+    marker.write_text(json.dumps({"pid": short.pid}), encoding="utf-8")
+    started = time.monotonic()
+    assert stop(repo).action == "block" and time.monotonic() - started >= 1.5
+    short.wait()
+
+    # a marker an agent wrote for a process of its own: it only delays, it never lets the stop through
+    monkeypatch.setattr(events, "POST_WAIT_S", 1)
+    forged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        marker.write_text(json.dumps({"pid": forged.pid}), encoding="utf-8")
+        assert stop(repo).action == "block"
+    finally:
+        forged.kill()
+        forged.wait()
+    marker.unlink()
+    # an oversized or non-regular marker is never read (a FIFO or /dev/zero link would hang the hook)
+    marker.write_text(json.dumps({"pid": forged.pid, "pad": "x" * 5000}), encoding="utf-8")
+    assert not events._post_in_progress(repo)
+    marker.unlink()
+    marker.mkdir()
+    assert not events._post_in_progress(repo)
+    marker.rmdir()
+    assert execute_post_task(repo_path=repo) is True and not marker.exists()  # post removes its own marker
+    assert stop(repo).action == "allow"
+
+    # waited for a post that approved: the stop goes through, with a note to read the report
+    monkeypatch.setattr(events, "POST_WAIT_S", 30)
+    short = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+    marker.write_text(json.dumps({"pid": short.pid}), encoding="utf-8")
+    told = stop(repo)
+    short.wait()
+    assert told.action == "notify" and "has finished" in told.reason
 
 
 def test_cli_contract_block_exits_2_and_bad_payload_is_allowed(tmp_path):

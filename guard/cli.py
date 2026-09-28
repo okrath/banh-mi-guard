@@ -348,7 +348,20 @@ def execute_post_task(
     hook: bool = False,
     full: bool = False,
 ) -> bool:
+    """guard post, marked as running while it works (an agent waiting for it may stop its turn)."""
+    from guard.agent.events import post_running
     target_repo = Path(repo_path or Path.cwd()).resolve()
+    with post_running(target_repo):
+        return _execute_post_task(target_repo, auto_fix=auto_fix, focus=focus, hook=hook, full=full)
+
+
+def _execute_post_task(
+    target_repo: Path,
+    auto_fix: bool = False,
+    focus: str = "all",
+    hook: bool = False,
+    full: bool = False,
+) -> bool:
     for msg in ensure_repo_setup(target_repo, create_invariants=not hook):
         console.print(f"[cyan]🔧 guard setup: {msg}[/cyan]")
     config = load_config(target_repo)
@@ -1707,7 +1720,9 @@ def agent_event_cmd(
     adapter = load_adapter(agent) if agent else None  # where this harness puts each field, how it reads answers
     payload: dict = {}
     try:
-        raw = sys.stdin.read(MAX_EVENT_BYTES + 1)
+        # Harnesses send UTF-8 JSON; the console code page (cp1252 on Windows) would garble the user's prompt
+        stream = getattr(sys.stdin, "buffer", None)
+        raw = stream.read(MAX_EVENT_BYTES + 1).decode("utf-8", "replace") if stream else sys.stdin.read(MAX_EVENT_BYTES + 1)
         if len(raw) > MAX_EVENT_BYTES:
             raise ValueError(f"payload larger than {MAX_EVENT_BYTES} characters")
         payload = json.loads(raw) if raw.strip() else {}

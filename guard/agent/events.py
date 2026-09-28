@@ -293,7 +293,7 @@ def _after_bash(repo: Path, session, ev: AgentEvent) -> Decision:
     if committed and _commit_decision(repo, session).action == "block":  # a commit got past the before-commit check
         return Decision(action="notify", reason=(
             f"Guard: that command made a commit ({after.get(HEAD_KEY, '')[:12]}) without an approved guard review. "
-            "Tell the user; run `guard post --full` on the work before anything is pushed."
+            "Tell the user; run `guard post` on the work and get it approved before anything is pushed."
         ))
     if not changed:
         return Decision()
@@ -313,9 +313,96 @@ def _after_bash(repo: Path, session, ev: AgentEvent) -> Decision:
     return Decision()
 
 
+POST_MARKER = "post-running.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class post_running:
+    """`.guard/post-running.json` with this process id while guard post works; removed when it ends."""
+
+    def __init__(self, repo: Path):
+        self.path = repo / ".guard" / POST_MARKER
+
+    def __enter__(self):
+        from guard.core.git_exclude import write_bytes_atomic
+        try:
+            # atomic, and never through a symlink someone placed at the marker's path
+            write_bytes_atomic(self.path, json.dumps({"pid": os.getpid(), "since": datetime.now(timezone.utc).isoformat()}).encode("utf-8"))
+        except OSError:
+            pass  # only a courtesy for waiting agents: never a reason for post to fail
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            # only this post's own marker: a second post running meanwhile keeps its marker
+            if json.loads(self.path.read_text(encoding="utf-8")).get("pid") == os.getpid() and not self.path.is_symlink():
+                self.path.unlink()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def _post_in_progress(repo: Path) -> bool:
+    import stat
+    path = repo / ".guard" / POST_MARKER
+    try:
+        # Only a small regular file is read (never a symlink, FIFO or device that could hang the hook)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            return False
+        with open(path, "rb") as f:
+            pid = int(json.loads(f.read(4096).decode("utf-8"))["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return pid != os.getpid() and _pid_alive(pid)  # a marker left by a killed post does not count
+
+
+POST_WAIT_S = 540  # under the harness's 600 s hook limit
+
+
+def _wait_for_post(repo: Path) -> bool:
+    """
+    Wait while a guard post runs (its marker names a live process), then let the caller decide on
+    the session as it is then. A marker proves nothing (anyone can write one), so it only buys time:
+    it never allows a stop by itself. True when a post was running.
+    """
+    deadline, waited = time.monotonic() + POST_WAIT_S, False
+    while _post_in_progress(repo) and time.monotonic() < deadline:
+        waited = True
+        time.sleep(max(0.0, min(2.0, deadline - time.monotonic())))  # never past the limit
+    return waited
+
+
 def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
     if ev.loop:
         return Decision()  # the harness already blocked once; never trap the agent
+    if _wait_for_post(repo):  # the agent waits for a running guard post: decide on its result, once
+        decision = _stop_on_session(repo, SessionManager(repo).load_local_session())
+        if decision.action == "allow":
+            return Decision(action="notify", reason="Guard: the guard post you waited for has finished; read its report and act on it.")
+        return decision
+    return _stop_on_session(repo, session)
+
+
+def _stop_on_session(repo: Path, session) -> Decision:
     if session and session.status == SessionStatus.NEEDS_USER:
         return Decision()  # stopping is right: the user decides (guard accept) before anything else
     if _active_pre(session):
@@ -345,9 +432,6 @@ def _commit_decision(repo: Path, session) -> Decision:
     uncovered = _uncovered(repo, session, staged=True)
     if uncovered:
         return Decision(action="block", reason=f"Guard: {', '.join(uncovered)} changed after the last approval. Run `guard post` again before committing.")
-    if not session.post.ocr_complete:
-        return Decision(action="block", reason=(
-            "Guard: the approval has no completed Alibaba OCR review "
-            f"({session.post.ocr_status or 'not run'}). Run `guard post --full` before committing."
-        ))
+    # The approval is enough: the Alibaba OCR review is optional (`guard post --full`), and the user is
+    # asked about it before the commit (the report's Commit line), not forced by the gate
     return Decision()

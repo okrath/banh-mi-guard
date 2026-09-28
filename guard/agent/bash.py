@@ -36,7 +36,74 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "cmd", "powershell", "pwsh
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+# `<<` (not `<<<`), optional `-`, then a quoted delimiter (any text, e.g. 'END HERE') or a word
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(?:'([^'\n]*)'|\"([^\"\n]*)\"|([^\s;&|<>()'\"]+))")
+
+
+def _scan(line: str):
+    """
+    (code, open quote) for one line, as the shell reads it: a `#` starts a comment only outside
+    quotes and at a word start (`a#b` is a word); the code is the line up to such a comment.
+    """
+    quote, prev = "", " "
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                prev = "x"
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch == "\\":
+            i += 2
+            prev = "x"
+            continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and prev in " \t;&|()":
+            return line[:i], ""
+        prev = ch
+        i += 1
+    return line, quote
+
+
+def _is_operator(prefix: str) -> bool:
+    """
+    `<<` after this text is a shell operator, not text: the text before it is not in a comment and
+    not inside quotes. When in doubt it is not a here-document, so no line is dropped (a real command
+    after a `# <<EOF` comment or an `echo "<<EOF"` stays visible to the checks).
+    """
+    code, quote = _scan(prefix)
+    escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2 == 1  # `\<<EOF` is a `<` and a redirect
+    return code == prefix and not quote and not escaped
+
+
+def strip_heredocs(command: str) -> str:
+    """
+    The command without here-document bodies: a message such as `git commit -F - <<'EOF'` followed by
+    "guard's change" is text for the program, not shell syntax, and must not break the tokenizer.
+    """
+    lines, out, i = command.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        found = [m for m in HEREDOC.finditer(line) if _is_operator(line[:m.start()])]
+        out.append(HEREDOC.sub("", line) if found else line)
+        i += 1
+        for m in found:  # each here-document's body follows in order, up to its delimiter line
+            delim, dash = next(g for g in m.groups()[1:] if g is not None), m.group(1) == "-"
+            while i < len(lines) and (lines[i].lstrip("\t") if dash else lines[i]) != delim:
+                i += 1
+            i += 1  # the delimiter line itself
+    return "\n".join(out)
+
+
 def _tokens(command: str) -> Optional[List[str]]:
+    # Heredoc bodies and comments are not commands; a line break separates commands like `;`
+    # (a quoted string spanning lines then fails to parse, and the callers fail closed)
+    lines = strip_heredocs(command.replace("\\\n", "")).split("\n")
+    command = " ;\n".join(_scan(line)[0] for line in lines)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -115,6 +182,8 @@ def _segment_reads_only(words: List[str]) -> bool:
 def is_read_only(command: str) -> bool:
     if "$(" in command or "`" in command or "<(" in command or ">(" in command:
         return False  # command substitution runs something we did not look at
+    if "<<" in command:
+        return False  # a here-document: measured, not guessed (a misread body could hide a command)
     tokens = _tokens(command)
     if tokens is None or any(t in WRITES or t.startswith((">", "&>")) for t in tokens):
         return False
@@ -144,6 +213,25 @@ def _git_alias(repo: Optional[Path], name: str) -> str:
     return (res.stdout or "").strip()
 
 
+# `git`, its global options (-C <dir>, -c <k=v>, --flag[=value]), then the `commit` subcommand
+COMMIT_SHAPE = re.compile(
+    r"(?:^|[;&|(`])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"  # at a command position (VAR=x prefixes allowed)
+    r"git(?:\s+(?:-[Cc]\s+\S+|-\S+))*\s+commit(?:\s|$)"
+)
+
+
+def _looks_like_commit(command: str) -> bool:
+    """
+    A commit found without trusting the tokenizer: every line as the shell sees it (continuations
+    joined, comments removed), heredoc bodies included. Stripping a heredoc wrongly can then never
+    hide a commit; the cost is a rare false alarm for a message line that starts with `git commit`.
+    """
+    for line in command.replace("\\\n", " ").split("\n"):
+        if COMMIT_SHAPE.search(_scan(line)[0]):
+            return True
+    return False
+
+
 def is_git_commit(command: str, repo: Optional[Path] = None, _depth: int = 0) -> bool:
     """
     Whether the command makes a Git commit, looking through wrappers (env, sudo, xargs, ...),
@@ -151,7 +239,14 @@ def is_git_commit(command: str, repo: Optional[Path] = None, _depth: int = 0) ->
     """
     if _depth > 3:
         return False
-    for seg in _segments(_tokens(command) or []):
+    if _looks_like_commit(command):
+        return True
+    tokens = _tokens(command)
+    if tokens is None:
+        # Cannot be parsed (an open quote): any line naming git and then commit counts, whatever wraps
+        # it (sudo, --git-dir <dir>, …), so a quote in a message never lets a commit past the gate
+        return any(re.search(r"\bgit\b.*\bcommit\b", _scan(line)[0]) for line in command.replace("\\\n", " ").split("\n"))
+    for seg in _segments(tokens):
         words = _unwrap(_words(seg))
         if not words:
             continue
