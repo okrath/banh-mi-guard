@@ -118,19 +118,22 @@ def test_llm_discovered_invariants_are_validated_then_written(tmp_path):
         "- API-02 | never uses axios | src/chat.ts | require | axios\n"
         "- SEND-01 | duplicate id | src/chat.ts | require | send\n"
         "- UX-01 | Esc stops generation\n"
+        "- API-01 | a second rule under the same id\n"  # rejected; its 0 checks must not become API-01's count
     )
     with patch("guard.core.llm_reviewer.call_llm", return_value=reply):
         assert execute_post_task(repo_path=repo) is True
 
     post = SessionManager(repo).load_local_session().post
-    assert post.learned_invariants == ["API-01", "UX-01"]
+    assert post.learned_invariants == ["API-01 (1 check(s) pass on the current code)"]  # what verified it
+    assert "API-01 (1 check(s) pass on the current code): added" in (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
     assert any(r.startswith("API-02: check does not pass") for r in post.rejected_invariant_proposals)
     assert any(r.startswith("SEND-01: already present") for r in post.rejected_invariant_proposals)
+    assert any(r.startswith("UX-01: no automated check") for r in post.rejected_invariant_proposals)  # never verified
     # Learned rules go to the local file; the repository's own rulebook is untouched
     shared = json.loads((repo / "guard.invariants.json").read_text(encoding="utf-8"))["invariants"]
     assert [i["id"] for i in shared] == ["SEND-01"]
     written = {i["id"]: i for i in json.loads((repo / ".guard" / "invariants.json").read_text(encoding="utf-8"))["invariants"]}
-    assert written["API-01"]["origin"].startswith("llm:") and written["UX-01"]["checks"] == []
+    assert written["API-01"]["origin"].startswith("llm:") and "UX-01" not in written
 
     # The learned additions are part of the approval: committing them passes the hook
     assert execute_post_task(repo_path=repo, hook=True) is True
@@ -188,7 +191,8 @@ def test_appending_a_learned_rule_keeps_existing_entries_byte_identical(tmp_path
         {"id": "SEND-01", "description": "send exported", "checks": [{"files": "src/chat.ts", "require": "export function send"}]},
     ]})
     (repo / "guard.invariants.json").write_text(original, encoding="utf-8", newline="\n")
-    added, _ = append_learned_invariants(repo, [{"id": "UX-01", "description": "Esc stops generation"}], "s1")
+    added, _ = append_learned_invariants(repo, [{"id": "UX-01", "description": "Esc stops generation",
+                                                 "checks": [{"files": "src/chat.ts", "require": "export"}]}], "s1")
     assert added == ["UX-01"]
     after = (repo / "guard.invariants.json").read_text(encoding="utf-8")
     assert after.startswith(original.rsplit("\n  ]", 1)[0])  # old block untouched, new one appended

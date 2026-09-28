@@ -179,6 +179,7 @@ class LLMReviewerEngine:
         focus: Optional[str] = "all",
         evidence: Optional[List[str]] = None,
         ledger: Optional[List[dict]] = None,
+        known_rules: Optional[List[dict]] = None,
     ) -> LLMReviewVerdict:
         violations = violations or []
         focus_str = (focus or "all").lower()
@@ -211,6 +212,7 @@ class LLMReviewerEngine:
                     focus=focus_str,
                     evidence=evidence or [],
                     ledger=ledger or [],
+                    known_rules=known_rules or [],
                 )
                 if llm_verdict:
                     return llm_verdict
@@ -352,6 +354,7 @@ class LLMReviewerEngine:
         focus: str = "all",
         evidence: Optional[List[str]] = None,
         ledger: Optional[List[dict]] = None,
+        known_rules: Optional[List[dict]] = None,
     ) -> Optional[LLMReviewVerdict]:
         if not self.config or not self.config.llm:
             return None
@@ -407,10 +410,11 @@ class LLMReviewerEngine:
             "documentation/other, requirement = a short verbatim quote from the Task Prompt the change violates or '-'>\n"
             "TECHNICAL: <bullet points>\n"
             "ERGONOMICS: <bullet points>\n"
-            "INVARIANTS: <'None', or one line per DURABLE project rule this diff reveals that is not already in the "
-            "Invariants list above and that the current code satisfies. Format: "
-            "`- ID | description | files-glob | forbid-or-require | python-regex` for a machine check, or "
-            "`- ID | description` for a rule that cannot be checked by regex. ID: UPPERCASE letters/digits/dashes. "
+            "INVARIANTS: <'None', or one line per DURABLE project rule this diff reveals that is not already among the "
+            "existing project rules listed above (in any wording) and that the current code satisfies. Format: "
+            "`- ID | description | files-glob | forbid-or-require | python-regex`. A machine check is required: guard "
+            "rejects a rule without one, a glob that matches no file, and a regex that does not hold on the current "
+            "code; a rule a regex cannot check is not proposed. ID: UPPERCASE letters/digits/dashes. "
             "Write each description in the same language as the existing invariant descriptions listed above "
             "(English when there are none), and wrap file paths in backticks. "
             "Propose only rules the project must keep in every future change, not task-specific notes.>"
@@ -427,6 +431,7 @@ class LLMReviewerEngine:
             f"- [{c.status.upper()}] {c.id}: {c.description} ({c.notes})" for c in (invariant_result.checks if invariant_result else [])
         ) or "- none declared"
         evidence_info = "\n".join(f"- {e}" for e in (evidence or [])) or "- none"
+        known_info = "\n".join(f"- {r.get('id')}: {r.get('description')}" for r in (known_rules or [])) or "- none"
         ledger_info = "\n".join(
             f"- [{f.get('id')}] round {f.get('round')}, {f.get('status', 'open')}"
             + (f" ({f.get('note')})" if f.get("note") else "")
@@ -445,6 +450,8 @@ Out of Scope Files: {diff_summary.out_of_scope_files if diff_summary else []}
 All Touched Files: {files_summary}
 Invariants:
 {invariants_info}
+Every project rule that exists now (team file, local file, learned earlier in this session; never propose one again, not even reworded):
+{known_info}
 Verified evidence (computed by guard over the whole repository, valid for every diff part):
 {evidence_info}
 Findings so far in this session (id, round, status, your earlier wording):

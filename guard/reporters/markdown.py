@@ -227,7 +227,7 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
     if post.learned_invariants or post.rejected_invariant_proposals:
         md.append("\n* **Invariants learned in this review (`.guard/invariants.json`, local):**")
         for i in post.learned_invariants:
-            md.append(f"  - ➕ `{i}` added (passes on the current code; enforced from the next `guard pre`)")
+            md.append(f"  - ➕ {i}: added, enforced from the next `guard pre`")
         for r in post.rejected_invariant_proposals:
             md.append(f"  - ✖️ proposal not added: {r}")
 

@@ -61,9 +61,13 @@ from guard.core.project_invariants import (
     append_learned_invariants,
     evaluate_checks,
     init_invariants_file,
+    learned_without_checks,
+    load_local_invariants,
     load_project_invariants,
     load_shared_invariants,
+    prune_learned_without_checks,
     removed_or_relaxed,
+    similar_groups,
 )
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.core.session import BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
@@ -619,6 +623,7 @@ def execute_post_task(
         focus=focus,
         evidence=evidence,
         ledger=session.findings_ledger if session else [],
+        known_rules=_known_rules(target_repo),
     )
 
     all_passed = (review_verdict.verdict == ReviewVerdict.APPROVED)
@@ -628,6 +633,10 @@ def execute_post_task(
     learned, rejected_props = append_learned_invariants(
         target_repo, review_verdict.proposed_invariants, session.session_id if session else "unknown",
     )
+    # The report says what verified each added rule: how many of its checks pass on the current code
+    # counted from the rules as written, not from the proposals (two proposals may share an id)
+    check_counts = {str(i["id"]): len(i.get("checks") or []) for i in (load_local_invariants(target_repo) or [])} if learned else {}
+    learned = [f"{i} ({check_counts.get(i, 0)} check(s) pass on the current code)" for i in learned]
 
     # 6. Save Post Record
     post_rec = PostTaskRecord(
@@ -676,6 +685,14 @@ def execute_post_task(
         ))
 
     return all_passed
+
+
+def _known_rules(target_repo: Path) -> List[dict]:
+    """Every rule that exists now (team file, local file with this session's learned rules), for the reviewer."""
+    try:
+        return [{"id": i["id"], "description": i["description"]} for i in load_project_invariants(target_repo) or []]
+    except InvariantsFileError:
+        return []  # a broken file is reported by the invariant checks themselves
 
 
 def _write_post_report(target_repo: Path, post_rec, pre) -> None:
@@ -896,8 +913,44 @@ def invariants_check_cmd(
         badge = {"passed": "[green]✅ PASSED[/green]", "failed": "[bold red]❌ FAILED[/bold red]"}.get(status, "[yellow]⚪ UNVERIFIED[/yellow]")
         table.add_row(str(inv["id"]), badge, note)
     console.print(table)
+    unchecked = learned_without_checks(target_repo)
+    if unchecked:
+        console.print(f"[yellow]⚪ {len(unchecked)} rule(s) learned by the review gate have no check and are never verified:[/yellow] "
+                      f"{', '.join(str(i['id']) for i in unchecked)}. Remove them with [bold]guard invariants prune[/bold].")
+    for group in similar_groups(items):
+        console.print(f"[yellow]≈ These rules say the same thing:[/yellow] {', '.join(group)}")
     if failed:
         raise typer.Exit(code=1)
+
+
+@invariants_app.command("prune")
+def invariants_prune_cmd(
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Target repository directory"),
+):
+    """
+    For the user, in an interactive terminal: remove the rules the review gate learned without any
+    check from the local .guard/invariants.json. The team's guard.invariants.json is never touched.
+    """
+    target_repo = Path(repo).resolve() if repo else Path.cwd().resolve()
+    try:
+        unchecked = learned_without_checks(target_repo)
+    except InvariantsFileError as e:
+        console.print(f"[bold red]❌ {e}[/bold red]")
+        raise typer.Exit(code=2)
+    if not unchecked:
+        console.print("[green]No learned rule without a check.[/green]")
+        return
+    for inv in unchecked:
+        console.print(f"  • {inv['id']}: ", end="")
+        console.print(str(inv["description"]), markup=False)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ Removing rules is the user's decision: run guard invariants prune yourself in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
+    if typer.prompt(f"Remove these {len(unchecked)} rule(s) from .guard/invariants.json? (y/N)", default="n").strip().lower() != "y":
+        console.print("[dim]Nothing changed.[/dim]")
+        return
+    gone = prune_learned_without_checks(target_repo, confirmed=unchecked)  # only what was listed and confirmed
+    console.print(f"[bold green]✅ Removed {len(gone)} learned rule(s) without a check.[/bold green]")
 
 
 # Subcommand: guard config
