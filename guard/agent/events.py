@@ -395,6 +395,12 @@ def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
     if ev.loop:
         return Decision()  # the harness already blocked once; never trap the agent
     if _wait_for_post(repo):  # the agent waits for a running guard post: decide on its result, once
+        if _post_in_progress(repo):
+            # Still running when the hook must answer (a full review takes longer than a hook may wait):
+            # keep the agent from stopping, but never send it to start a second post
+            return Decision(action="block", reason=(
+                f"Guard: a guard post is still running (more than {POST_WAIT_S // 60} min so far). Do not start "
+                "another one: wait until it finishes, then read .guard/POST_TASK_REPORT.md and act on it."))
         decision = _stop_on_session(repo, SessionManager(repo).load_local_session())
         if decision.action == "allow":
             return Decision(action="notify", reason="Guard: the guard post you waited for has finished; read its report and act on it.")

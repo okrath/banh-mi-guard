@@ -221,7 +221,9 @@ def test_stop_waits_for_a_running_post_and_a_marker_never_allows_it(tmp_path, mo
     forged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         marker.write_text(json.dumps({"pid": forged.pid}), encoding="utf-8")
-        assert stop(repo).action == "block"
+        still = stop(repo)
+        # still running when the wait ends: blocked, and never told to start a second post
+        assert still.action == "block" and "still running" in still.reason and "Run `guard post`" not in still.reason
     finally:
         forged.kill()
         forged.wait()
