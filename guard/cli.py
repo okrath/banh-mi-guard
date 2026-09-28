@@ -40,6 +40,7 @@ from guard.core.config import (
 )
 from guard.core.invariant_eval import DomainType, evaluate_invariants
 from guard.core.hygiene_engine import HygieneEngine
+from guard.core.impact import check_impact, expected_impact
 from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner, RuleViolation, run_ocr_review
 from guard.core.removal_check import check_removed_symbols
@@ -297,6 +298,11 @@ def execute_pre_task(
         # meantime would let the task choose the rules it is judged by
         baseline_status = dict(superseded.pre.baseline_invariant_status)
         invariants = list(superseded.pre.locked_invariants)
+    # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
+    if superseded:
+        impact = superseded.pre.impact
+    else:
+        impact = expected_impact(target_repo, candidate_files, [inv.model_dump() for inv in invariants]) if candidate_files else None
 
     # 4. Save Session
     # What the agent hook recorded before this pre: the user's own prompt, files changed early
@@ -313,6 +319,7 @@ def execute_pre_task(
     session = session_mgr.start_pre_session(
         user_prompt=user_prompt,
         pre_edit_changes=pre_edit_changes,
+        impact=impact,
         carry=superseded,  # a restart keeps the task's findings ledger and round count
         prompt=prompt,
         expected_files=candidate_files,
@@ -469,6 +476,11 @@ def _execute_post_task(
     removal_violations, removal_summary = check_removed_symbols(target_repo, task_diff)
     violations.extend(removal_violations)
     evidence = [removal_summary] if removal_summary else []
+    # Changed symbols against the impact range pre expected (MEDIUM: reported, never blocking)
+    impact_violations, impact_summary = check_impact(target_repo, task_diff, pre.impact if pre else None, expected_files)
+    violations.extend(impact_violations)
+    if impact_summary:
+        evidence.append(impact_summary)
 
     # Weakening the rulebook is never a side effect: a removed or relaxed invariant blocks
     rulebook_retired: set = set()
@@ -685,6 +697,7 @@ def _execute_post_task(
         learned_invariants=learned,
         rejected_invariant_proposals=rejected_props,
         ocr_status=ocr_status,
+        impact_summary=impact_summary,
         ocr_complete=ocr_status.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in violations),
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )

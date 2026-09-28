@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from guard.core.impact import ImpactRange, is_test
 from guard.core.session import PostTaskRecord, PreTaskRecord
 
 INVARIANT_ICONS = {"passed": "✅", "failed": "❌", "unverified": "⚪", "baseline_failed": "⚠️", "retired": "🗑️"}
@@ -64,6 +65,29 @@ def ocr_findings(post: PostTaskRecord) -> list:
     return [v for v in post.rule_violations if v.rule_id.startswith("OCR-")]
 
 
+def impact_lines(impact: ImpactRange) -> list:
+    """Per scoped file: its invariants, then each symbol with its callers and tests (repository names shown inert)."""
+    by_file: dict = {}
+    for sym in impact.symbols:
+        by_file.setdefault(sym.file, []).append(sym)
+    lines = []
+    for f in sorted(set(by_file) | set(impact.invariants)):
+        ids = impact.invariants.get(f)
+        lines.append(f"  - {inert(f)}" + (f" (invariants: {inert(', '.join(ids))})" if ids else ""))
+        unreferenced = []
+        for sym in by_file.get(f, []):
+            if not sym.references:
+                unreferenced.append(inert(sym.name))
+                continue
+            callers = ", ".join(inert(r) for r in sym.references if not is_test(r)) or "only tests"
+            tests = ", ".join(inert(t) for t in sym.tests) or "none"
+            lines.append(f"    - {inert(sym.name)} ({sym.kind}): {callers}{' …' if sym.capped else ''}; tests: {tests}")
+        if unreferenced:
+            lines.append(f"    - not referenced from other files: {', '.join(unreferenced)}")
+    lines.extend(f"  - ⚠️ capped: {inert(n)}" for n in impact.notes)
+    return lines
+
+
 def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     """
     Generate standard Pre-Task Impact Note.
@@ -88,6 +112,9 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
             md.append(f"  - `{f}`")
     else:
         md.append("  - ⚠️ No scope declared (name files in the prompt or pass `--scope`). Scope will NOT be audited.")
+    if pre.impact and (pre.impact.symbols or pre.impact.invariants or pre.impact.notes):
+        md.append("\n* **Expected Impact Range (symbols, their callers, covering tests, invariants):**")
+        md.extend(impact_lines(pre.impact))
 
     if pre.base_ref:
         md.append(f"\n* **Base commit:** `{pre.base_ref[:12]}` (post-task diffs against it, including mid-task commits)")
@@ -183,6 +210,9 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         for v in ocr_findings(post):
             loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
             md.append(f"  - `[{v.severity}]` {inert(v.rule_id)} at {inert(loc)}: {inert(v.message)}")
+
+    if post.impact_summary:
+        md.append(f"\n* **Impact Range:** {inert(post.impact_summary)} (IMPACT findings are MEDIUM and never block.)")
 
     if post.invariant_result:
         md.append("\n* **Invariant Verification (deterministic checks):**")

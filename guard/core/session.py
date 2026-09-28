@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from guard.core.impact import ImpactRange
 from guard.core.invariant_eval import DomainType, InvariantResult
 from guard.core.ocr_engine import DiffSummary, RuleViolation
 
@@ -66,6 +67,8 @@ class PreTaskRecord(BaseModel):
     # command changed before this pre ran
     user_prompt: Optional[str] = None
     pre_edit_changes: List[str] = Field(default_factory=list)
+    # Symbols of the scoped files with their references, tests and invariants (None: a session from before it existed)
+    impact: Optional[ImpactRange] = None
 
 
 class BuildCheckResult(BaseModel):
@@ -99,6 +102,7 @@ class PostTaskRecord(BaseModel):
     rejected_invariant_proposals: List[str] = Field(default_factory=list)
     ocr_status: str = ""  # "complete: N finding(s) ..." or "did not run: <reason>"
     ocr_complete: bool = False  # OCR reviewed the whole task and did not fail (what an agent commit requires)
+    impact_summary: str = ""  # changed symbols compared with the expected impact range
     commit_mode: Optional[str] = None  # "auto" | "ask" | None (not chosen yet)
     findings: List[Dict] = Field(default_factory=list)  # this round's structured LLM findings
     followups: List[Dict] = Field(default_factory=list)  # findings approved without being fixed
@@ -224,6 +228,7 @@ class SessionManager:
         restarts: Optional[List[Dict[str, str]]] = None,
         user_prompt: Optional[str] = None,
         pre_edit_changes: Optional[List[str]] = None,
+        impact: Optional[ImpactRange] = None,
         carry: Optional["GuardSession"] = None,
     ) -> GuardSession:
         self.guard_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +249,7 @@ class SessionManager:
             restarts=restarts or [],
             user_prompt=user_prompt,
             pre_edit_changes=pre_edit_changes or [],
+            impact=impact,
             expected_files=expected_files,
             existing_contracts=contracts,
             locked_invariants=invariants,

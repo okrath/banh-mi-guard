@@ -67,6 +67,18 @@ def render_pre_task_terminal(pre: PreTaskRecord):
         console.print(Panel(files_str, title="📁 Expected Impact Range (Target Files)", border_style="green"))
     else:
         console.print("[yellow]⚠️ No scope declared (name files in the prompt or pass --scope); scope will not be audited.[/yellow]")
+    if pre.impact and (pre.impact.symbols or pre.impact.invariants or pre.impact.notes):
+        rows = []
+        for f in sorted({s.file for s in pre.impact.symbols} | set(pre.impact.invariants)):
+            syms = [s for s in pre.impact.symbols if s.file == f]
+            callers = {r for s in syms for r in s.references}
+            tests = {t for s in syms for t in s.tests}
+            ids = pre.impact.invariants.get(f)
+            rows.append(f"  • {f}: {len(syms)} symbol(s), {len(callers)} referencing file(s), {len(tests)} test file(s)"
+                        + (f"; invariants {', '.join(ids)}" if ids else ""))
+        rows.extend(f"  ⚠️ capped: {n}" for n in pre.impact.notes)
+        console.print(Panel(Text("\n".join(rows)), title="🧭 Expected symbols, callers and tests (details in PRE_TASK_NOTE.md)",
+                            border_style="green"))
 
 
 def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None):
@@ -194,6 +206,10 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
         for v in ocr_findings(post):
             loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
             console.print(f"  [{v.severity}] {v.rule_id} {loc}: {v.message}", markup=False)
+
+    if post.impact_summary:
+        console.print("[bold cyan]🧭 Impact range:[/bold cyan] ", end="")
+        console.print(post.impact_summary, markup=False)
 
     for i in post.learned_invariants:
         console.print(f"[bold green]➕ Learned invariant {i} → .guard/invariants.json (enforced from next guard pre)[/bold green]")
