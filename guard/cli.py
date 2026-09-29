@@ -1768,15 +1768,19 @@ def _unchanged_since_diff(path: Path, shown: dict) -> None:
         raise typer.Exit(code=1)
 
 
-def _file_unchanged(path: Path, shown: bytes) -> None:
-    """A file is written or deleted only as shown: if it changed while the question was on screen, nothing happens."""
+def _file_state(path: Path):
+    """A file's bytes, None when there is none (an empty file is not an absent one), False when it cannot be read."""
     try:
-        now = path.read_bytes()
+        return path.read_bytes()
     except FileNotFoundError:
-        now = b""
+        return None
     except OSError:
-        now = None
-    if now != shown:
+        return False
+
+
+def _file_unchanged(path: Path, shown) -> None:
+    """A file is written or deleted only as shown: if it changed while the question was on screen, nothing happens."""
+    if _file_state(path) != shown or shown is False:
         console.print(f"[bold red]❌ {path} changed while you were reading; nothing was done. Run the command again.[/bold red]")
         raise typer.Exit(code=1)
 
@@ -1888,7 +1892,7 @@ def _install_extension(adapter: dict, name: str) -> None:
     """omp, pi, opencode: guard writes one file of its own (shown first, confirmed); a file of anyone else's stays."""
     import difflib
     from guard.agent.adapter import (
-        AdapterError, adapters_dir, config_path, extension_is_guards, extension_text, save_adapter,
+        AdapterError, adapters_dir, config_path, extension_is_guards, extension_text, save_adapter, _record_name,
     )
     path = config_path(adapter)
     if path.exists() and not extension_is_guards(adapter):
@@ -1899,8 +1903,8 @@ def _install_extension(adapter: dict, name: str) -> None:
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)
         raise typer.Exit(code=1)
-    seen = path.read_bytes() if path.exists() else b""
-    old = seen.decode("utf-8", errors="replace")
+    seen = _file_state(path)
+    old = seen.decode("utf-8", errors="replace") if isinstance(seen, bytes) else ""
     if old == text:
         save_adapter(adapter)
         console.print(f"[green]✅ {adapter['title']} already loads guard's {path.name} ({path}).[/green]")
@@ -1909,8 +1913,8 @@ def _install_extension(adapter: dict, name: str) -> None:
     if not typer.confirm(f"Write guard's {path.name} to {path}?", default=False):
         console.print("[dim]Nothing changed.[/dim]")
         raise typer.Exit(code=1)
-    _file_unchanged(path, seen)  # never replaces a file put there while the diff was on screen
-    record = adapters_dir() / f"{name}.json"
+    _file_unchanged(path, seen)  # before anything is saved: never replaces a file put there meanwhile
+    record = adapters_dir() / f"{_record_name(name)}.json"
     kept = record.read_bytes() if record.is_file() else None
     save_adapter(adapter)  # the record first, as for a config
     try:
@@ -1930,8 +1934,8 @@ def _install_extension(adapter: dict, name: str) -> None:
 def _install_adapter(adapter: dict, name: str) -> None:
     """Show the config diff, confirm, back up and write; a config guard cannot edit gets the entries to add by hand."""
     from guard.agent.adapter import (
-        AdapterError, adapters_dir, config_path, diff, dump, guard_command, installed, load_adapter, read_config, save_adapter,
-        with_guard, write_config, _entry,
+        AdapterError, adapters_dir, config_path, diff, dump, guard_command, installed, load_adapter, others_under,
+        read_config, save_adapter, switched_on, switched_path, with_guard, write_config, _at, _entry, _record_name,
     )
     _registered_ok(adapter, name)  # every install, including one from a record written earlier
     for limit in adapter.get("limits") or []:  # what guard cannot do for this agent, said before anything is written
@@ -1975,21 +1979,40 @@ def _install_adapter(adapter: dict, name: str) -> None:
         console.print(f"[green]✅ {adapter['title']} already runs guard's hooks ({path}).[/green]")
         return
     _show_diff(change)
+    switched = switched_on(adapter, before)
+    others = others_under(adapter, before)
+    if switched and others:
+        console.print(f"[bold yellow]⚠️ This turns on {', '.join(switched)} in {path}: the {others} hook(s) already "
+                      "there start running too.[/bold yellow] `guard agent remove` switches it back off.")
     if not typer.confirm(f"Write these hooks to {path}?", default=False):
         console.print("[dim]Nothing changed.[/dim]")
         raise typer.Exit(code=1)
     _unchanged_since_diff(path, before)
     # the adapter first: a config that calls `agent-event --agent <name>` must never exist without it
-    record = adapters_dir() / f"{name}.json"
+    record, switch_record = adapters_dir() / f"{_record_name(name)}.json", switched_path(name)
     kept = record.read_bytes() if record.is_file() else None
+    kept_switch = switch_record.read_bytes() if switch_record.is_file() else None
     save_adapter(adapter)
     try:
-        backup = write_config(path, after)
-    except (OSError, AdapterError) as e:  # the config is as it was: so is the adapter its hooks call
-        if kept is None:
-            record.unlink(missing_ok=True)
+        # what guard turns on now, so that remove turns exactly that back off; an earlier record stays
+        # while the switch it names is still on (guard's hooks put back after being taken out by hand)
+        try:
+            earlier = json.loads(kept_switch) if kept_switch else []
+        except ValueError:
+            earlier = []
+        still_on = [k for k in earlier if isinstance(k, str) and _at(before, k.split(".")) is True] \
+            if isinstance(earlier, list) else []
+        if switched or still_on:
+            switch_record.write_text(json.dumps(sorted(set(switched) | set(still_on))), encoding="utf-8")
         else:
-            record.write_bytes(kept)
+            switch_record.unlink(missing_ok=True)
+        backup = write_config(path, after)
+    except (OSError, AdapterError) as e:  # the config is as it was: so are the records about it
+        for file, old in ((record, kept), (switch_record, kept_switch)):
+            if old is None:
+                file.unlink(missing_ok=True)
+            else:
+                file.write_bytes(old)
         console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
         _cannot_set_up(name, f"writing {_home_relative(path)} failed ({type(e).__name__})")
     events = ", ".join(sorted({h["event"] for h in adapter["hooks"]}))
@@ -2079,7 +2102,7 @@ def agent_list_cmd():
     """Built-in and registered agents, and whether each one's config runs guard's hooks now."""
     from guard.agent.adapter import BUILT_IN, adapters_dir, config_path, installed, load_adapter
     from guard.core.repo_setup import _agent_present
-    registered = ({p.stem for p in adapters_dir().glob("*.json") if not p.stem.endswith(".test")}  # not test records
+    registered = ({p.stem for p in adapters_dir().glob("*.json") if "." not in p.stem}  # not test or switch records
                   if adapters_dir().is_dir() else set())
     names = sorted(set(BUILT_IN) | registered)
     table = Table(title="🤖 Agents", show_header=True)
@@ -2108,7 +2131,9 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
     For the user, in an interactive terminal: take guard's hooks out of the agent's config (only
     guard's entries; everything else stays as it is). An agent cannot remove its own guard.
     """
-    from guard.agent.adapter import AdapterError, config_path, diff, read_config, without_guard, write_config
+    from guard.agent.adapter import (
+        AdapterError, config_path, diff, read_config, switched_path, without_guard, write_config, _at, _drop_at,
+    )
     adapter = _adapter_or_exit(name)
     _registered_ok(adapter, name)  # an edited record cannot point remove at another config file
     path = config_path(adapter)
@@ -2119,7 +2144,7 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
         if state in ("missing", "foreign"):
             console.print(f"[green]No guard file at {path}.[/green]")
             return
-        seen = path.read_bytes()
+        seen = _file_state(path)
         if state == "stale":  # guard's file, but not as this guard writes it: what differs is shown first
             current = path.read_text(encoding="utf-8")
             console.print(f"[yellow]{path} differs from the file this guard writes (guard moved, another version, or "
@@ -2145,8 +2170,31 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
         console.print(f"[bold red]❌ {e}[/bold red]")
         raise typer.Exit(code=1)
     after = without_guard(before, adapter["name"], adapter)
+    record = switched_path(name)
+    try:  # the settings guard turned on at add (ZCode's hooks.enabled), still as guard left them
+        switched = json.loads(record.read_text(encoding="utf-8")) if record.exists() else []
+    except (OSError, ValueError):
+        switched = None
+    if not isinstance(switched, list) or not all(isinstance(k, str) for k in switched):
+        console.print(f"[bold red]❌ {record} cannot be read, so guard does not know what it switched on in {path}."
+                      "[/bold red] Nothing was changed. Delete that file to keep every switch as it is now, then run "
+                      f"guard agent remove {name} again.", highlight=False)
+        raise typer.Exit(code=1)
+    own = {k for k, v in (adapter.get("defaults") or {}).items() if v is True} if isinstance(adapter.get("defaults"), dict) else set()
+    # the diff below shows it before anything is written: a switch the user wants kept is kept by declining
+    # (asked only in a terminal: without one, remove stops below before writing anything)
+    if not record.exists() and before != after and sys.stdin.isatty() and sys.stdout.isatty():
+        for key in sorted(own):
+            if _at(after, key.split(".")) is True and typer.confirm(
+                    f"{key} is on in {path}. Guard may have switched it on when it was added (before it kept a record "
+                    "of that). Switch it off too? It also stops the other hooks there", default=False):
+                switched.append(key)
+    for key in switched:
+        if key in own and _at(after, key.split(".")) is True:
+            after = _drop_at(after, key.split("."))
     change = diff(path, before, after)
     if not change:
+        switched_path(name).unlink(missing_ok=True)  # nothing of guard's there: nothing to switch back later
         console.print(f"[green]No guard hooks in {path}.[/green]")
         return
     _show_diff(change)
@@ -2158,6 +2206,7 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
         raise typer.Exit(code=1)
     _unchanged_since_diff(path, before)
     write_config(path, after)
+    switched_path(name).unlink(missing_ok=True)
     console.print(f"[bold green]✅ Guard's hooks removed from {path}.[/bold green]")
 
 
@@ -2217,8 +2266,10 @@ def agent_test_cmd(
     from guard.agent.adapter import test_record_path  # what doctor shows as this agent's last test
     record = test_record_path(name)
     record.parent.mkdir(parents=True, exist_ok=True)
+    from guard.agent.adapter import config_path, config_fingerprint
     record.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "events": len(lines),
-                                  "blocked_edit": blocked_edit, "missing": missing}), encoding="utf-8")
+                                  "blocked_edit": blocked_edit, "missing": missing,
+                                  "config": config_fingerprint(config_path(adapter))}), encoding="utf-8")
     if not lines:
         console.print("[bold red]❌ No event arrived: the agent is not calling guard.[/bold red] Restart the agent and try "
                       "once more; some agents only read their hooks at start.")

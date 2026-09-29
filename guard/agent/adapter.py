@@ -83,9 +83,36 @@ def protection(adapter: Dict[str, Any]) -> str:
     return text
 
 
+def _record_name(name: str) -> str:
+    """An agent's name as part of a file name under ~/.guard/agents: never a path (`..`, `/`)."""
+    if not isinstance(name, str) or not NAME.fullmatch(name):
+        raise AdapterError(f"{name!r} is not an agent name (lowercase letters, digits and -)")
+    return name
+
+
 def test_record_path(name: str) -> Path:
     """What the last `guard agent test <name>` saw (doctor shows it)."""
-    return adapters_dir() / f"{name}.test.json"
+    return adapters_dir() / f"{_record_name(name)}.test.json"
+
+
+def config_fingerprint(path: Path) -> Optional[str]:
+    """
+    Which config file a test saw and what it held: its path and a hash of its content ("missing" when
+    there is none). None when it cannot be read: no evidence, so it never matches an earlier test.
+    """
+    import hashlib
+    try:
+        content = hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        content = "missing"
+    except OSError:
+        return None
+    return f"{path.resolve()}:{content}"
+
+
+def switched_path(name: str) -> Path:
+    """The settings guard switched on for this agent (ZCode's hooks.enabled): `guard agent remove` switches them back."""
+    return adapters_dir() / f"{_record_name(name)}.switched.json"
 
 
 def extension_path(adapter: Dict[str, Any]) -> Path:
@@ -150,6 +177,8 @@ def load_adapter(name: str) -> Optional[Dict[str, Any]]:
     """
     if name in BUILT_IN:
         return BUILT_IN[name]
+    if not isinstance(name, str) or not NAME.fullmatch(name):
+        return None  # never a path outside ~/.guard/agents
     path = adapters_dir() / f"{name}.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -324,6 +353,15 @@ def _at(data: Any, path: List[str]) -> Any:
     return data
 
 
+def _absent_at(data: Any, path: List[str]) -> bool:
+    """Nothing at `path` (a key set to null is there: it is the user's value)."""
+    for part in path:
+        if not isinstance(data, dict) or part not in data:
+            return True
+        data = data[part]
+    return False
+
+
 def _set_at(data: Dict[str, Any], path: List[str], value: Any) -> Dict[str, Any]:
     """A copy of `data` with `value` at `path` (objects on the way are copied, never changed in place)."""
     out = dict(data)
@@ -368,10 +406,31 @@ def read_config(path: Path, adapter: Optional[Dict[str, Any]] = None) -> Dict[st
     return data
 
 
+def _held_parent(settings: Dict[str, Any], path: List[str], whole: bool = False) -> Optional[str]:
+    """
+    The first folder-like key on `path` (with `whole`, `path` itself too) the config holds as something
+    other than an object (null, text), if any.
+    """
+    data: Any = settings
+    for i, part in enumerate(path if whole else path[:-1]):
+        if not isinstance(data, dict) or part not in data:
+            return None
+        data = data[part]
+        if not isinstance(data, dict):
+            return ".".join(path[:i + 1])
+    return None
+
+
 def with_guard(settings: Dict[str, Any], adapter: Dict[str, Any], command: Optional[List[str]] = None) -> Dict[str, Any]:
     """Settings with guard's entries replaced by the adapter's current ones (idempotent)."""
     command = command or guard_command()
     where = hooks_path(adapter)
+    defaults = adapter.get("defaults") or {}
+    for path, whole in [(where, True)] + [(k.split("."), False) for k in (defaults if isinstance(defaults, dict) else {})]:
+        held = _held_parent(settings, path, whole)
+        if held:  # e.g. `"hooks": null`: that value is the user's, and remove could not give it back
+            raise AdapterError(f"`{held}` in the config is {json.dumps(_at(settings, held.split('.')))}, not an object: "
+                               "guard does not replace it; set it to {} or remove it, then add again")
     current = _at(settings, where)
     hooks = _without_guard(current if isinstance(current, dict) else {}, adapter["name"])  # another adapter's stay
     for hook in adapter["hooks"]:
@@ -381,9 +440,8 @@ def with_guard(settings: Dict[str, Any], adapter: Dict[str, Any], command: Optio
     out = _set_at(settings, where, hooks)
     # `defaults`: keys a config needs before its hooks run (Cursor's `version`, ZCode's `hooks.enabled`),
     # set only where the key is absent: a value the user chose is never overridden
-    defaults = adapter.get("defaults") or {}
     for key, value in (defaults.items() if isinstance(defaults, dict) else ()):
-        if _at(out, key.split(".")) is None:
+        if _absent_at(out, key.split(".")):
             out = _set_at(out, key.split("."), value)
     return out
 
@@ -396,6 +454,21 @@ def without_guard(settings: Dict[str, Any], agent: Optional[str] = None,
         return dict(settings)
     hooks = _without_guard(current, agent)
     return _set_at(settings, where, hooks) if hooks else _drop_at(settings, where)
+
+
+def switched_on(adapter: Dict[str, Any], before: Dict[str, Any]) -> List[str]:
+    """The `defaults` guard turns on because the config has none (ZCode's hooks.enabled)."""
+    defaults = adapter.get("defaults") or {}
+    return [k for k, v in (defaults.items() if isinstance(defaults, dict) else ()) if v is True
+            and _absent_at(before, k.split("."))]
+
+
+def others_under(adapter: Dict[str, Any], settings: Dict[str, Any]) -> int:
+    """How many hook entries in the config are not guard's (a switch guard turns on runs them too)."""
+    current = _at(settings, hooks_path(adapter))
+    if not isinstance(current, dict):
+        return 0
+    return sum(len(v) for v in _without_guard(current, adapter.get("name")).values() if isinstance(v, list))
 
 
 def installed(adapter: Dict[str, Any]) -> bool:

@@ -436,3 +436,274 @@ def test_a_guard_file_changed_before_removal_is_confirmed_is_not_deleted(monkeyp
     except cli.typer.Exit as e:
         cli_result = e.exit_code
     assert cli_result == 1 and path.exists()
+
+
+def test_zcode_switch_turned_on_by_guard_is_said_and_switched_back_on_remove(monkeypatch, capsys):
+    import guard.cli as cli
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mine = {"type": "process", "command": "node my-audit.js"}
+    path.write_text(json.dumps({"hooks": {"events": {"Stop": [mine]}}}), encoding="utf-8")  # no hooks.enabled
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    cli._install_adapter(zcode, "zcode")
+    assert "hook(s) already there start running too" in capsys.readouterr().out
+    assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["enabled"] is True
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    cli.agent_remove_cmd(name="zcode")
+    left = json.loads(path.read_text(encoding="utf-8"))
+    assert "enabled" not in left["hooks"] and left["hooks"]["events"]["Stop"] == [mine]  # as before guard came
+
+
+def test_a_zcode_switch_the_user_set_is_left_on_by_remove(monkeypatch):
+    import guard.cli as cli
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"hooks": {"enabled": True, "events": {}}}), encoding="utf-8")
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    cli._install_adapter(zcode, "zcode")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    # no record says guard switched it on, so remove asks: the user keeps it
+    monkeypatch.setattr(cli.typer, "confirm", lambda text, **k: "Switch it off too" not in text)
+    cli.agent_remove_cmd(name="zcode")
+    assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["enabled"] is True
+
+
+def test_a_name_that_is_a_path_never_becomes_one():
+    from guard.agent.adapter import AdapterError, test_record_path
+    assert load_adapter("../outside") is None
+    with pytest.raises(AdapterError):
+        test_record_path("../outside")
+    result = CliRunner().invoke(app, ["agent", "test", "../outside", "--report"])
+    assert result.exit_code == 1 and not (home() / ".guard" / "outside.test.json").exists()
+
+
+def test_presence_without_a_detect_folder_needs_the_config_file():
+    from guard.core.repo_setup import _agent_present
+    (home() / ".config").mkdir(exist_ok=True)
+    assert not _agent_present({"config": "~/.config/acme.json"})  # a shared folder proves nothing
+    (home() / ".config" / "acme.json").write_text("{}", encoding="utf-8")
+    assert _agent_present({"config": "~/.config/acme.json"})
+
+
+def test_an_empty_file_that_appeared_after_the_diff_is_not_replaced(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import extension_path
+    path = extension_path(BUILT_IN["pi"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def someone_creates(*a, **k):
+        path.write_bytes(b"")
+        return True
+    monkeypatch.setattr(cli.typer, "confirm", someone_creates)
+    assert CliRunner().invoke(app, ["agent", "add", "pi"]).exit_code == 1
+    assert path.read_bytes() == b""
+
+
+def test_antigravity_tells_a_stop_it_cannot_refuse():
+    stdout, stderr, code = render(BUILT_IN["antigravity"]["output"], "Stop", Decision(action="block", reason="unapproved edits"))
+    assert stderr.strip() == "unapproved edits" and code == 0
+
+
+def test_doctor_says_a_cli_review_without_an_agent_chosen(tmp_path, monkeypatch):
+    from guard.core import config as config_mod
+    from guard.core.config import LLMConfig, LLMProtocol
+    from guard.core.repo_setup import setup_health
+    cfg = config_mod.load_global_config()
+    cfg.llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent="", api_key="left-over")
+    monkeypatch.setattr(config_mod, "load_global_config", lambda: cfg)
+    rows = [r for r in setup_health(tmp_path) if "LLM" in str(r)]
+    assert any("none is chosen" in str(r) for r in rows)
+
+
+def test_doctor_trusts_the_last_test_for_hooks_added_by_hand_to_a_config_that_is_not_json(tmp_path):
+    from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
+    from guard.core.repo_setup import setup_health
+    (home() / ".acme").mkdir(parents=True, exist_ok=True)
+    (home() / ".acme" / "config.toml").write_text("[hooks]\n", encoding="utf-8")
+    adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
+    adapter.update(name="acme", title="Acme", config="~/.acme/config.toml", detect="~/.acme")
+    adapters_dir().mkdir(parents=True, exist_ok=True)
+    (adapters_dir() / "acme.json").write_text(json.dumps(adapter), encoding="utf-8")
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert any("added by hand" in r and "no test" in r for r in rows)
+    test_record_path("acme").write_text(json.dumps({"at": "2026-09-29T00:00:00", "events": 3, "config": config_fingerprint(home() / ".acme" / "config.toml")}),
+                                        encoding="utf-8")
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert any("hooks added by hand; the last test" in r for r in rows)
+
+
+def test_doctor_never_says_an_edit_was_refused_by_an_agent_that_cannot_refuse_one(tmp_path):
+    from guard.agent.adapter import adapters_dir, test_record_path
+    from guard.core.repo_setup import setup_health
+    adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
+    adapter.update(name="acme", title="Acme", config="~/.acme/hooks.json", detect="~/.acme", can_block=[])
+    adapters_dir().mkdir(parents=True, exist_ok=True)
+    (adapters_dir() / "acme.json").write_text(json.dumps(adapter), encoding="utf-8")
+    path = config_path(adapter)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(with_guard({}, adapter, COMMAND)), encoding="utf-8")
+    test_record_path("acme").write_text(json.dumps({"at": "2026-09-29", "events": 2, "blocked_edit": False}), encoding="utf-8")
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert rows and not any("an edit was refused" in r for r in rows) and any("events arrived" in r for r in rows)
+
+
+def test_a_switch_record_from_an_earlier_add_stays_while_that_switch_is_on(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").write_text('["hooks.enabled"]', encoding="utf-8")  # guard switched it on at an earlier add
+    # guard's hooks were taken out by hand, the switch left on: a new add must not forget who turned it on
+    path.write_text(json.dumps({"hooks": {"enabled": True, "events": {}}}), encoding="utf-8")
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    cli._install_adapter(zcode, "zcode")
+    assert json.loads(switched_path("zcode").read_text(encoding="utf-8")) == ["hooks.enabled"]
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    cli.agent_remove_cmd(name="zcode")
+    assert "enabled" not in json.loads(path.read_text(encoding="utf-8")).get("hooks", {})
+
+
+def test_a_switch_record_whose_switch_is_off_is_dropped_on_add(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").write_text('["hooks.enabled"]', encoding="utf-8")
+    path.write_text(json.dumps({"hooks": {"enabled": False, "events": {}}}), encoding="utf-8")  # the user turned it off
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    cli._install_adapter(zcode, "zcode")
+    assert not switched_path("zcode").exists()
+
+def test_a_config_write_that_fails_leaves_no_switch_record(monkeypatch):
+    import typer
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"hooks": {"events": {}}}), encoding="utf-8")
+
+    def fail(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr("guard.agent.adapter.write_config", fail)
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    with pytest.raises(typer.Exit):
+        cli._install_adapter(zcode, "zcode")
+    assert not switched_path("zcode").exists()
+
+
+def test_a_switch_the_user_set_to_null_is_theirs_and_never_recorded(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_on
+    zcode = BUILT_IN["zcode"]
+    assert switched_on(zcode, {"hooks": {"enabled": None}}) == [] and switched_on(zcode, {"hooks": {}}) == ["hooks.enabled"]
+    assert with_guard({"hooks": {"enabled": None}}, zcode, COMMAND)["hooks"]["enabled"] is None
+
+
+def test_a_switch_record_naming_another_setting_is_ignored_by_remove(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(with_guard({"hooks": {"enabled": True}}, zcode, COMMAND), custom={"on": True})),
+                    encoding="utf-8")
+    switched_path("zcode").parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").write_text('["custom.on"]', encoding="utf-8")  # an edited record
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    cli.agent_remove_cmd(name="zcode")
+    assert json.loads(path.read_text(encoding="utf-8"))["custom"] == {"on": True}
+
+
+def test_a_parent_the_user_set_to_null_is_never_replaced():
+    from guard.agent.adapter import AdapterError
+    with pytest.raises(AdapterError, match="hooks"):
+        with_guard({"hooks": None}, BUILT_IN["zcode"], COMMAND)  # ZCode keeps its events under hooks.events
+    with pytest.raises(AdapterError, match="hooks"):
+        with_guard({"hooks": None}, BUILT_IN["claude-code"], COMMAND)  # the hooks object itself, held as null
+
+
+@pytest.mark.parametrize("record", ["not json", '{"hooks.enabled": true}', '[{"k": 1}]'])
+def test_remove_stops_when_the_switch_record_cannot_be_read(monkeypatch, record):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    installed_config = with_guard({"hooks": {"events": {}}}, zcode, COMMAND)
+    path.write_text(json.dumps(installed_config), encoding="utf-8")
+    switched_path("zcode").parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").write_text(record, encoding="utf-8")
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    with pytest.raises(cli.typer.Exit):
+        cli.agent_remove_cmd(name="zcode")
+    assert json.loads(path.read_text(encoding="utf-8")) == installed_config and switched_path("zcode").exists()
+
+
+def test_hand_added_hooks_that_refused_no_edit_are_not_healthy(tmp_path):
+    from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
+    from guard.core.repo_setup import setup_health
+    (home() / ".acme").mkdir(parents=True, exist_ok=True)
+    (home() / ".acme" / "config.toml").write_text("[hooks]\n", encoding="utf-8")
+    adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
+    adapter.update(name="acme", title="Acme", config="~/.acme/config.toml", detect="~/.acme")
+    adapters_dir().mkdir(parents=True, exist_ok=True)
+    (adapters_dir() / "acme.json").write_text(json.dumps(adapter), encoding="utf-8")
+    test_record_path("acme").write_text(json.dumps({"at": "2026-09-29", "events": 3, "blocked_edit": False, "config": config_fingerprint(home() / ".acme" / "config.toml")}),
+                                        encoding="utf-8")
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert any("refused no edit" in r for r in rows) and not any("saw guard's events" in r for r in rows)
+
+
+def test_hand_added_hooks_are_tested_again_after_their_config_changed(tmp_path):
+    from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
+    from guard.core.repo_setup import setup_health
+    conf = home() / ".acme" / "config.toml"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("[hooks]\n", encoding="utf-8")
+    adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
+    adapter.update(name="acme", title="Acme", config="~/.acme/config.toml", detect="~/.acme")
+    adapters_dir().mkdir(parents=True, exist_ok=True)
+    (adapters_dir() / "acme.json").write_text(json.dumps(adapter), encoding="utf-8")
+    test_record_path("acme").write_text(json.dumps({"at": "2026-09-29", "events": 3, "blocked_edit": True,
+                                                    "config": config_fingerprint(conf)}), encoding="utf-8")
+    conf.write_text("# the user took the hooks out\n", encoding="utf-8")
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert any("changed since the last test" in r for r in rows)
+
+
+def test_remove_of_an_install_older_than_the_switch_record_asks_about_the_switch(monkeypatch):
+    import guard.cli as cli
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(with_guard({"hooks": {"events": {}}}, zcode, COMMAND)), encoding="utf-8")  # no record
+    assert not switched_path("zcode").exists()
+    asked = []
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.typer, "confirm", lambda text, **k: asked.append(text) or True)
+    cli.agent_remove_cmd(name="zcode")
+    assert any("Switch it off too" in q for q in asked)
+    assert "enabled" not in json.loads(path.read_text(encoding="utf-8")).get("hooks", {})
+
+
+def test_a_config_fingerprint_names_its_file_and_an_unreadable_one_has_none(tmp_path):
+    from guard.agent.adapter import config_fingerprint
+    (tmp_path / "a.toml").write_text("same", encoding="utf-8")
+    (tmp_path / "b.toml").write_text("same", encoding="utf-8")
+    assert config_fingerprint(tmp_path / "a.toml") != config_fingerprint(tmp_path / "b.toml")
+    assert config_fingerprint(tmp_path / "gone.toml").endswith(":missing")
+    assert config_fingerprint(tmp_path) is None  # a folder cannot be read as a file: no evidence

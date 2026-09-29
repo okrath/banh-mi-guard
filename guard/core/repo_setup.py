@@ -347,7 +347,7 @@ def _detected_adapters(installed_too: bool = True) -> List[dict]:
     registered (`guard agent add <other agent>`); without `installed_too`, only those not set up yet.
     """
     from guard.agent.adapter import BUILT_IN, adapters_dir, installed, load_adapter
-    registered = sorted(p.stem for p in adapters_dir().glob("*.json") if not p.stem.endswith(".test")) \
+    registered = sorted(p.stem for p in adapters_dir().glob("*.json") if "." not in p.stem) \
         if adapters_dir().is_dir() else []
     found = []
     for name in list(BUILT_IN) + [n for n in registered if n not in BUILT_IN]:
@@ -364,15 +364,12 @@ def _detected_adapters(installed_too: bool = True) -> List[dict]:
 
 
 def _agent_present(adapter: dict) -> bool:
-    """The agent is on this machine: its detect folder exists, else its config's own folder (never home itself), else the file."""
+    """The agent is on this machine: its detect folder exists, else its config file does (a shared folder proves nothing)."""
     from guard.agent.adapter import user_path
     if adapter.get("detect"):
         return Path(user_path(str(adapter["detect"]))).is_dir()
     target = Path(user_path(str(adapter.get("config") or adapter.get("install") or "")))
-    if not target.is_absolute():
-        return False
-    home = Path(os.path.expanduser("~"))
-    return target.is_file() or (target.parent != home and target.parent.is_dir())
+    return target.is_absolute() and target.is_file()
 
 
 def uninstall_global() -> List[str]:
@@ -579,7 +576,32 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     from guard.agent.adapter import installed, protection, test_record_path
     for adapter in _detected_adapters():
         name = adapter["name"]
-        if not installed(adapter):
+        by_hand = adapter.get("kind") != "extension" and not str(adapter.get("config", "")).endswith(".json")
+        if by_hand or not installed(adapter):
+            if by_hand:  # guard printed the entries to add; only a test shows they are there
+                try:
+                    tested = json.loads(test_record_path(name).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    tested = None
+                from guard.agent.adapter import config_fingerprint, config_path
+                refuses = "before-edit" in (adapter.get("can_block") or [])
+                now = config_fingerprint(config_path(adapter))  # None: unreadable now, so nothing to compare with
+                same_file = isinstance(tested, dict) and now is not None and tested.get("config") == now
+                if isinstance(tested, dict) and tested.get("events") and not same_file:
+                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; its config changed since the "
+                        f"last test ({str(tested.get('at'))[:10]})", f"guard agent test {name}")
+                elif isinstance(tested, dict) and tested.get("events") and (tested.get("blocked_edit") or not refuses):
+                    # guard cannot read that file to check it now: the last test is the evidence
+                    add("ok", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
+                        f"({str(tested.get('at'))[:10]}) saw guard's events (run guard agent test {name} after "
+                        "changing that file)")
+                elif isinstance(tested, dict) and tested.get("events"):
+                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
+                        f"({str(tested.get('at'))[:10]}) refused no edit", f"guard agent test {name}")
+                else:
+                    add("warn", "Agent hooks", f"{adapter['title']}: its config is not JSON, so guard's entries are "
+                        "added by hand; no test has seen them yet", f"guard agent test {name}")
+                continue
             stale = False
             if adapter.get("kind") == "extension":
                 from guard.agent.adapter import extension_state
@@ -601,6 +623,9 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         elif not last.get("events"):
             add("warn", "Agent hooks", f"{adapter['title']}: hooks in place, but the last test ({str(last.get('at'))[:10]}) "
                 "saw no event: the agent is not calling guard", f"guard agent fix {name}")
+        elif "before-edit" not in (adapter.get("can_block") or []):  # it reports edits after they run
+            add("ok", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; last test {str(last.get('at'))[:10]}: "
+                "guard's events arrived (this agent cannot refuse an edit, guard reports it right after)")
         elif not last.get("blocked_edit"):  # events arrived, but guard refused no edit during the test
             add("warn", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; the last test "
                 f"({str(last.get('at'))[:10]}) refused no edit", f"guard agent test {name}")
@@ -633,7 +658,10 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     from guard.core.config import load_config, load_global_config, ocr_in_sync
     from guard.core.config import LLMProtocol
     llm = load_global_config().llm
-    if llm.protocol == LLMProtocol.CLI and llm.ready:
+    if llm.protocol == LLMProtocol.CLI and not llm.ready:
+        add("missing", "LLM", "the review runs through an agent CLI, but none is chosen: guard post falls back to "
+            "the heuristic gate", "guard config llm")
+    elif llm.protocol == LLMProtocol.CLI:
         from guard.core import cli_llm
         if cli_llm.find(llm.cli_agent):
             add("ok", "LLM", f"the {llm.cli_agent} CLI" + (f" ({llm.model})" if llm.model else "") + " (your subscription; no API key)")

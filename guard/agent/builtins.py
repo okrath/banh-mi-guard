@@ -172,7 +172,7 @@ ANTIGRAVITY: Dict[str, Any] = {
         # no notification field of Antigravity's is verified: the reason goes to stderr, which a hook's
         # log keeps, on exit 0, which never refuses anything
         "notify": {"*": {"stderr": "{reason}", "exit": 0}},
-        "block": {"PreToolUse": {"stdout": {"decision": "deny", "reason": "{reason}"}}, "*": {"exit": 0}},
+        "block": {"PreToolUse": {"stdout": {"decision": "deny", "reason": "{reason}"}}, "*": {"stderr": "{reason}", "exit": 0}},
     },
     "limits": [
         "Antigravity's stop cannot be refused safely yet: guard reports unapproved edits, the Git pre-commit "
