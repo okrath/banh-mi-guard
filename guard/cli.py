@@ -1785,24 +1785,113 @@ def _show_diff(text: str) -> None:
         console.print(line, style=style, markup=False, highlight=False)
 
 
-@agent_app.command("add")
-def agent_add_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-code")):
+def _home_relative(path: Path) -> str:
+    """A config file as discovery shows it (`~/…`, `%APPDATA%/…`), never a full path with the user's name."""
+    from guard.agent.discover import _shown
+    return _shown(path, path.parent, Path.home())
+
+
+def _cannot_set_up(name: str, problem: str, inv=None) -> None:
+    """Tell the user guard could not make this agent work, what they can do, and exit."""
+    from guard.agent.discover import issue_url
+    console.print(f"[bold yellow]⚠️ Guard could not set up {name}:[/bold yellow] ", end="")
+    console.print(problem, markup=False, highlight=False)
+    console.print(
+        f"What you can do: look in {name}'s documentation for hooks that run a command before an edit or a shell "
+        f"command (then [bold]guard agent fix {name} --note \"<what the docs say>\"[/bold]), or ask for support with "
+        "this prefilled GitHub issue (read it first; guard sends nothing itself):")
+    console.print(issue_url(name, problem, inv), markup=False, highlight=False, soft_wrap=True)
+    console.print(f"Until then guard still protects {name} through the agent directive and the Git pre-commit hook.")
+    raise typer.Exit(code=1)
+
+
+def _proposed_adapter(name: str, inv, previous: Optional[dict] = None, log: str = "") -> dict:
+    """The LLM's adapter after validation (one retry with the problems named), or exit with what to do next."""
+    from guard.agent.adapter import NOT_JSON, validate_adapter
+    from guard.agent.discover import propose
+    from guard.core.llm_client import LLMClientError
+    problems: List[str] = []
+    for _ in range(2):
+        try:
+            proposal = propose(_work_llm(), inv, previous=previous, problems=problems, log=log)
+        except (LLMClientError, ValueError) as e:
+            console.print(f"[bold red]❌ The LLM gave no usable adapter:[/bold red] {printable_error(e)}", highlight=False)
+            console.print("Registering an agent needs a working LLM: check it with [bold]guard config test[/bold] "
+                          "(set it up with [bold]guard config llm[/bold]).")
+            _cannot_set_up(name, f"the LLM gave no usable adapter ({type(e).__name__})", inv)
+        if "no_hooks" in proposal:
+            _cannot_set_up(name, f"no hooks guard can use ({str(proposal['no_hooks'])[:300]})", inv)
+        proposal["name"] = name  # the adapter is registered under the name the user typed
+        problems = [p for p in validate_adapter(proposal) if p != NOT_JSON]
+        if not problems:
+            return proposal
+    _cannot_set_up(name, "the proposed adapter is not safe to install: " + "; ".join(problems), inv)
+
+
+def _work_llm():
+    """The configured LLM without a time limit, as for a review: llm.timeout is only for `guard config test` pings."""
+    return load_config(Path.cwd()).llm.model_copy(update={"timeout": None})
+
+
+def printable_error(e: Exception) -> str:
+    return " ".join(str(e).split())[:300]
+
+
+def _investigate(name: str, need_found: bool = True):
     """
-    Add guard's hooks to the agent's own config (global, never a repository file): shows the diff,
-    asks you to confirm, keeps the original as <file>.guard.bak, and changes only guard's entries.
+    What this machine says about an agent guard does not know, or exit with what to do next. With
+    `need_found` False (fix with a note), an agent nothing points to goes on with the note alone.
     """
-    from guard.agent.adapter import AdapterError, config_path, diff, read_config, save_adapter, with_guard, write_config
-    adapter = _adapter_or_exit(name)
+    from guard.agent.discover import investigate
+    try:
+        inv = investigate(name)
+    except ValueError as e:
+        console.print(f"[bold red]❌ {name!r}: {e}.[/bold red]", highlight=False)
+        raise typer.Exit(code=1)
+    console.print(f"[cyan]🔎 {name}: binary {inv.binary or 'not on PATH'}; {len(inv.listing)} config file(s) found, "
+                  f"{len(inv.files)} read as structure only (no text values).[/cyan]")
+    for note in inv.notes:
+        console.print(f"[dim]{note}[/dim]", highlight=False)
+    if need_found and not inv.found():
+        _cannot_set_up(name, "it is not on PATH and has no config folder in your home folder", inv)
+    return inv
+
+
+def _install_adapter(adapter: dict, name: str) -> None:
+    """Show the config diff, confirm, back up and write; a config guard cannot edit gets the entries to add by hand."""
+    from guard.agent.adapter import (
+        AdapterError, adapters_dir, config_path, diff, dump, guard_command, load_adapter, read_config, save_adapter,
+        with_guard, write_config, _entry,
+    )
+    _registered_ok(adapter, name)  # every install, including one from a record written earlier
     path = config_path(adapter)
     try:
-        before = read_config(path)
+        before = read_config(path) if path.suffix == ".json" else {}
+        after = with_guard(before, adapter)  # builds guard's entries: refuses a command a shell would misread
     except AdapterError as e:
-        console.print(f"[bold red]❌ {e}[/bold red]")
-        raise typer.Exit(code=1)
-    after = with_guard(before, adapter)
+        console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
+        _cannot_set_up(name, f"{_home_relative(path)} could not be read or filled ({type(e).__name__})")
+    if path.suffix != ".json":
+        entries: dict = {}  # every entry of an event, in order (one event may carry several matchers)
+        for h in adapter["hooks"]:
+            entries.setdefault(h["harness_event"], []).append(_entry(adapter, h, guard_command()))
+        console.print(f"[bold yellow]⚠️ {path} is not JSON: guard does not edit it.[/bold yellow] These are the hook "
+                      "entries to add there yourself, in its own format:")
+        console.print(dump(entries), markup=False, highlight=False)
+        if not typer.confirm(f"Register this adapter for {name} (guard answers these hooks with it)?", default=False):
+            console.print("[dim]Nothing changed.[/dim]")
+            raise typer.Exit(code=1)
+        save_adapter(adapter)  # agent-event reads its answers from it
+        console.print(f"Add the entries, then check it with [bold]guard agent test {name}[/bold].")
+        return
     change = diff(path, before, after)
     if not change:
-        save_adapter(adapter)
+        # the entries are in place, but the adapter decides how guard reads and answers them
+        if load_adapter(name) != adapter:
+            if not typer.confirm(f"{path} needs no change. Save the new adapter for {name}?", default=False):
+                console.print("[dim]Nothing changed.[/dim]")
+                raise typer.Exit(code=1)
+            save_adapter(adapter)
         console.print(f"[green]✅ {adapter['title']} already runs guard's hooks ({path}).[/green]")
         return
     _show_diff(change)
@@ -1810,12 +1899,119 @@ def agent_add_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-cod
         console.print("[dim]Nothing changed.[/dim]")
         raise typer.Exit(code=1)
     _unchanged_since_diff(path, before)
-    backup = write_config(path, after)
+    # the adapter first: a config that calls `agent-event --agent <name>` must never exist without it
+    record = adapters_dir() / f"{name}.json"
+    kept = record.read_bytes() if record.is_file() else None
     save_adapter(adapter)
-    console.print(f"[bold green]✅ {adapter['title']} now calls guard on prompt, edit, shell command and stop.[/bold green]")
+    try:
+        backup = write_config(path, after)
+    except (OSError, AdapterError) as e:  # the config is as it was: so is the adapter its hooks call
+        if kept is None:
+            record.unlink(missing_ok=True)
+        else:
+            record.write_bytes(kept)
+        console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
+        _cannot_set_up(name, f"writing {_home_relative(path)} failed ({type(e).__name__})")
+    events = ", ".join(sorted({h["event"] for h in adapter["hooks"]}))
+    console.print(f"[bold green]✅ {adapter['title']} now calls guard on: {events}.[/bold green]")
     if backup:
         console.print(f"[dim]Original kept as {backup}.[/dim]")
     console.print(f"Check it with [bold]guard agent test {name}[/bold]; undo with [bold]guard agent remove {name}[/bold].")
+
+
+@agent_app.command("add")
+def agent_add_cmd(
+    name: str = typer.Argument(..., help="An agent, e.g. claude-code (built in), cursor, codex"),
+):
+    """
+    Add guard's hooks to the agent's own config (global, never a repository file): shows the diff,
+    asks you to confirm, keeps the original as <file>.guard.bak, and changes only guard's entries.
+    An agent guard does not know is investigated first (binary, version, the structure of its config
+    files without their values) and the configured LLM proposes the adapter, which guard validates;
+    `guard agent test` then shows whether it really works. When guard cannot set it up, it says what
+    you can do and prints a prefilled GitHub issue.
+    """
+    from guard.agent.adapter import load_adapter
+    adapter = load_adapter(name)
+    if adapter is None:
+        adapter = _proposed_adapter(name, _investigate(name))
+        console.print(f"[bold cyan]Proposed adapter for {name}[/bold cyan] (saved to ~/.guard/agents/{name}.json when installed):")
+        console.print(json.dumps(adapter, indent=2), markup=False, highlight=False)
+    _install_adapter(adapter, name)
+
+
+def _registered_ok(adapter: dict, name: str) -> None:
+    """
+    A registered adapter is a file anyone can edit: it is validated again before guard writes with
+    it, and it must be the adapter of the agent asked for (`name`), not another agent's record.
+    """
+    from guard.agent.adapter import BUILT_IN, NOT_JSON, validate_adapter
+    if name in BUILT_IN and adapter is BUILT_IN[name]:
+        return  # shipped with this guard version
+    problems = [p for p in validate_adapter(adapter) if p != NOT_JSON]
+    if isinstance(adapter, dict) and adapter.get("name") != name:
+        problems.insert(0, f"name: the record is {adapter.get('name')!r}, not {name!r}")
+    if problems:
+        console.print(f"[bold red]❌ ~/.guard/agents/{name}.json is not safe to install:[/bold red]")
+        for p in problems:
+            console.print(f"  • {p}", markup=False, highlight=False)
+        console.print(f"Regenerate it with [bold]guard agent fix {name}[/bold].")
+        raise typer.Exit(code=1)
+
+
+@agent_app.command("fix")
+def agent_fix_cmd(
+    name: str = typer.Argument(..., help="An agent (registered or not)"),
+    note: str = typer.Option("", "--note", help="What went wrong, or what the agent's docs say about its hooks"),
+):
+    """
+    Regenerate an agent's adapter from the current one (if any), the events guard received from it
+    (guard agent test) and your note; the result is validated and installed like `guard agent add`.
+    An agent `guard agent add` could not set up starts over here with your note.
+    """
+    from guard.agent.adapter import BUILT_IN, adapter_diff, load_adapter
+    from guard.core.repo_setup import guard_home
+    if name in BUILT_IN:
+        console.print(f"[bold red]❌ {name} is built into guard: update guard instead.[/bold red]")
+        raise typer.Exit(code=1)
+    previous = load_adapter(name)  # None: add could not set it up, so this starts from the investigation
+    inv = _investigate(name, need_found=not note)
+    log_path = guard_home() / "agent-events.log"
+    from guard.agent.discover import event_summary
+    lines = [l for l in (log_path.read_text(encoding="utf-8", errors="replace").splitlines() if log_path.is_file() else [])
+             if f" {name} " in l][-50:]
+    log = event_summary(lines) + (f"\nThe user says: {note}" if note else "")  # the note is the user's own words
+    adapter = _proposed_adapter(name, inv, previous=previous, log=log or "none")
+    change = adapter_diff(previous or {}, adapter)
+    if not change:
+        console.print(f"[green]The LLM proposes no change to {name}'s adapter[/green]; checking its hooks are in place.")
+    else:
+        _show_diff(change)
+    _install_adapter(adapter, name)  # also restores hook entries removed or gone stale in the agent's config
+
+
+@agent_app.command("list")
+def agent_list_cmd():
+    """Built-in and registered agents, and whether each one's config runs guard's hooks now."""
+    from guard.agent.adapter import BUILT_IN, adapters_dir, config_path, installed, load_adapter
+    registered = {p.stem for p in adapters_dir().glob("*.json")} if adapters_dir().is_dir() else set()
+    names = sorted(set(BUILT_IN) | registered)
+    table = Table(title="🤖 Agents", show_header=True)
+    for column in ("Name", "Agent", "Source", "Config", "Hooks"):
+        table.add_column(column)
+    for n in names:
+        adapter = load_adapter(n)
+        if adapter is None:
+            continue
+        if adapter.get("name") != n or not isinstance(adapter.get("config"), str) or not isinstance(adapter.get("hooks"), list):
+            # an edited or broken record: shown, never allowed to hide the others
+            table.add_row(n, "-", "registered", "-", f"[red]broken record: guard agent fix {n}[/red]")
+            continue
+        path = config_path(adapter)
+        state = ("add by hand" if path.suffix != ".json" else "[green]installed[/green]" if installed(adapter)
+                 else "[yellow]not installed[/yellow]")
+        table.add_row(n, adapter.get("title", n), "built in" if n in BUILT_IN else "registered", str(path), state)
+    console.print(table)
 
 
 @agent_app.command("remove")
@@ -1826,13 +2022,17 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
     """
     from guard.agent.adapter import AdapterError, config_path, diff, read_config, without_guard, write_config
     adapter = _adapter_or_exit(name)
+    _registered_ok(adapter, name)  # an edited record cannot point remove at another config file
     path = config_path(adapter)
+    if path.suffix != ".json":
+        console.print(f"[yellow]Guard does not edit {path}: remove the entries that run `guard agent-event` from it yourself.[/yellow]")
+        return
     try:
         before = read_config(path)
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]")
         raise typer.Exit(code=1)
-    after = without_guard(before)
+    after = without_guard(before, adapter["name"])
     change = diff(path, before, after)
     if not change:
         console.print(f"[green]No guard hooks in {path}.[/green]")
@@ -1892,15 +2092,26 @@ def agent_test_cmd(
     for event, results in seen.items():
         table.add_row(event, str(len(results)), ", ".join(sorted(set(results))) or "[yellow]none[/yellow]")
     console.print(table)
-    blocked_edit = any("-> block" in r for r in seen.get("PreToolUse", []))
+    # the harness's own name for its before-edit hook (PreToolUse for Claude Code, preToolUse for Cursor, …)
+    edit_events = {h["harness_event"] for h in adapter["hooks"] if h["event"] == "before-edit"}
+    blocked_edit = any("-> block" in r for e in edit_events for r in seen.get(e, []))
     missing = [e for e, r in seen.items() if not r]
     if not lines:
-        console.print("[bold red]❌ No event arrived: the agent is not calling guard (restart it, or check its hooks).[/bold red]")
-        raise typer.Exit(code=1)
+        console.print("[bold red]❌ No event arrived: the agent is not calling guard.[/bold red] Restart the agent and try "
+                      "once more; some agents only read their hooks at start.")
+        _cannot_set_up(name, f"guard agent test: no event arrived from {adapter['title']} after an edit was asked for")
     if blocked_edit:
-        console.print("[green]✅ The edit was blocked by guard. Confirm the agent showed guard's reason (run guard pre first).[/green]")
+        # the log shows what guard answered, not what the agent did with it: only the user can see that
+        console.print("[green]✅ Guard answered the edit with a block.[/green] Now check in the agent that the file was "
+                      "NOT changed and that it showed guard's reason; if the edit went through anyway, run "
+                      f"[bold]guard agent fix {name} --note \"the edit was not blocked\"[/bold].")
     else:
-        console.print("[yellow]⚠️ No edit was blocked: ask for a file edit in a repository without a guard session.[/yellow]")
+        console.print("[yellow]⚠️ No edit was blocked: ask for a file edit in a repository without a guard session.[/yellow] "
+                      f"If you did and the edit went through, run [bold]guard agent fix {name} --note \"edits are not "
+                      "blocked\"[/bold], or ask for support with this prefilled issue:")
+        from guard.agent.discover import issue_url
+        console.print(issue_url(name, f"guard agent test: events arrived from {adapter['title']} but no edit was blocked"),
+                      markup=False, highlight=False, soft_wrap=True)
     if missing:
         console.print(f"[yellow]Events that did not arrive: {', '.join(missing)} (a stop arrives when the agent finishes its turn).[/yellow]")
 

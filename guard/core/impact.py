@@ -327,7 +327,7 @@ def check_impact(
         notes.append(f"outside-range check skipped where pre's listing was capped: {_capped(skipped)}")
 
     summary = (
-        f"Impact range check (deterministic, files Git does not ignore):{len(changed)} symbol(s) added, changed or removed "
+        f"Impact range check (deterministic, files Git does not ignore): {len(changed)} symbol(s) added, changed or removed "
         f"in {len({p for p, _, _, _ in changed})} file(s); referenced outside the expected impact range: "
         f"{_capped(outside_names) or 'none'}; changed without a test reference: "
         f"{_capped([f'`{n}`' for names in untested.values() for n in names]) or 'none'}"

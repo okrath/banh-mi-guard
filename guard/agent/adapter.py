@@ -13,6 +13,8 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -89,8 +91,20 @@ def load_adapter(name: str) -> Optional[Dict[str, Any]]:
     return BUILT_IN.get(name)
 
 
+USER_ROOTS = ("APPDATA", "LOCALAPPDATA")  # Windows' per-user folders, written `%APPDATA%/…` as discovery shows them
+
+
+def user_path(raw: str) -> str:
+    """`~/…` or `%APPDATA%/…` / `%LOCALAPPDATA%/…` made absolute; anything else as it is."""
+    for env in USER_ROOTS:
+        tag = f"%{env}%"
+        if raw[len(tag):len(tag) + 1] in ("/", "\\") and raw.startswith(tag) and os.environ.get(env):
+            return os.environ[env] + raw[len(tag):]
+    return os.path.expanduser(raw)
+
+
 def config_path(adapter: Dict[str, Any]) -> Path:
-    return Path(os.path.expanduser(adapter["config"]))
+    return Path(user_path(adapter["config"]))
 
 
 def guard_command() -> List[str]:
@@ -102,29 +116,108 @@ def guard_command() -> List[str]:
     return [str(Path(found).resolve())] if found else [sys.executable, "-m", "guard.cli"]
 
 
-def _entry(adapter: Dict[str, Any], hook: Dict[str, Any], command: List[str]) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {}
-    if hook.get("matcher"):
-        entry["matcher"] = hook["matcher"]
-    # exec form (command + args): no shell, no quoting problems on Windows
-    entry["hooks"] = [{"type": "command", "command": command[0],
-                       "args": command[1:] + [MARKER, hook["event"], "--agent", adapter["name"]]}]
-    return entry
+SHELL_SAFE = re.compile(r"[\w\-.:/\\]+(?:~\d+[\w\-.:/\\]*)*")  # `~1` only as in an 8.3 short name (PROGRA~1)
+SHELL_SPECIAL = set('"%$`^&|<>;()!\n\r')  # an apostrophe is plain text inside double quotes
 
 
-def _is_guard_hook(hook: Any) -> bool:
-    """Guard's handler, as guard writes it: its arguments end in `agent-event <event> --agent <name>`."""
+def command_line(command: List[str]) -> str:
+    """
+    One command string, for harnesses that run a shell line instead of a program and its arguments.
+    On Windows the shell may be cmd or PowerShell, and they read a quoted program differently
+    (PowerShell needs `& "…"`, where cmd sees `&` as a command separator): so no part is quoted. A
+    part that is not plain (a space, an apostrophe) is replaced by its 8.3 short name, which both
+    read alike; a part with no plain short name, or with characters a shell interprets, is refused.
+    """
+    if os.name != "nt":
+        return shlex.join(command)
+    parts = []
+    for part in command:
+        if not SHELL_SAFE.fullmatch(part) and not SHELL_SPECIAL.intersection(part.replace("'", "")):
+            part = _short_path(part) or part
+        if not SHELL_SAFE.fullmatch(part):
+            raise AdapterError(f"{part!r} is not a plain path both cmd and PowerShell run as it is; "
+                               "install guard in a path without spaces or special characters")
+        parts.append(part)
+    return " ".join(parts)
+
+
+def _short_path(path: str) -> Optional[str]:
+    """The Windows 8.3 short name of an existing path (no spaces), or None when there is none."""
+    try:
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(1024)
+        size = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, 1024)
+        return buffer.value if 0 < size < 1024 else None
+    except (AttributeError, OSError):
+        return None
+
+
+def _entry(adapter: Dict[str, Any], hook: Dict[str, Any], command: List[str]) -> Any:
+    args = command[1:] + [MARKER, hook["event"], "--agent", adapter["name"]]
+    template = adapter.get("entry")
+    if template is None:  # Claude Code's shape
+        entry: Dict[str, Any] = {}
+        if hook.get("matcher"):
+            entry["matcher"] = hook["matcher"]
+        # exec form (command + args): no shell, no quoting problems on Windows
+        entry["hooks"] = [{"type": "command", "command": command[0], "args": args}]
+        return entry
+    # The adapter's own shape: guard fills in what runs, the template only says where it goes
+    values = {"{matcher}": hook.get("matcher"), "{program}": command[0], "{args}": args}
+    if "{command_line}" in json.dumps(template):  # built only for a shell line: the exec form never needs quoting
+        values["{command_line}"] = command_line([command[0]] + args)
+
+    def fill(value: Any) -> Any:
+        if isinstance(value, str) and value in values:
+            return values[value]
+        if isinstance(value, dict):
+            return {k: fill(v) for k, v in value.items() if not (v == "{matcher}" and not hook.get("matcher"))}
+        if isinstance(value, list):
+            return [fill(v) for v in value]
+        return value
+    return fill(template)
+
+
+def _is_guard_program(words: List[str]) -> bool:
+    """The command starts guard: the guard executable, or Python running `-m guard.cli` (guard_command())."""
+    if not words:
+        return False
+    program = Path(words[0].strip('"\'')).name.lower()
+    if program in ("guard", "guard.exe"):
+        return True
+    # the module form only with a Python launcher (python, python3.11, pythonw.exe, py.exe)
+    return bool(re.fullmatch(r"(python[\d.]*w?|py)(\.exe)?", program)) and words[1:3] == ["-m", "guard.cli"]
+
+
+def _is_guard_hook(hook: Any, agent: Optional[str] = None, event: Optional[str] = None) -> bool:
+    """
+    Guard's handler, as guard writes it: guard itself runs with `agent-event <event> --agent <name>`.
+    Someone else's program with the same words (`node audit.js agent-event stop …`) is not guard's.
+    With `agent`, only the entries of that adapter (two adapters may share one config file); with
+    `event`, only the entry for that guard event.
+    """
     if not isinstance(hook, dict):
         return False
-    words = [str(a) for a in hook.get("args") or []] or str(hook.get("command", "")).split()
-    for i, word in enumerate(words):
-        if word == MARKER and i + 3 < len(words) and words[i + 2] == "--agent" and words[i + 1] in _EVENTS:
-            return True
+    if "args" in hook and not isinstance(hook["args"], list):
+        return False
+    if hook.get("args"):
+        words = [str(hook.get("command", ""))] + [str(a) for a in hook["args"]]
+    else:
+        try:
+            words = shlex.split(str(hook.get("command", "")), posix=os.name != "nt")
+        except ValueError:
+            return False
+    if not _is_guard_program(words):
+        return False
+    # exactly what guard writes: the command ends in `agent-event <event> --agent <name>`, nothing after
+    tail = words[-4:]
+    if len(tail) == 4 and tail[0] == MARKER and tail[1] in _EVENTS and tail[2] == "--agent" and NAME.fullmatch(tail[3]):
+        return (agent is None or tail[3] == agent) and (event is None or tail[1] == event)
     return False
 
 
-def _without_guard(hooks: Dict[str, Any]) -> Dict[str, Any]:
-    """The hooks section with guard's entries taken out; everything else exactly as it was."""
+def _without_guard(hooks: Dict[str, Any], agent: Optional[str] = None) -> Dict[str, Any]:
+    """The hooks section with guard's entries (of `agent`, when given) taken out; everything else as it was."""
     out: Dict[str, Any] = {}
     for event, entries in hooks.items():
         if not isinstance(entries, list):
@@ -132,9 +225,11 @@ def _without_guard(hooks: Dict[str, Any]) -> Dict[str, Any]:
             continue
         kept = []
         for entry in entries:
+            if _is_guard_hook(entry, agent):  # a flat entry (a command string or program and args) of guard's
+                continue
             inner = entry.get("hooks") if isinstance(entry, dict) else None
-            if isinstance(inner, list) and any(_is_guard_hook(h) for h in inner):
-                rest = [h for h in inner if not _is_guard_hook(h)]
+            if isinstance(inner, list) and any(_is_guard_hook(h, agent) for h in inner):
+                rest = [h for h in inner if not _is_guard_hook(h, agent)]
                 if rest:  # someone else's hook shares the entry: keep it without guard's
                     kept.append({**entry, "hooks": rest})
                 continue
@@ -161,14 +256,17 @@ def read_config(path: Path) -> Dict[str, Any]:
 def with_guard(settings: Dict[str, Any], adapter: Dict[str, Any], command: Optional[List[str]] = None) -> Dict[str, Any]:
     """Settings with guard's entries replaced by the adapter's current ones (idempotent)."""
     command = command or guard_command()
-    hooks = _without_guard(settings.get("hooks") or {})
+    hooks = _without_guard(settings.get("hooks") or {}, adapter["name"])  # another adapter's entries stay
     for hook in adapter["hooks"]:
-        hooks.setdefault(hook["harness_event"], []).append(_entry(adapter, hook, command))
-    return {**settings, "hooks": hooks}
+        if not isinstance(hooks.get(hook["harness_event"]), list):  # an event set to null holds no hook yet
+            hooks[hook["harness_event"]] = []
+        hooks[hook["harness_event"]].append(_entry(adapter, hook, command))
+    # `defaults`: top-level keys a config needs to be read at all (Cursor's `version`), never overriding
+    return {**(adapter.get("defaults") or {}), **settings, "hooks": hooks}
 
 
-def without_guard(settings: Dict[str, Any]) -> Dict[str, Any]:
-    hooks = _without_guard(settings.get("hooks") or {})
+def without_guard(settings: Dict[str, Any], agent: Optional[str] = None) -> Dict[str, Any]:
+    hooks = _without_guard(settings.get("hooks") or {}, agent)
     out = {k: v for k, v in settings.items() if k != "hooks"}
     if hooks:
         out["hooks"] = hooks
@@ -180,12 +278,29 @@ def installed(adapter: Dict[str, Any]) -> bool:
         hooks = read_config(config_path(adapter)).get("hooks") or {}
     except AdapterError:
         return False
-    return all(any(_is_guard_hook(h) for e in hooks.get(k["harness_event"], []) if isinstance(e, dict)
-                   for h in e.get("hooks") or []) for k in adapter["hooks"])
+    name = adapter.get("name")
+    records = adapter.get("hooks")
+    if not isinstance(name, str) or not isinstance(records, list) or not records or not all(
+            isinstance(k, dict) and isinstance(k.get("harness_event"), str) and isinstance(k.get("event"), str)
+            for k in records):
+        return False  # a malformed record (no name, hooks: [{}]) runs nothing: `guard agent list` shows it
+    def guards(entry: Any, event: str) -> bool:
+        return _is_guard_hook(entry, name, event) or (isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+                                                      and any(_is_guard_hook(h, name, event) for h in entry["hooks"]))
+    def entries(event: str) -> list:  # an event set to null or anything but a list holds no hook
+        value = hooks.get(event) if isinstance(hooks, dict) else None
+        return value if isinstance(value, list) else []
+    return all(any(guards(e, k["event"]) for e in entries(k["harness_event"])) for k in records)
 
 
 def dump(settings: Dict[str, Any]) -> str:
     return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+
+
+def adapter_diff(before: Dict[str, Any], after: Dict[str, Any]) -> str:
+    """The change between two adapter records, as the user reviews it."""
+    return "".join(difflib.unified_diff(dump(before).splitlines(keepends=True), dump(after).splitlines(keepends=True),
+                                        "adapter (current)", "adapter (proposed)"))
 
 
 def diff(path: Path, before: Dict[str, Any], after: Dict[str, Any]) -> str:
@@ -258,3 +373,236 @@ def render(output: Optional[Dict[str, Any]], harness: str, decision: Decision) -
     stdout = json.dumps(stdout) + "\n" if isinstance(stdout, (dict, list)) else (stdout + "\n" if stdout else "")
     stderr = fill(rule.get("stderr", ""))
     return stdout, (stderr + "\n" if stderr else ""), int(rule.get("exit", 0))
+
+
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
+WORD = re.compile(r"^[A-Za-z][\w.-]{0,39}\Z")  # a harness event name, or a literal in an entry template
+RULE_KEYS = {"stdout", "stderr", "exit"}
+# Not a reason to refuse: guard prints the entries for the user to add to a TOML or YAML config
+NOT_JSON = "config: guard only edits JSON configs (other formats: add the entries by hand)"
+
+
+def _inside_home(raw: str) -> bool:
+    """
+    A user-level path: `~/…` or absolute, inside a dot folder of the home folder (`~/.cursor/…`,
+    `~/.config/…`) and never inside a Git repository: a relative path would follow the current
+    directory, and `~/work/project/.cursor/hooks.json` is a project's file, not the user's.
+    """
+    raw = user_path(raw)
+    if not (raw.startswith("~/") or raw.startswith("~\\") or Path(raw).is_absolute()):
+        return False
+    try:
+        home = Path(os.path.expanduser("~")).resolve()
+        path = Path(os.path.expanduser(raw)).resolve()
+        # Windows' own per-user settings folders count wherever a redirected profile puts them
+        app_data = [Path(os.environ[e]).resolve() for e in USER_ROOTS if os.environ.get(e)]
+    except OSError:
+        return False
+    if not any(path.is_relative_to(a) and path != a for a in app_data):  # otherwise a dot folder of home
+        if not path.is_relative_to(home):
+            return False
+        rel = path.relative_to(home)
+        if not rel.parts or not rel.parts[0].startswith("."):
+            return False
+    # every folder above the file, the root and what holds it included: a home folder (or an
+    # %APPDATA% moved into a checkout) kept in Git makes every file below it a repository's file
+    return not any((folder / ".git").exists() for folder in path.parents)
+
+
+def _is_number(v: Any) -> bool:
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+# The only keys an entry template may hold, and what each may be: what runs is always guard's own
+# command, filled in by guard. Any other key (`exec`, `script`, …) is refused, whatever a harness
+# does with it, so no unknown field can ever carry a command.
+ENTRY_KEYS = {
+    "type": lambda v: isinstance(v, str) and bool(WORD.match(v)),
+    "command": lambda v: v in ("{command_line}", "{program}"),
+    "args": lambda v: v == "{args}",
+    "matcher": lambda v: v == "{matcher}",
+    "timeout": _is_number,
+    "loop_limit": _is_number,
+    "failClosed": lambda v: isinstance(v, bool),
+    "enabled": lambda v: v is True,  # `false` would install a hook the harness never runs
+}
+DEFAULT_KEYS = {"version": _is_number}  # top-level keys a new config may need (Cursor's `version`)
+
+
+def _entry_problem(value: Any, where: str) -> Optional[str]:
+    """
+    Why an entry template is refused, or None: an object built only from ENTRY_KEYS, where `command`
+    is "{command_line}", or "{program}" with `"args": "{args}"` beside it; a nested `hooks` list
+    holds entries of the same kind (Claude Code's shape).
+    """
+    if not isinstance(value, dict):
+        return f"{where}: one JSON object (a hook entry)"
+    for k, v in value.items():
+        at = f"{where}.{k}"
+        if k == "hooks":
+            if not isinstance(v, list) or not v:
+                return f"{at}: a list of hook entries"
+            problem = next((p for i, e in enumerate(v) if (p := _entry_problem(e, f"{at}[{i}]"))), None)
+            if problem:
+                return problem
+        elif k not in ENTRY_KEYS:
+            return f"{at}: not a hook entry key guard accepts ({', '.join(sorted(ENTRY_KEYS))}, hooks)"
+        elif not ENTRY_KEYS[k](v):
+            return f"{at}: {str(v)[:60]!r} is not allowed here"
+    if value.get("command") == "{program}" and value.get("args") != "{args}":
+        return f'{where}.command: "{{program}}" needs "args": "{{args}}" beside it'
+    if "args" in value and value.get("command") != "{program}":
+        return f'{where}.args: "{{args}}" goes beside "command": "{{program}}"'
+    return None
+
+
+def _runs_guard(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return value.get("command") in ("{command_line}", "{program}") or any(
+        _runs_guard(e) for e in value.get("hooks") or [] if isinstance(value.get("hooks"), list))
+
+
+def _defaults_problem(value: Any) -> Optional[str]:
+    if not isinstance(value, dict):
+        return "defaults: an object of top-level keys"
+    for k, v in value.items():
+        if k not in DEFAULT_KEYS or not DEFAULT_KEYS[k](v):
+            return f"defaults.{k}: not a top-level key guard accepts ({', '.join(DEFAULT_KEYS)})"
+    return None
+
+
+def _block_problems(hooks: List[Any], can_block: Any, block: Any) -> List[str]:
+    """
+    Every harness event of a guard event in can_block has a block rule (its own, or `*`) that the
+    harness reads as a refusal (see _refuses). Without one, guard's refusal would reach the harness
+    as silence, or as `{"decision": "allow"}`, which it reads as allowed.
+    """
+    refusing = {e for e in can_block if isinstance(e, str)} if isinstance(can_block, list) else set()
+    rules = block if isinstance(block, dict) else {}
+    problems = []
+    for hook in hooks:
+        if not isinstance(hook, dict) or not isinstance(hook.get("event"), str) or hook["event"] not in refusing \
+                or not isinstance(hook.get("harness_event"), str):
+            continue
+        harness = hook["harness_event"]
+        rule = next((r for k, r in rules.items() if k != "*" and harness in str(k).split("|")), rules.get("*"))
+        if not _refuses(rule):
+            problems.append(f"output.block: nothing refuses {harness} (can_block has {hook['event']}): give it a "
+                            'non-zero exit, or stdout saying "block"/"deny" (or `"continue": false`), and no "allow"')
+    return sorted(set(problems))
+
+
+REFUSAL_WORDS = {"block", "deny"}
+ALLOWING_WORDS = {"allow", "approve", "accept"}
+REFUSAL_KEYS = {"followup_message"}  # Cursor keeps a stop going by giving the agent a follow-up
+
+
+def _refuses(rule: Any) -> bool:
+    """
+    A block rule the harness reads as a refusal: a non-zero exit, or stdout holding "block"/"deny",
+    `"continue": false` or a follow-up message, with no allowing word anywhere in it.
+    """
+    if not isinstance(rule, dict):
+        return False
+    pairs: List[Any] = []
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, str(k))
+        elif isinstance(value, list):
+            for v in value:
+                walk(v, key)
+        else:
+            pairs.append((key, value))
+
+    walk(rule.get("stdout"))
+    words = {str(v).strip().lower() for _, v in pairs if isinstance(v, str)}
+    if words & ALLOWING_WORDS or ("continue", True) in pairs:
+        return False
+    exit_code = rule.get("exit", 0)
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return True
+    return bool(words & REFUSAL_WORDS) or ("continue", False) in pairs or any(k in REFUSAL_KEYS for k, _ in pairs)
+
+
+def _rule_ok(rule: Any) -> bool:
+    return (isinstance(rule, dict) and set(rule) <= RULE_KEYS
+            and isinstance(rule.get("exit", 0), int) and not isinstance(rule.get("exit", 0), bool)
+            and 0 <= rule.get("exit", 0) <= 255
+            and isinstance(rule.get("stderr", ""), str) and isinstance(rule.get("stdout", ""), (str, dict, list))
+            and len(json.dumps(rule)) <= 2000)
+
+
+def validate_adapter(adapter: Any) -> List[str]:
+    """
+    Why a proposed adapter cannot be installed (empty: it can). An adapter is data only: it maps a
+    harness's events, fields and answers onto guard's; it never decides what runs or what is allowed.
+    """
+    from guard.agent.events import DEFAULT_FIELDS
+    if not isinstance(adapter, dict):
+        return ["the adapter is not a JSON object"]
+    errors: List[str] = []
+    name = adapter.get("name")
+    if not isinstance(name, str) or not NAME.match(name):
+        errors.append("name: lower-case letters, digits and dashes, up to 40")
+    elif name in BUILT_IN:
+        errors.append(f"name: {name} is built in")
+    if not isinstance(adapter.get("title"), str) or not 0 < len(adapter["title"]) <= 60:
+        errors.append("title: a short text")
+    config = adapter.get("config")
+    if not isinstance(config, str) or not _inside_home(config):
+        errors.append("config: a path inside your home folder")
+    elif not config.endswith(".json"):
+        errors.append(NOT_JSON)
+    if "detect" in adapter and (not isinstance(adapter["detect"], str) or not _inside_home(adapter["detect"])):
+        errors.append("detect: a path inside your home folder")
+
+    hooks = adapter.get("hooks")
+    if not isinstance(hooks, list) or not hooks:
+        errors.append("hooks: a non-empty list")
+        hooks = []
+    for i, hook in enumerate(hooks):
+        if not isinstance(hook, dict) or not isinstance(hook.get("harness_event"), str) or not WORD.match(hook["harness_event"]):
+            errors.append(f"hooks[{i}].harness_event: the harness's event name")
+        elif not isinstance(hook.get("event"), str) or hook["event"] not in _EVENTS:
+            errors.append(f"hooks[{i}].event: one of {', '.join(_EVENTS)}")
+        elif "matcher" in hook and (not isinstance(hook["matcher"], str) or len(hook["matcher"]) > 200):
+            errors.append(f"hooks[{i}].matcher: a short text")
+    # only text values reach the sets below: a list or object in the proposal is an error, not a crash
+    events = {h["event"] for h in hooks if isinstance(h, dict) and isinstance(h.get("event"), str)}
+    can_block = adapter.get("can_block", [])
+    if not isinstance(can_block, list) or not all(isinstance(e, str) for e in can_block) or not set(can_block) <= events:
+        errors.append("can_block: events the adapter hooks")
+
+    fields = adapter.get("fields", {})
+    if not isinstance(fields, dict) or any(
+        k not in DEFAULT_FIELDS or not isinstance(v, list) or not all(isinstance(p, str) and len(p) <= 100 for p in v)
+        for k, v in fields.items()
+    ):
+        errors.append(f"fields: lists of payload paths for {', '.join(DEFAULT_FIELDS)}")
+
+    output = adapter.get("output")
+    if not isinstance(output, dict) or not output or not set(output) <= {"allow", "notify", "block"}:
+        errors.append("output: rules for allow, notify and block")
+    else:
+        for action, rules in output.items():
+            if not isinstance(rules, dict) or not all(isinstance(k, str) and _rule_ok(r) for k, r in rules.items()):
+                errors.append(f"output.{action}: harness events mapped to {{stdout, stderr, exit}}")
+        errors.extend(_block_problems(hooks, can_block, output.get("block")))
+
+    if "entry" not in adapter:  # only a built-in adapter may use Claude Code's shape by default
+        errors.append("entry: the JSON of one hook entry as the config file holds it")
+    else:
+        problem = _entry_problem(adapter["entry"], "entry")
+        if problem:
+            errors.append(problem)
+        elif not _runs_guard(adapter["entry"]):
+            errors.append('entry: needs "command": "{command_line}", or "command": "{program}" with "args": "{args}"')
+    if "defaults" in adapter:
+        problem = _defaults_problem(adapter["defaults"])
+        if problem:
+            errors.append(problem)
+    return errors

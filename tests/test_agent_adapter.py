@@ -152,7 +152,7 @@ def test_add_test_and_remove_through_the_cli(tmp_path, monkeypatch):
     _event("before-edit", edit)
     _event("prompt", {"cwd": str(repo), "hook_event_name": "UserPromptSubmit", "prompt": "write x.md"})
     report = CliRunner().invoke(app, ["agent", "test", "claude-code", "--report"])
-    assert report.exit_code == 0 and "The edit was blocked by guard" in report.output
+    assert report.exit_code == 0 and "Guard answered the edit with a block" in report.output
     assert "Stop" in report.output and "did not arrive" in report.output
 
     # remove: only in the user's terminal, and only guard's entries
