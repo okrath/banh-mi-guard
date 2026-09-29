@@ -101,6 +101,8 @@ guard config commit ask    # the agent asks you for every commit message
 
 `guard post` reports the chosen mode in the **Commit** line of an approved report; while no mode is set, the agent is told to ask you which one you want. `guard install` and `guard doctor` list it as "Commit messages".
 
+**Your own agent CLI instead of an API key.** `guard config llm` offers a third choice, *My agent CLI*: the review gate then asks `claude` or `codex` on this machine (your subscription answers, no key or gateway). Guard sends one prompt and reads one answer, with the CLI's tools off (`claude -p --tools ""`) or read-only (`codex exec --sandbox read-only`), in an empty temporary folder outside any repository. `guard config test` asks it one short question. A CLI that fails is an LLM failure (Heuristic Gate plus the reason), never an approval. Alibaba OCR cannot use a CLI: it calls an HTTP endpoint with tool calls, so it keeps its own LLM (an API key, or a gateway such as cli-to-api); `guard doctor` says so.
+
 ---
 
 ## 6. `guard install` / `guard uninstall`
@@ -224,7 +226,41 @@ guard doctor [options]
 
 ---
 
-## 12. `guard laya` (removed)
+## 12. `guard agent`
+
+Puts guard on the agent's own path through its hooks: an edit before `guard pre` or outside the scope, a stop with unapproved edits and a commit without an approval are refused with the reason, where the agent can refuse them. Guard writes only the agent's global (user-level) config or its own extension file, after you saw the diff, with a one-time backup; it never touches a repository file.
+
+```bash
+guard agent list                      # every agent guard knows, whether it is on this machine, and its hooks
+guard agent add <agent>               # show the diff, ask, back up, write (the limits are shown first)
+guard agent test <agent>              # start listening; ask the agent for one small edit; then:
+guard agent test <agent> --report     # which events arrived, and whether guard answered the edit with a block
+guard agent fix <agent> [--note "…"]  # regenerate an adapter from what the test saw and your note
+guard agent remove <agent>            # in your own terminal: take guard's entries (or guard's file) out again
+```
+
+Agents guard ships an adapter for, each checked against the agent's own source, local install or docs:
+
+| Agent | Where guard writes | What it can refuse |
+|---|---|---|
+| `claude-code` (CLI, Desktop, IDE extensions) | `~/.claude/settings.json` | edits, commits, stops |
+| `codex` | `~/.codex/hooks.json` (never `config.toml`) | edits and commits (an `apply_patch` edit is reported right after it), stops; trust the hook once in Codex |
+| `cursor` (app and `cursor-agent`) | `~/.cursor/hooks.json` | edits, commits, stops (`cursor-agent` sends no prompt event) |
+| `grok` (Grok Build) | `~/.grok/hooks/guard.json` (guard's own file) | edits, commits, stops |
+| `gemini` (Gemini CLI) | `~/.gemini/settings.json` | edits, commits, stops |
+| `antigravity` | `~/.gemini/config/hooks.json` | edits and commits; a stop is only reminded |
+| `zcode` | `~/.zcode/cli/config.json` (`hooks.events`, `hooks.enabled`) | edits, commits, stops |
+| `omp` | `~/.omp/agent/extensions/guard-hook.ts` (guard's own file) | edits, commits, stops |
+| `pi` | `~/.pi/agent/extensions/guard-hook.ts` (guard's own file) | edits and commits; pi has no stop that can be refused |
+| `opencode` | `~/.config/opencode/plugins/guard-hook.js` (guard's own file) | edits and commits; opencode has no stop that can be refused |
+
+Where a stop cannot be refused, the Git pre-commit hook still blocks an unapproved commit. Restart an agent after adding guard; `guard doctor` shows each agent's hooks and its last test.
+
+**Any other agent.** `guard agent add <name>` investigates it on this machine: its binary, its version number and the structure of its config files (key names, numbers and booleans; every text value and any key that could be data is replaced, so nothing you wrote leaves the machine). The configured LLM proposes an adapter from that and what it knows of the agent; guard checks it (only guard's own command can run, only a user-level JSON config is written) and shows the diff. A config that is not JSON (TOML, YAML) gets the entries printed for you to add. When guard cannot set an agent up (not found, no hooks, an unsafe proposal, or a test that saw no event), it says why, suggests `guard agent fix <name> --note "<what the docs say>"`, and prints a prefilled GitHub issue (agent, guard version, OS, config file names, the problem; never a config's contents) that you can read and send yourself.
+
+---
+
+## 13. `guard laya` (removed)
 
 Removed in 0.11. The Laya neural triage only produced informational guesses and never influenced a gate decision; the repository domain is detected from the repository itself. `guard laya ...` prints this notice, and old model files in `~/.guard/models` can be deleted.
 

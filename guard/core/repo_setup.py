@@ -332,23 +332,47 @@ def install_global(cwd: Path) -> Tuple[bool, List[str]]:
     if not docs:
         messages.append("WARN no agent config directory found (~/.claude, ~/.codex, ~/.gemini, ~/.config/opencode); "
                         "use `guard install --workspace <dir>` so agents see the guard directives")
+    from guard.agent.adapter import protection
     for adapter in _detected_adapters(installed_too=False):
         # Offered, not done: the agent's own config changes only after the user saw the diff
         messages.append(f"WARN {adapter['title']} found: `guard agent add {adapter['name']}` makes it call guard through "
-                        "its hooks (edits blocked before guard pre, no stop or commit without an approval)")
+                        f"its hooks ({protection(adapter)})")
     messages.extend(ensure_repo_setup(cwd))
     return ok, messages
 
 
 def _detected_adapters(installed_too: bool = True) -> List[dict]:
-    """Built-in adapters whose agent is on this machine; without `installed_too`, only those not set up yet."""
-    from guard.agent.adapter import BUILT_IN, installed, load_adapter
+    """
+    Adapters whose agent is on this machine: the built-in ones found here and every one the user
+    registered (`guard agent add <other agent>`); without `installed_too`, only those not set up yet.
+    """
+    from guard.agent.adapter import BUILT_IN, adapters_dir, installed, load_adapter
+    registered = sorted(p.stem for p in adapters_dir().glob("*.json") if not p.stem.endswith(".test")) \
+        if adapters_dir().is_dir() else []
     found = []
-    for name in BUILT_IN:
+    for name in list(BUILT_IN) + [n for n in registered if n not in BUILT_IN]:
         adapter = load_adapter(name)
-        if adapter and Path(os.path.expanduser(adapter["detect"])).is_dir() and (installed_too or not installed(adapter)):
+        if not isinstance(adapter, dict) or not isinstance(adapter.get("hooks"), list):
+            continue  # a broken record: `guard agent list` shows it
+        if name not in BUILT_IN:
+            from guard.agent.adapter import NOT_JSON, validate_adapter
+            if [p for p in validate_adapter(adapter) if p != NOT_JSON]:
+                continue  # an invalid record: `guard agent add` refuses it and names the problems
+        if _agent_present(adapter) and (installed_too or not installed(adapter)):
             found.append(adapter)
     return found
+
+
+def _agent_present(adapter: dict) -> bool:
+    """The agent is on this machine: its detect folder exists, else its config's own folder (never home itself), else the file."""
+    from guard.agent.adapter import user_path
+    if adapter.get("detect"):
+        return Path(user_path(str(adapter["detect"]))).is_dir()
+    target = Path(user_path(str(adapter.get("config") or adapter.get("install") or "")))
+    if not target.is_absolute():
+        return False
+    home = Path(os.path.expanduser("~"))
+    return target.is_file() or (target.parent != home and target.parent.is_dir())
 
 
 def uninstall_global() -> List[str]:
@@ -552,13 +576,37 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         add("missing", "Agent directives", "no agent instruction file tells the agent to run guard pre/post", install_fix)
 
     # 2b. Agent hooks: the directives ask; the hooks enforce
-    from guard.agent.adapter import installed
+    from guard.agent.adapter import installed, protection, test_record_path
     for adapter in _detected_adapters():
-        if installed(adapter):
-            add("ok", "Agent hooks", f"{adapter['title']} calls guard on prompt, edit, shell command and stop")
+        name = adapter["name"]
+        if not installed(adapter):
+            stale = False
+            if adapter.get("kind") == "extension":
+                from guard.agent.adapter import extension_state
+                stale = extension_state(adapter) == "stale"
+            add("warn", "Agent hooks", f"{adapter['title']}: guard's file there is not this guard's (guard moved, another "
+                "version, or an edit): it may call nothing" if stale else
+                f"{adapter['title']}: no hooks, it only reads the directives; nothing stops an edit before guard pre",
+                f"guard agent add {name}")
+            continue
+
+        try:  # the last `guard agent test`: whether the agent really called guard
+            last = json.loads(test_record_path(name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            last = None
+        if not isinstance(last, dict):
+            last = None  # an edited record (`[]`, a string): as if never tested
+        if last is None:
+            add("ok", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; not tested yet (guard agent test {name})")
+        elif not last.get("events"):
+            add("warn", "Agent hooks", f"{adapter['title']}: hooks in place, but the last test ({str(last.get('at'))[:10]}) "
+                "saw no event: the agent is not calling guard", f"guard agent fix {name}")
+        elif not last.get("blocked_edit"):  # events arrived, but guard refused no edit during the test
+            add("warn", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; the last test "
+                f"({str(last.get('at'))[:10]}) refused no edit", f"guard agent test {name}")
         else:
-            add("warn", "Agent hooks", f"{adapter['title']} only reads the directives; nothing stops an edit before guard pre",
-                f"guard agent add {adapter['name']}")
+            add("ok", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; last test {str(last.get('at'))[:10]}: "
+                "an edit was refused")
 
     # 3. Project invariants
     if repo:
@@ -583,8 +631,16 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
 
     # 4. The LLM behind the review gate (and Alibaba OCR, which guard keeps in sync with it)
     from guard.core.config import load_config, load_global_config, ocr_in_sync
+    from guard.core.config import LLMProtocol
     llm = load_global_config().llm
-    if llm.api_key:
+    if llm.protocol == LLMProtocol.CLI and llm.ready:
+        from guard.core import cli_llm
+        if cli_llm.find(llm.cli_agent):
+            add("ok", "LLM", f"the {llm.cli_agent} CLI" + (f" ({llm.model})" if llm.model else "") + " (your subscription; no API key)")
+        else:
+            add("missing", "LLM", f"the {llm.cli_agent} CLI is chosen but not on PATH: guard post falls back to the "
+                "heuristic gate", "guard config llm")
+    elif llm.api_key:
         from urllib.parse import urlsplit
         try:
             parts = urlsplit(llm.base_url or "")
@@ -602,7 +658,11 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     when = {None: "runs only with guard post --full; it can run on every post (not chosen yet: guard config ocr always|optional)",
             True: "runs on every guard post (guard config ocr optional: only with --full)",
             False: "runs only with guard post --full (guard config ocr always: on every post)"}[always]
-    if shutil.which(ocr_binary) and not llm.api_key:
+    if shutil.which(ocr_binary) and llm.protocol == LLMProtocol.CLI:
+        # guard cannot give OCR an agent CLI: OCR calls an HTTP endpoint, with tool calls
+        add("warn", "Alibaba OCR", f"{ocr_binary} found; the review gate uses the {llm.cli_agent} CLI, and OCR needs an "
+            f"HTTP endpoint of its own (an API key, or a gateway such as cli-to-api); {when}", "ocr config")
+    elif shutil.which(ocr_binary) and not llm.api_key:
         add("warn", "Alibaba OCR", f"{ocr_binary} found, not synced: there is no LLM to give it yet; {when}", "guard config llm")
     elif shutil.which(ocr_binary) and not ocr_in_sync(llm, ocr_binary):
         add("warn", "Alibaba OCR", f"{ocr_binary} found, but guard has not given it the current LLM; {when}", "guard config sync")

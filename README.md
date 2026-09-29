@@ -128,9 +128,10 @@ Configure your LLM credentials once; `guard` writes them into the Alibaba OCR CL
 guard config llm
 ```
 
-The interactive wizard supports two industry-standard protocols:
+The interactive wizard offers three ways to reach an LLM:
 1. **OpenAI / OpenAI-Compatible**: OpenAI, **Ollama** (`http://localhost:11434/v1`), **DeepSeek** (`https://api.deepseek.com/v1`), OpenRouter, vLLM, or Local Gateways (`http://127.0.0.1:8090/v1`).
 2. **Anthropic**: Claude API (any current Claude model id).
+3. **My agent CLI**: `claude` or `codex` on this machine answers the review gate through your subscription, with no API key or gateway: Claude with its tools and your MCP servers off; Codex without your config, in its read-only sandbox (it can still read files on this machine, as its sandbox allows); both in an empty folder outside any repository. Alibaba OCR cannot use a CLI (it calls an HTTP endpoint with tool calls): it keeps its own LLM, and `guard doctor` says so.
 
 Verify connectivity with an instant, token-free latency ping:
 ```bash
@@ -213,6 +214,8 @@ guard hook refresh
 ```
 
 **How it chains together.** The agent reads the guard directives (global or workspace) and runs `guard pre` before editing. The first guard run inside a repository sets it up (below), and the Git hook checks every commit. Agents without a global instruction file (Cursor, omp) see the directives through a workspace install.
+
+**Agent hooks: the directives ask, the hooks enforce.** `guard agent add <agent>` puts guard on the agent's own path, so an edit before `guard pre` or outside the scope, a stop with unapproved edits and a commit without an approval are refused with the reason instead of relying on the agent to obey. Guard ships checked adapters for Claude Code (CLI, Desktop, IDE extensions), Codex, Cursor, Grok Build, Gemini CLI, Google Antigravity, ZCode, omp, pi and opencode; `guard agent list` shows them and `guard install` offers the ones it finds. Some agents cannot refuse everything (pi and opencode have no stop that can be refused; Antigravity's is only reminded; Codex edits are checked right after they happen): `guard agent add` says so first, and the Git hook remains the backstop. For any other agent guard investigates it on this machine, has the LLM propose an adapter, tests it with you (`guard agent test`), and, when it cannot be set up, tells you why with a prefilled GitHub issue. Details: [`docs/cli-reference.md`](docs/cli-reference.md#12-guard-agent).
 
 The older `guard hook install` still works: without options it runs `guard install`, and its options (`--stealth`, `--mode`, `--all-repos`, `--select-repos`, `--global`) keep their previous per-repository behavior. `guard hook status` shows the current hooks and directives.
 

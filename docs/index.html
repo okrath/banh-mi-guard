@@ -462,8 +462,13 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
           </tr>
           <tr>
             <td><code>guard config llm</code></td>
-            <td>Launch interactive LLM configuration wizard</td>
+            <td>Launch interactive LLM configuration wizard (an API, or your own <code>claude</code> / <code>codex</code> CLI)</td>
             <td><code>--local</code></td>
+          </tr>
+          <tr>
+            <td><code>guard agent add / list / test / fix / remove</code></td>
+            <td>Put guard on an agent's own hooks (Claude Code, Codex, Cursor, Grok Build, Gemini CLI, Antigravity, ZCode, omp, pi, opencode, or any other agent guard can set up)</td>
+            <td><code>test --report</code>, <code>fix --note</code></td>
           </tr>
           <tr>
             <td><code>guard config test</code></td>

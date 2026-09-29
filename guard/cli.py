@@ -1191,9 +1191,9 @@ def finish_setup(cwd: Path) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]
             done.append((item, result or "done"))
 
     # 1. An LLM for the review gate (the wizard also gives it to Alibaba OCR)
-    if not load_global_config().llm.api_key:
+    if not load_global_config().llm.ready:  # an API key, or the user's own agent CLI
         step("LLM", "guard config llm", "No LLM is configured for the review gate. Set one up now?",
-             lambda: bool(run_llm_wizard().llm.api_key) and "configured")
+             lambda: run_llm_wizard().llm.ready and "configured")
 
     # 2. Alibaba OCR, for `guard post --full` (installed through the same quarantine as `guard update ocr`).
     # The binary is the one guard post and doctor use here (a repository may name its own)
@@ -1768,6 +1768,19 @@ def _unchanged_since_diff(path: Path, shown: dict) -> None:
         raise typer.Exit(code=1)
 
 
+def _file_unchanged(path: Path, shown: bytes) -> None:
+    """A file is written or deleted only as shown: if it changed while the question was on screen, nothing happens."""
+    try:
+        now = path.read_bytes()
+    except FileNotFoundError:
+        now = b""
+    except OSError:
+        now = None
+    if now != shown:
+        console.print(f"[bold red]❌ {path} changed while you were reading; nothing was done. Run the command again.[/bold red]")
+        raise typer.Exit(code=1)
+
+
 def _test_listening() -> bool:
     """`guard agent test` started less than an hour ago (an abandoned test stops logging by itself)."""
     from guard.core.repo_setup import guard_home
@@ -1857,16 +1870,79 @@ def _investigate(name: str, need_found: bool = True):
     return inv
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    import os
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".guard-tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _install_extension(adapter: dict, name: str) -> None:
+    """omp, pi, opencode: guard writes one file of its own (shown first, confirmed); a file of anyone else's stays."""
+    import difflib
+    from guard.agent.adapter import (
+        AdapterError, adapters_dir, config_path, extension_is_guards, extension_text, save_adapter,
+    )
+    path = config_path(adapter)
+    if path.exists() and not extension_is_guards(adapter):
+        console.print(f"[bold red]❌ {path} is not guard's file:[/bold red] guard does not replace it. Move it away, then add again.")
+        raise typer.Exit(code=1)
+    try:
+        text = extension_text(adapter)
+    except AdapterError as e:
+        console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)
+        raise typer.Exit(code=1)
+    seen = path.read_bytes() if path.exists() else b""
+    old = seen.decode("utf-8", errors="replace")
+    if old == text:
+        save_adapter(adapter)
+        console.print(f"[green]✅ {adapter['title']} already loads guard's {path.name} ({path}).[/green]")
+        return
+    _show_diff("".join(difflib.unified_diff(old.splitlines(keepends=True), text.splitlines(keepends=True), str(path), str(path))))
+    if not typer.confirm(f"Write guard's {path.name} to {path}?", default=False):
+        console.print("[dim]Nothing changed.[/dim]")
+        raise typer.Exit(code=1)
+    _file_unchanged(path, seen)  # never replaces a file put there while the diff was on screen
+    record = adapters_dir() / f"{name}.json"
+    kept = record.read_bytes() if record.is_file() else None
+    save_adapter(adapter)  # the record first, as for a config
+    try:
+        _write_text_atomic(path, text)
+    except OSError as e:  # the file is as it was: so is the record
+        if kept is None:
+            record.unlink(missing_ok=True)
+        else:
+            record.write_bytes(kept)
+        console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
+        _cannot_set_up(name, f"writing {_home_relative(path)} failed ({type(e).__name__})")
+    events = ", ".join(sorted({h["event"] for h in adapter["hooks"]}))
+    console.print(f"[bold green]✅ {adapter['title']} now calls guard on: {events}.[/bold green] Restart it so it loads the file.")
+    console.print(f"Check it with [bold]guard agent test {name}[/bold]; undo with [bold]guard agent remove {name}[/bold].")
+
+
 def _install_adapter(adapter: dict, name: str) -> None:
     """Show the config diff, confirm, back up and write; a config guard cannot edit gets the entries to add by hand."""
     from guard.agent.adapter import (
-        AdapterError, adapters_dir, config_path, diff, dump, guard_command, load_adapter, read_config, save_adapter,
+        AdapterError, adapters_dir, config_path, diff, dump, guard_command, installed, load_adapter, read_config, save_adapter,
         with_guard, write_config, _entry,
     )
     _registered_ok(adapter, name)  # every install, including one from a record written earlier
+    for limit in adapter.get("limits") or []:  # what guard cannot do for this agent, said before anything is written
+        console.print("[yellow]⚠️ [/yellow]", end="")
+        console.print(limit, markup=False, highlight=False)
+    if adapter.get("kind") == "extension":
+        _install_extension(adapter, name)
+        return
     path = config_path(adapter)
     try:
-        before = read_config(path) if path.suffix == ".json" else {}
+        before = read_config(path, adapter) if path.suffix == ".json" else {}
         after = with_guard(before, adapter)  # builds guard's entries: refuses a command a shell would misread
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
@@ -1892,6 +1968,10 @@ def _install_adapter(adapter: dict, name: str) -> None:
                 console.print("[dim]Nothing changed.[/dim]")
                 raise typer.Exit(code=1)
             save_adapter(adapter)
+        if not installed(adapter):  # the entries are there, but the agent's own switch is off (ZCode's hooks.enabled)
+            console.print(f"[yellow]⚠️ Guard's entries are in {path}, but its hooks are switched off there "
+                          "(hooks.enabled is false). Turn them on in that file; guard does not override your choice.[/yellow]")
+            return
         console.print(f"[green]✅ {adapter['title']} already runs guard's hooks ({path}).[/green]")
         return
     _show_diff(change)
@@ -1913,7 +1993,11 @@ def _install_adapter(adapter: dict, name: str) -> None:
         console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)  # the full error, on this screen only
         _cannot_set_up(name, f"writing {_home_relative(path)} failed ({type(e).__name__})")
     events = ", ".join(sorted({h["event"] for h in adapter["hooks"]}))
-    console.print(f"[bold green]✅ {adapter['title']} now calls guard on: {events}.[/bold green]")
+    if installed(adapter):
+        console.print(f"[bold green]✅ {adapter['title']} now calls guard on: {events}.[/bold green]")
+    else:  # written, but the agent's own switch is off (ZCode's hooks.enabled): nothing runs yet
+        console.print(f"[yellow]⚠️ Guard's entries are in {path}, but its hooks are switched off there "
+                      "(hooks.enabled is false). Turn them on in that file; guard does not override your choice.[/yellow]")
     if backup:
         console.print(f"[dim]Original kept as {backup}.[/dim]")
     console.print(f"Check it with [bold]guard agent test {name}[/bold]; undo with [bold]guard agent remove {name}[/bold].")
@@ -1994,23 +2078,27 @@ def agent_fix_cmd(
 def agent_list_cmd():
     """Built-in and registered agents, and whether each one's config runs guard's hooks now."""
     from guard.agent.adapter import BUILT_IN, adapters_dir, config_path, installed, load_adapter
-    registered = {p.stem for p in adapters_dir().glob("*.json")} if adapters_dir().is_dir() else set()
+    from guard.core.repo_setup import _agent_present
+    registered = ({p.stem for p in adapters_dir().glob("*.json") if not p.stem.endswith(".test")}  # not test records
+                  if adapters_dir().is_dir() else set())
     names = sorted(set(BUILT_IN) | registered)
     table = Table(title="🤖 Agents", show_header=True)
-    for column in ("Name", "Agent", "Source", "Config", "Hooks"):
+    for column in ("Name", "Agent", "Source", "On this machine", "Config", "Hooks"):
         table.add_column(column)
     for n in names:
         adapter = load_adapter(n)
         if adapter is None:
             continue
-        if adapter.get("name") != n or not isinstance(adapter.get("config"), str) or not isinstance(adapter.get("hooks"), list):
+        extension = adapter.get("kind") == "extension"
+        if adapter.get("name") != n or not isinstance(adapter.get("install" if extension else "config"), str) or not isinstance(adapter.get("hooks"), list):
             # an edited or broken record: shown, never allowed to hide the others
-            table.add_row(n, "-", "registered", "-", f"[red]broken record: guard agent fix {n}[/red]")
+            table.add_row(n, "-", "registered", "-", "-", f"[red]broken record: guard agent fix {n}[/red]")
             continue
         path = config_path(adapter)
-        state = ("add by hand" if path.suffix != ".json" else "[green]installed[/green]" if installed(adapter)
-                 else "[yellow]not installed[/yellow]")
-        table.add_row(n, adapter.get("title", n), "built in" if n in BUILT_IN else "registered", str(path), state)
+        here = "yes" if _agent_present(adapter) else "[dim]no[/dim]"
+        state = ("add by hand" if not extension and path.suffix != ".json" else "[green]installed[/green]"
+                 if installed(adapter) else "[yellow]not installed[/yellow]")
+        table.add_row(n, adapter.get("title", n), "built in" if n in BUILT_IN else "registered", here, str(path), state)
     console.print(table)
 
 
@@ -2024,15 +2112,39 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
     adapter = _adapter_or_exit(name)
     _registered_ok(adapter, name)  # an edited record cannot point remove at another config file
     path = config_path(adapter)
+    if adapter.get("kind") == "extension":
+        import difflib
+        from guard.agent.adapter import extension_state, extension_text
+        state = extension_state(adapter)
+        if state in ("missing", "foreign"):
+            console.print(f"[green]No guard file at {path}.[/green]")
+            return
+        seen = path.read_bytes()
+        if state == "stale":  # guard's file, but not as this guard writes it: what differs is shown first
+            current = path.read_text(encoding="utf-8")
+            console.print(f"[yellow]{path} differs from the file this guard writes (guard moved, another version, or "
+                          "an edit):[/yellow]")
+            _show_diff("".join(difflib.unified_diff(extension_text(adapter).splitlines(keepends=True),
+                                                    current.splitlines(keepends=True), "guard's file", str(path))))
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            console.print("[bold red]❌ Removing guard's hooks is the user's decision: run it yourself in an interactive terminal.[/bold red]")
+            raise typer.Exit(code=1)
+        if not typer.confirm(f"Delete guard's file {path}?", default=False):
+            console.print("[dim]Nothing changed.[/dim]")
+            raise typer.Exit(code=1)
+        _file_unchanged(path, seen)  # never deletes a file put there while the question was on screen
+        path.unlink()
+        console.print(f"[bold green]✅ {path} removed; restart {adapter['title']}.[/bold green]")
+        return
     if path.suffix != ".json":
         console.print(f"[yellow]Guard does not edit {path}: remove the entries that run `guard agent-event` from it yourself.[/yellow]")
         return
     try:
-        before = read_config(path)
+        before = read_config(path, adapter)
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]")
         raise typer.Exit(code=1)
-    after = without_guard(before, adapter["name"])
+    after = without_guard(before, adapter["name"], adapter)
     change = diff(path, before, after)
     if not change:
         console.print(f"[green]No guard hooks in {path}.[/green]")
@@ -2072,19 +2184,25 @@ def agent_test_cmd(
                       "create or edit one small file. Then run [bold]guard agent test " + name + " --report[/bold].")
         return
     try:
-        since = json.loads(flag.read_text(encoding="utf-8"))["since"]
-    except (OSError, ValueError, KeyError):
-        console.print(f"[bold red]❌ No test is running: start it with guard agent test {name}[/bold red]")
+        started = json.loads(flag.read_text(encoding="utf-8"))
+        since = started["since"] if isinstance(started, dict) and started.get("agent") == name else None
+    except (OSError, ValueError, KeyError, TypeError):
+        since = None
+    if not isinstance(since, str):
+        console.print(f"[bold red]❌ No test of {name} is running: start it with guard agent test {name}[/bold red]")
         raise typer.Exit(code=1)
     lines = []
     if log_path.is_file():
         lines = [l for l in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
                  if l[:32] >= since[:32] and f" {name} " in l and " EVENT " in l]
     flag.unlink(missing_ok=True)
+    def same(name: str) -> str:  # `PreToolUse`, `preToolUse` and `pre_tool_use` are one event
+        return name.replace("_", "").lower()
     seen = {h["harness_event"]: [] for h in adapter["hooks"]}
+    by_key = {same(e): e for e in seen}
     for line in lines:
         parts = line.split(" EVENT ", 1)[1].split()
-        seen.setdefault(parts[0], []).append(" ".join(parts[1:]))
+        seen.setdefault(by_key.get(same(parts[0]), parts[0]), []).append(" ".join(parts[1:]))
     table = Table(title=f"🤖 {adapter['title']}: events since {since[:19]}", show_header=True)
     table.add_column("Harness event", style="bold")
     table.add_column("Arrived", justify="right")
@@ -2096,6 +2214,11 @@ def agent_test_cmd(
     edit_events = {h["harness_event"] for h in adapter["hooks"] if h["event"] == "before-edit"}
     blocked_edit = any("-> block" in r for e in edit_events for r in seen.get(e, []))
     missing = [e for e, r in seen.items() if not r]
+    from guard.agent.adapter import test_record_path  # what doctor shows as this agent's last test
+    record = test_record_path(name)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "events": len(lines),
+                                  "blocked_edit": blocked_edit, "missing": missing}), encoding="utf-8")
     if not lines:
         console.print("[bold red]❌ No event arrived: the agent is not calling guard.[/bold red] Restart the agent and try "
                       "once more; some agents only read their hooks at start.")

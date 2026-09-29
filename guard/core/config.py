@@ -27,6 +27,7 @@ console = Console()
 class LLMProtocol(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    CLI = "cli"  # the user's own agent CLI (claude, codex): no API key, the subscription answers
 
 
 class LLMConfig(BaseModel):
@@ -35,6 +36,14 @@ class LLMConfig(BaseModel):
     api_key: str = Field(default="", description="API Authentication Token")
     model: str = Field(default="gpt-4o", description="Target model name")
     timeout: float = Field(default=60.0, description="HTTP Timeout in seconds")
+    cli_agent: str = Field(default="", description="With protocol cli: the agent CLI that answers (claude, codex)")
+
+    @property
+    def ready(self) -> bool:
+        """An LLM guard can ask: an agent CLI chosen for the CLI protocol (it signs in on its own), else an API key."""
+        if self.protocol == LLMProtocol.CLI:
+            return bool(self.cli_agent)
+        return bool(self.api_key)
 
     @property
     def masked_api_key(self) -> str:
@@ -189,6 +198,11 @@ class _sync_lock:
 
 
 def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]:
+    if llm.protocol == LLMProtocol.CLI:
+        # OCR only calls an HTTP endpoint (with tool calls): an agent CLI cannot answer it directly
+        return False, ("Alibaba OCR needs an HTTP endpoint and keeps its own LLM settings: point it at an API key "
+                       "or a gateway (for example cli-to-api) with `guard config llm --local` + `guard config sync`, "
+                       "or `ocr config` directly.")
     ocr_bin = shutil.which(binary)
     if not ocr_bin:
         return False, f"CLI '{binary}' (@alibaba-group/open-code-review) not found in PATH."
@@ -215,6 +229,34 @@ def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]
         return False, f"Error executing OCR CLI: {str(e)}"
 
 
+def _cli_wizard(current_cfg: GuardConfig, found: List[str], local: bool, repo_path: Optional[Path]) -> GuardConfig:
+    """Option 3: the review runs through `claude` or `codex` on this machine; tested before it is saved."""
+    if not found:
+        console.print("[bold red]❌ Neither `claude` nor `codex` is on PATH.[/bold red] Install one and sign in, then run "
+                      "[bold]guard config llm[/bold] again.")
+        return current_cfg
+    agent = Prompt.ask("Agent CLI", choices=found, default=current_cfg.llm.cli_agent if current_cfg.llm.cli_agent in found else found[0])
+    console.print("[dim]Model: Enter keeps the CLI's own default.[/dim]")
+    model = Prompt.ask("Model", default=current_cfg.llm.model if current_cfg.llm.protocol == LLMProtocol.CLI else "")
+    new_llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent=agent, model=model, base_url="", api_key="",
+                        timeout=current_cfg.llm.timeout)
+    with console.status(f"[cyan]Asking {agent} a one-line question...[/cyan]"):
+        from guard.core.llm_client import ping_llm
+        success, msg, latency = ping_llm(new_llm)
+    if success:
+        console.print(f"[bold green]✅ {agent} answered[/bold green] ({latency / 1000:.1f}s)")
+    else:
+        console.print(f"[bold red]❌ {agent} did not answer:[/bold red] {msg}")
+        if not Confirm.ask("Save it anyway?", default=False):
+            return current_cfg
+    current_cfg.llm = new_llm
+    target_path = save_config(current_cfg, local=local, repo_path=repo_path)
+    console.print(f"[bold green]💾 Saved at:[/bold green] [dim]{target_path}[/dim]")
+    console.print("[yellow]ℹ️  Alibaba OCR keeps its own LLM settings: it needs an HTTP endpoint (an API key or a gateway "
+                  "such as cli-to-api), set with `ocr config` or `guard config sync` from an HTTP LLM config.[/yellow]")
+    return current_cfg
+
+
 def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> GuardConfig:
     current_cfg = load_config(repo_path)
     console.print(Panel(
@@ -227,13 +269,19 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     console.print("\n[bold yellow]Step 1: Select API Protocol[/bold yellow]")
     console.print("  [1] [bold green]OpenAI / OpenAI-Compatible[/bold green] (OpenAI, Ollama, DeepSeek, OpenRouter, vLLM, Local Gateway...)")
     console.print("  [2] [bold magenta]Anthropic[/bold magenta] (Claude API)")
-    
+    from guard.core import cli_llm
+    found = cli_llm.installed()
+    console.print("  [3] [bold cyan]My agent CLI[/bold cyan] (no API key: your Claude or Codex subscription answers)"
+                  + (f" [dim]found: {', '.join(found)}[/dim]" if found else " [dim]none found on PATH[/dim]"))
+
     choice = Prompt.ask(
         "Choice",
-        choices=["1", "2"],
-        default="1" if current_cfg.llm.protocol == LLMProtocol.OPENAI else "2",
+        choices=["1", "2", "3"],
+        default={LLMProtocol.OPENAI: "1", LLMProtocol.ANTHROPIC: "2"}.get(current_cfg.llm.protocol, "3"),
         show_choices=False,
     )
+    if choice == "3":
+        return _cli_wizard(current_cfg, found, local, repo_path)
 
     if choice == "1":
         protocol = LLMProtocol.OPENAI
@@ -334,9 +382,13 @@ def print_config_table(config: GuardConfig, path_info: str):
     table.add_column("Value", style="green")
 
     table.add_row("LLM", "Protocol", config.llm.protocol.value)
-    table.add_row("LLM", "Base URL", config.llm.base_url)
-    table.add_row("LLM", "Model", config.llm.model)
-    table.add_row("LLM", "API Key", config.llm.masked_api_key)
+    if config.llm.protocol == LLMProtocol.CLI:
+        table.add_row("LLM", "Agent CLI", config.llm.cli_agent or "(not set)")
+        table.add_row("LLM", "Model", config.llm.model or "(the CLI's default)")
+    else:
+        table.add_row("LLM", "Base URL", config.llm.base_url)
+        table.add_row("LLM", "Model", config.llm.model)
+        table.add_row("LLM", "API Key", config.llm.masked_api_key)
     table.add_row("LLM", "Timeout", f"{config.llm.timeout}s")
 
 

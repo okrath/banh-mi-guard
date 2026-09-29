@@ -25,8 +25,16 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     Priority 2: Fallback to lightweight message if /models is unsupported
     """
     start = time.perf_counter()
+    if cfg.protocol == LLMProtocol.CLI:  # one short question through the agent CLI: it answers, or says why not
+        from guard.core import cli_llm
+        try:
+            answer = cli_llm.call(cfg.cli_agent, "Reply with the single word OK.", model=cfg.model, timeout=cfg.timeout)
+        except cli_llm.CLILLMError as e:
+            return False, str(e), (time.perf_counter() - start) * 1000
+        first = answer.strip().splitlines()[0][:80] if answer.strip() else ""
+        return bool(answer), f"{cfg.cli_agent} answered: {first}", (time.perf_counter() - start) * 1000
     headers = {"Content-Type": "application/json"}
-    
+
     try:
         if cfg.protocol == LLMProtocol.OPENAI:
             models_url = f"{cfg.base_url.rstrip('/')}/models"
@@ -121,8 +129,14 @@ def call_llm(
     temperature: float = 0.2,
     max_tokens: int = 2048,
 ) -> str:
+    if cfg.protocol == LLMProtocol.CLI:
+        from guard.core import cli_llm
+        try:
+            return cli_llm.call(cfg.cli_agent, prompt, system_prompt=system_prompt, model=cfg.model, timeout=cfg.timeout)
+        except cli_llm.CLILLMError as e:
+            raise LLMClientError(f"Agent CLI error: {e}") from e
     headers = {"Content-Type": "application/json"}
-    
+
     try:
         if cfg.protocol == LLMProtocol.OPENAI:
             url = f"{cfg.base_url.rstrip('/')}/chat/completions"

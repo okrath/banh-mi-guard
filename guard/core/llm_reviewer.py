@@ -199,7 +199,7 @@ class LLMReviewerEngine:
 
         # 2. Deep LLM Review using the configured LLM (OpenAI, Anthropic, Ollama, DeepSeek, etc.)
         llm_error: Optional[str] = None
-        if use_llm and self.config and self.config.llm and self.config.llm.api_key:
+        if use_llm and self.config and self.config.llm and self.config.llm.ready:
             try:
                 llm_verdict = self._evaluate_with_llm(
                     prompt=prompt,
@@ -328,7 +328,7 @@ class LLMReviewerEngine:
         else:
             summary = f"HEURISTIC GATE REJECT ({score:.1f}/10): {len(remediation)} issue(s) to fix before handover."
 
-        model_name = self.config.llm.model if (self.config and self.config.llm and self.config.llm.api_key) else "Local Rule Engine"
+        model_name = self.config.llm.model if (self.config and self.config.llm and self.config.llm.ready) else "Local Rule Engine"
 
         return LLMReviewVerdict(
             verdict=verdict,

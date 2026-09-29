@@ -26,7 +26,7 @@ EVENTS = ("prompt", "before-edit", "after-bash", "stop", "before-commit")
 EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
 # Tools known to only read; any other tool that names a file is treated as one that edits it
 READ_TOOLS = {"read", "grep", "glob", "ls", "notebookread", "webfetch", "websearch", "todowrite",
-              "view", "read_file", "list_directory", "search", "find"}
+              "view", "read_file", "list_directory", "search", "find", "list"}
 SHELL_TOOLS = {"bash", "shell", "powershell", "run_shell_command", "terminal"}
 STATE_FILE = "agent-state.json"
 
@@ -50,9 +50,12 @@ class Decision(BaseModel):
 def _get(payload: Any, path: str) -> Any:
     cur = payload
     for part in path.split("."):
-        if not isinstance(cur, dict):
+        if isinstance(cur, list) and part.isdigit():  # `workspacePaths.0`: an item of a list
+            cur = cur[int(part)] if int(part) < len(cur) else None
+        elif isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
             return None
-        cur = cur.get(part)
     return cur
 
 
@@ -66,6 +69,18 @@ DEFAULT_FIELDS: Dict[str, List[str]] = {
     "call_id": ["tool_use_id", "call_id", "tool_call_id"],
     "loop": ["stop_hook_active", "loop"],
 }
+
+
+def _is_loop(value: Any) -> bool:
+    """
+    The harness already refused a stop once: `true` (stop_hook_active), or a count above zero
+    (Cursor's `loop_count`); "false", 0 and a missing field are not.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    return str(value).strip().lower() == "true"
 
 
 def normalise(event: str, payload: Any, fields: Optional[Dict[str, List[str]]] = None) -> AgentEvent:
@@ -87,7 +102,7 @@ def normalise(event: str, payload: Any, fields: Optional[Dict[str, List[str]]] =
         file_paths=list(dict.fromkeys(paths)),
         command=first("command") if isinstance(first("command"), str) else None,
         call_id=str(first("call_id")) if first("call_id") else None,
-        loop=first("loop") is True or str(first("loop")).strip().lower() == "true",  # "false" is not true
+        loop=_is_loop(first("loop")),
     )
 
 

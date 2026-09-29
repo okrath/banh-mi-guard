@@ -17,7 +17,7 @@ from guard.cli import app
 
 SECRET = "sk_live_9988776655aabbccddeeff"  # the repository's dummy-key form for tests
 CURSOR = {
-    "name": "cursor", "title": "Cursor", "config": "~/.cursor/hooks.json", "detect": "~/.cursor",
+    "name": "acme", "title": "Acme", "config": "~/.acme/hooks.json", "detect": "~/.acme",
     "defaults": {"version": 1},
     "hooks": [{"harness_event": "preToolUse", "event": "before-edit"}, {"harness_event": "stop", "event": "stop"}],
     "fields": {"cwd": ["cwd"], "tool": ["tool_name"], "file_paths": ["tool_input.file_path"]},
@@ -31,11 +31,11 @@ FOREIGN = {"command": "node audit.js", "timeout": 5}
 
 def test_only_the_version_number_of_the_agent_is_sent(monkeypatch):
     import subprocess
-    cursor_home()
-    monkeypatch.setattr(discover.shutil, "which", lambda name: "C:/tools/cursor.exe")
-    out = f"cursor 1.7.2 (build abc)\nlogged in as me@example.com with key {SECRET}\n"
+    acme_home()
+    monkeypatch.setattr(discover.shutil, "which", lambda name: "C:/tools/acme.exe")
+    out = f"acme 1.7.2 (build abc)\nlogged in as me@example.com with key {SECRET}\n"
     monkeypatch.setattr(discover, "_first_bytes", lambda *a, **k: out)
-    inv = discover.investigate("cursor")
+    inv = discover.investigate("acme")
     evidence = discover._evidence(inv)
     assert inv.version == "1.7.2" and "Version: 1.7.2" in evidence
     assert SECRET not in evidence and "example.com" not in evidence  # free text never leaves the machine
@@ -48,7 +48,7 @@ def test_a_project_file_is_never_a_user_config(monkeypatch):
     project = home() / "work" / "app"
     (project / ".git").mkdir(parents=True)
     (home() / ".agentx" / "repo" / ".git").mkdir(parents=True)
-    for config in ("~/work/app/.cursor/hooks.json", "~/.agentx/repo/hooks.json", "~/hooks.json"):
+    for config in ("~/work/app/.acme/hooks.json", "~/.agentx/repo/hooks.json", "~/hooks.json"):
         assert any("home folder" in e for e in validate_adapter(dict(CURSOR, config=config))), config
     # an agent that keeps its settings where Windows puts them is a user config
     assert validate_adapter(dict(CURSOR, config="~/AppData/Roaming/agentx/hooks.json")) == []
@@ -56,32 +56,32 @@ def test_a_project_file_is_never_a_user_config(monkeypatch):
 
 def test_an_edited_adapter_record_is_checked_again_before_installing():
     from guard.agent.adapter import adapters_dir
-    cursor_home()
+    acme_home()
     adapters_dir().mkdir(parents=True, exist_ok=True)
     tampered = dict(CURSOR, entry={"command": "evil.exe"})
-    (adapters_dir() / "cursor.json").write_text(json.dumps(tampered), encoding="utf-8")
-    result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n")
+    (adapters_dir() / "acme.json").write_text(json.dumps(tampered), encoding="utf-8")
+    result = CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n")
     assert result.exit_code == 1 and "not safe to install" in result.output
-    assert "evil" not in (home() / ".cursor" / "hooks.json").read_text(encoding="utf-8")
+    assert "evil" not in (home() / ".acme" / "hooks.json").read_text(encoding="utf-8")
 
 
 def test_an_event_set_to_null_is_simply_not_installed():
-    base = cursor_home()
+    base = acme_home()
     (base / "hooks.json").write_text(json.dumps({"version": 1, "hooks": {"stop": None}}), encoding="utf-8")
     assert installed(CURSOR) is False
     assert with_guard({"hooks": {"stop": None}}, CURSOR, ["C:/tools/guard.exe"])["hooks"]["stop"][0]["command"].endswith(
-        "--agent cursor")  # adding fills it instead of failing
+        "--agent acme")  # adding fills it instead of failing
 
 
 def test_a_record_for_another_agent_or_a_broken_one_is_refused():
     from guard.agent.adapter import adapters_dir
-    cursor_home()
+    acme_home()
     adapters_dir().mkdir(parents=True, exist_ok=True)
-    (adapters_dir() / "cursor.json").write_text(json.dumps(dict(CURSOR, name="codex")), encoding="utf-8")
-    result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n")
-    assert result.exit_code == 1 and "not 'cursor'" in result.output
-    (adapters_dir() / "cursor.json").write_text("{}", encoding="utf-8")
-    result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n")
+    (adapters_dir() / "acme.json").write_text(json.dumps(dict(CURSOR, name="tomlagent")), encoding="utf-8")
+    result = CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n")
+    assert result.exit_code == 1 and "not 'acme'" in result.output
+    (adapters_dir() / "acme.json").write_text("{}", encoding="utf-8")
+    result = CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n")
     assert result.exit_code == 1 and "not safe to install" in result.output  # a message, not a traceback
 
 
@@ -89,7 +89,7 @@ def test_fix_sends_the_old_adapter_without_its_free_text():
     summary = discover._adapter_summary(dict(CURSOR, title="My agent (see notes in C:\\Users\\me)",
                                             output={"block": {"*": {"stdout": {"note": "call 555-1234 now"}}}}))
     assert summary["title"] == "<text>" and summary["output"]["block"]["*"]["stdout"]["note"] == "<text>"
-    assert summary["config"] == "~/.cursor/hooks.json" and summary["entry"] == CURSOR["entry"]
+    assert summary["config"] == "~/.acme/hooks.json" and summary["entry"] == CURSOR["entry"]
     assert summary["hooks"] == CURSOR["hooks"]
 
 
@@ -101,8 +101,8 @@ def test_a_home_folder_kept_in_git_holds_no_user_config():
 def test_only_a_python_launcher_runs_the_guard_module_form():
     from guard.agent.adapter import _is_guard_hook
     for program in ("python", "python3.11", "C:/Py/python.exe", "C:/Py/pythonw.exe", "py.exe"):
-        assert _is_guard_hook({"command": program, "args": ["-m", "guard.cli", "agent-event", "stop", "--agent", "cursor"]})
-    assert not _is_guard_hook({"command": "node", "args": ["-m", "guard.cli", "agent-event", "stop", "--agent", "cursor"]})
+        assert _is_guard_hook({"command": program, "args": ["-m", "guard.cli", "agent-event", "stop", "--agent", "acme"]})
+    assert not _is_guard_hook({"command": "node", "args": ["-m", "guard.cli", "agent-event", "stop", "--agent", "acme"]})
 
 
 def test_a_noisy_version_command_is_read_only_so_far(monkeypatch):
@@ -117,21 +117,23 @@ def test_fix_summary_drops_free_text_and_secret_shaped_words():
                                             output={"block": {"*": {"stdout": {"x": "AKIAIOSFODNN7EXAMPLE"}}}}))
     assert summary["title"] == "<text>" and summary["fields"]["cwd"] == ["<text>"]
     assert summary["output"]["block"]["*"]["stdout"]["x"] == "<text>"
-    assert summary["hooks"] == CURSOR["hooks"] and summary["config"] == "~/.cursor/hooks.json"
+    assert summary["hooks"] == CURSOR["hooks"] and summary["config"] == "~/.acme/hooks.json"
     assert summary["output"] != CURSOR["output"] and summary["entry"] == CURSOR["entry"]
 
 
 def test_an_llm_failure_still_offers_the_way_forward():
     from guard.core.llm_client import LLMClientError
-    cursor_home()
+    acme_home()
     with patch("guard.core.llm_client.call_llm", side_effect=LLMClientError("down")):
-        result = CliRunner().invoke(app, ["agent", "add", "cursor"])
+        result = CliRunner().invoke(app, ["agent", "add", "acme"])
     assert result.exit_code == 1 and "guard config test" in result.output and "issues/new?" in result.output
     assert "guard agent fix" in result.output and "--note" in result.output
 
 
-def test_list_survives_a_broken_record():
+def test_list_survives_a_broken_record(monkeypatch):
+    import guard.cli as cli
     from guard.agent.adapter import adapters_dir
+    monkeypatch.setattr(cli.console, "width", 250, raising=False)
     adapters_dir().mkdir(parents=True, exist_ok=True)
     (adapters_dir() / "broken.json").write_text("{}", encoding="utf-8")
     listed = CliRunner().invoke(app, ["agent", "list"])
@@ -140,7 +142,7 @@ def test_list_survives_a_broken_record():
 
 def test_an_address_is_not_a_version():
     assert discover.VERSION.findall("proxy 10.0.0.5 up") == []
-    assert discover.VERSION.findall("codex-cli 0.156.1") == ["0.156.1"]
+    assert discover.VERSION.findall("tomlagent-cli 0.156.1") == ["0.156.1"]
 
 
 def test_an_ambiguous_version_is_left_out(monkeypatch):
@@ -148,31 +150,31 @@ def test_an_ambiguous_version_is_left_out(monkeypatch):
     monkeypatch.setattr(discover.shutil, "which", lambda name: "C:/tools/x.exe")
     out = "x 2.0.1 (update 2.1.0 available, proxy 10.0.0.5)\n"
     monkeypatch.setattr(discover, "_first_bytes", lambda *a, **k: out)
-    assert discover.investigate("cursor").version == ""  # two versions on the line: guard does not guess
+    assert discover.investigate("acme").version == ""  # two versions on the line: guard does not guess
 
 
 def test_config_outside_home_is_shown_by_its_root_not_its_full_path(tmp_path, monkeypatch):
     appdata = tmp_path / "Roaming Profile Of Someone"
-    (appdata / "cursor").mkdir(parents=True)
-    (appdata / "cursor" / "settings.json").write_text("{}", encoding="utf-8")
+    (appdata / "acme").mkdir(parents=True)
+    (appdata / "acme" / "settings.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("APPDATA", str(appdata))
-    inv = discover.investigate("cursor")
-    assert "%APPDATA%/cursor/settings.json" in inv.listing
+    inv = discover.investigate("acme")
+    assert "%APPDATA%/acme/settings.json" in inv.listing
     assert "Someone" not in discover._evidence(inv)
 
 
 def test_manual_entries_keep_every_hook_of_an_event():
-    base = home() / ".codex"
+    base = home() / ".tomlagent"
     base.mkdir(parents=True, exist_ok=True)
     (base / "config.toml").write_text('model = "x"\n', encoding="utf-8")
-    codex = dict(CURSOR, name="codex", title="Codex", config="~/.codex/config.toml", detect="~/.codex",
+    tomlagent = dict(CURSOR, name="tomlagent", title="Tomlagent", config="~/.tomlagent/config.toml", detect="~/.tomlagent",
                  hooks=[{"harness_event": "PreToolUse", "event": "before-edit"},
                         {"harness_event": "PreToolUse", "event": "after-bash"}])
-    stub, _ = llm(json.dumps(codex))
+    stub, _ = llm(json.dumps(tomlagent))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "codex"], input="n\n")
-    assert "agent-event before-edit --agent codex" in result.output
-    assert "agent-event after-bash --agent codex" in result.output  # both entries, not only the last
+        result = CliRunner().invoke(app, ["agent", "add", "tomlagent"], input="n\n")
+    assert "agent-event before-edit --agent tomlagent" in result.output
+    assert "agent-event after-bash --agent tomlagent" in result.output  # both entries, not only the last
 
 
 @pytest.fixture(autouse=True)
@@ -185,8 +187,8 @@ def home() -> Path:
     return Path(os.path.expanduser("~"))  # conftest points HOME at a temp dir
 
 
-def cursor_home() -> Path:
-    base = home() / ".cursor"
+def acme_home() -> Path:
+    base = home() / ".acme"
     base.mkdir(parents=True, exist_ok=True)
     (base / "hooks.json").write_text(json.dumps({"version": 1, "hooks": {"stop": [FOREIGN]}}), encoding="utf-8")
     (base / "cli-config.json").write_text(json.dumps({"apiKey": SECRET, "model": "auto"}), encoding="utf-8")
@@ -205,45 +207,45 @@ def llm(*answers):
 
 
 def test_valid_proposal_is_installed_after_confirmation_keeping_other_hooks():
-    base = cursor_home()
+    base = acme_home()
     stub, prompts = llm("Here it is:\n```json\n" + json.dumps(CURSOR) + "\n```")
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n")
+        result = CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n")
     assert result.exit_code == 0, result.output
 
     written = json.loads((base / "hooks.json").read_text(encoding="utf-8"))
     assert written["version"] == 1 and written["hooks"]["stop"][0] == FOREIGN  # the user's hook stays first
     guard_entry = written["hooks"]["preToolUse"][0]
-    assert guard_entry["timeout"] == 30 and guard_entry["command"].endswith("agent-event before-edit --agent cursor")
+    assert guard_entry["timeout"] == 30 and guard_entry["command"].endswith("agent-event before-edit --agent acme")
     assert (base / "hooks.json.guard.bak").is_file()
-    assert load_adapter("cursor")["entry"] == CURSOR["entry"] and installed(load_adapter("cursor"))
+    assert load_adapter("acme")["entry"] == CURSOR["entry"] and installed(load_adapter("acme"))
     assert SECRET not in "\n".join(prompts) and "apiKey" in "\n".join(prompts)  # structure sent, secret masked
 
     # guard answers the harness with the adapter's own rules
     payload = {"cwd": str(home()), "tool_name": "Write", "tool_input": {"file_path": str(home() / "x.txt")}}
-    answer = CliRunner().invoke(app, ["agent-event", "before-edit", "--agent", "cursor"], input=json.dumps(payload))
+    answer = CliRunner().invoke(app, ["agent-event", "before-edit", "--agent", "acme"], input=json.dumps(payload))
     assert answer.exit_code == 0
 
 
 def test_declining_the_diff_writes_nothing():
-    base = cursor_home()
+    base = acme_home()
     before = (base / "hooks.json").read_text(encoding="utf-8")
     stub, _ = llm(json.dumps(CURSOR))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="n\n")
+        result = CliRunner().invoke(app, ["agent", "add", "acme"], input="n\n")
     assert result.exit_code == 1
-    assert (base / "hooks.json").read_text(encoding="utf-8") == before and load_adapter("cursor") is None
+    assert (base / "hooks.json").read_text(encoding="utf-8") == before and load_adapter("acme") is None
 
 
 def test_invalid_proposal_is_retried_once_then_refused():
-    cursor_home()
+    acme_home()
     bad = dict(CURSOR, hooks=[{"harness_event": "preToolUse", "event": "delete-everything"}])
     stub, prompts = llm(json.dumps(bad))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n")
+        result = CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n")
     assert result.exit_code == 1 and "not safe to install" in result.output
     assert "Fix these problems" in prompts[-1]  # the retry named the problem
-    assert load_adapter("cursor") is None
+    assert load_adapter("acme") is None
 
 
 def test_validation_rejects_paths_outside_home_and_commands_in_templates(monkeypatch):
@@ -294,7 +296,7 @@ def test_windows_command_line_uses_short_names_and_refuses_what_a_shell_reads(mo
     # the exec form never goes through a shell: such a path still installs there
     exec_form = dict(CURSOR, entry={"command": "{program}", "args": "{args}"})
     entry = with_guard({}, exec_form, ["C:/Users/A&B/guard.exe"])["hooks"]["stop"][0]
-    assert entry == {"command": "C:/Users/A&B/guard.exe", "args": ["agent-event", "stop", "--agent", "cursor"]}
+    assert entry == {"command": "C:/Users/A&B/guard.exe", "args": ["agent-event", "stop", "--agent", "acme"]}
 
 
 def test_defaults_and_missing_entries_cannot_carry_another_command():
@@ -305,7 +307,7 @@ def test_defaults_and_missing_entries_cannot_carry_another_command():
 
 
 def test_a_users_own_hook_with_the_same_words_is_never_removed():
-    foreign = {"command": "node audit.js agent-event stop --agent cursor", "timeout": 5}
+    foreign = {"command": "node audit.js agent-event stop --agent acme", "timeout": 5}
     settings = with_guard({"hooks": {"stop": [foreign]}}, CURSOR, ["C:/tools/guard.exe"])
     assert settings["hooks"]["stop"][0] == foreign and len(settings["hooks"]["stop"]) == 2
     assert without_guard(settings)["hooks"]["stop"] == [foreign]
@@ -314,35 +316,35 @@ def test_a_users_own_hook_with_the_same_words_is_never_removed():
 
 
 def test_fix_can_start_over_for_an_agent_add_could_not_set_up():
-    base = cursor_home()
+    base = acme_home()
     stub, prompts = llm(json.dumps(CURSOR))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "fix", "cursor", "--note", "hooks live in ~/.cursor/hooks.json"],
+        result = CliRunner().invoke(app, ["agent", "fix", "acme", "--note", "hooks live in ~/.acme/hooks.json"],
                                     input="y\n")
     assert result.exit_code == 0, result.output
     assert "hooks live in" in prompts[-1] and "The current adapter" not in prompts[-1]
-    assert load_adapter("cursor") is not None and "agent-event" in (base / "hooks.json").read_text(encoding="utf-8")
+    assert load_adapter("acme") is not None and "agent-event" in (base / "hooks.json").read_text(encoding="utf-8")
 
 
 def test_two_adapters_sharing_a_config_keep_each_others_hooks():
     other = dict(CURSOR, name="cursor-nightly")
     both = with_guard(with_guard({}, CURSOR, ["C:/g/guard.exe"]), other, ["C:/g/guard.exe"])
     assert len(both["hooks"]["stop"]) == 2  # adding one never replaces the other's entry
-    only_other = without_guard(both, "cursor")
+    only_other = without_guard(both, "acme")
     assert [e["command"].split()[-1] for e in only_other["hooks"]["stop"]] == ["cursor-nightly"]
 
 
 def test_an_issue_without_an_investigation_says_unknown():
     from urllib.parse import parse_qs, urlsplit
-    body = parse_qs(urlsplit(discover.issue_url("cursor", "no event arrived")).query)["body"][0]
+    body = parse_qs(urlsplit(discover.issue_url("acme", "no event arrived")).query)["body"][0]
     assert "Binary on PATH: unknown" in body and "Config files: unknown" in body
 
 
 def test_fix_sends_only_event_names_and_decisions():
     lines = [
-        "2026-09-28T10:00:00+00:00 cursor EVENT preToolUse tool=Write -> block",
-        "2026-09-28T10:00:01+00:00 cursor EVENT stop tool=C:/Users/me/secret/path.txt -> allow",
-        f"2026-09-28T10:00:02+00:00 cursor UNREADABLE ValueError: payload held {SECRET}",
+        "2026-09-28T10:00:00+00:00 acme EVENT preToolUse tool=Write -> block",
+        "2026-09-28T10:00:01+00:00 acme EVENT stop tool=C:/Users/me/secret/path.txt -> allow",
+        f"2026-09-28T10:00:02+00:00 acme UNREADABLE ValueError: payload held {SECRET}",
     ]
     summary = discover.event_summary(lines)
     assert summary == "preToolUse tool=Write -> block\nstop -> allow\nUNREADABLE ValueError"
@@ -357,25 +359,25 @@ def test_flat_entries_are_added_and_removed_exactly():
 
 
 def test_non_json_config_prints_entries_and_leaves_the_file_alone():
-    base = home() / ".codex"
+    base = home() / ".tomlagent"
     base.mkdir(parents=True, exist_ok=True)
     (base / "config.toml").write_text(f'model = "x"\ntoken = "{SECRET}"\n', encoding="utf-8")
-    codex = dict(CURSOR, name="codex", title="Codex", config="~/.codex/config.toml", detect="~/.codex")
-    stub, prompts = llm(json.dumps(codex))
+    tomlagent = dict(CURSOR, name="tomlagent", title="Tomlagent", config="~/.tomlagent/config.toml", detect="~/.tomlagent")
+    stub, prompts = llm(json.dumps(tomlagent))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "codex"], input="y\n")
+        result = CliRunner().invoke(app, ["agent", "add", "tomlagent"], input="y\n")
     assert result.exit_code == 0, result.output
-    assert "is not JSON" in result.output and "agent-event before-edit --agent codex" in result.output
+    assert "is not JSON" in result.output and "agent-event before-edit --agent tomlagent" in result.output
     assert (base / "config.toml").read_text(encoding="utf-8").endswith(f'"{SECRET}"\n')  # untouched
-    assert load_adapter("codex") is not None
+    assert load_adapter("tomlagent") is not None
     assert SECRET not in "\n".join(prompts) and "token = <text>" in "\n".join(prompts)
 
 
 def test_agent_without_hooks_and_unknown_agent_are_explained():
-    cursor_home()
+    acme_home()
     stub, _ = llm(json.dumps({"no_hooks": "the docs list no hook system"}))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "cursor"])
+        result = CliRunner().invoke(app, ["agent", "add", "acme"])
     assert result.exit_code == 1 and "no hooks guard can use" in result.output and "pre-commit" in result.output
     assert "github.com/okrath/banh-mi-guard/issues/new?" in result.output  # a prefilled issue to ask for support
 
@@ -387,26 +389,26 @@ def test_agent_without_hooks_and_unknown_agent_are_explained():
 
 def test_the_issue_holds_what_happened_and_never_a_config_s_contents():
     from urllib.parse import parse_qs, urlsplit
-    base = cursor_home()
-    inv = discover.investigate("cursor")
-    query = parse_qs(urlsplit(discover.issue_url("cursor", "no event arrived", inv)).query)
+    base = acme_home()
+    inv = discover.investigate("acme")
+    query = parse_qs(urlsplit(discover.issue_url("acme", "no event arrived", inv)).query)
     body = query["body"][0]
-    assert query["title"] == ["Support agent: cursor"] and "What happened: no event arrived" in body
-    assert "~/.cursor/hooks.json" in body  # file names help; contents never go into the issue
+    assert query["title"] == ["Support agent: acme"] and "What happened: no event arrived" in body
+    assert "~/.acme/hooks.json" in body  # file names help; contents never go into the issue
     assert SECRET not in body and "audit.js" not in body and (base / "hooks.json").is_file()
 
 
 def test_a_blocked_edit_is_found_under_the_harness_s_own_event_name():
     from guard.core.repo_setup import guard_home
-    cursor_home()
+    acme_home()
     stub, _ = llm(json.dumps(CURSOR))
     with stub:
-        assert CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n").exit_code == 0
-    assert CliRunner().invoke(app, ["agent", "test", "cursor"]).exit_code == 0
+        assert CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n").exit_code == 0
+    assert CliRunner().invoke(app, ["agent", "test", "acme"]).exit_code == 0
     log = guard_home() / "agent-events.log"
     with open(log, "a", encoding="utf-8") as f:  # what agent-event logs while a test listens
-        f.write("9999-12-31T00:00:00+00:00 cursor EVENT preToolUse before-edit -> block\n")
-    result = CliRunner().invoke(app, ["agent", "test", "cursor", "--report"])
+        f.write("9999-12-31T00:00:00+00:00 acme EVENT preToolUse before-edit -> block\n")
+    result = CliRunner().invoke(app, ["agent", "test", "acme", "--report"])
     assert "Guard answered the edit with a block" in result.output
 
 
@@ -419,7 +421,7 @@ def test_a_test_where_nothing_arrived_offers_the_issue(monkeypatch):
 
 
 def test_investigation_stays_shallow_and_out_of_data_folders():
-    base = cursor_home()
+    base = acme_home()
     deep = base / "worktrees" / "repo" / "node_modules" / "pkg"
     deep.mkdir(parents=True)
     (deep / "package.json").write_text("{}", encoding="utf-8")
@@ -428,9 +430,9 @@ def test_investigation_stays_shallow_and_out_of_data_folders():
     (base / "sub").mkdir()
     (base / "sub" / "settings.json").write_text("{}", encoding="utf-8")
 
-    inv = discover.investigate("cursor")
+    inv = discover.investigate("acme")
 
-    assert sorted(inv.listing) == ["~/.cursor/cli-config.json", "~/.cursor/hooks.json", "~/.cursor/sub/settings.json"]
+    assert sorted(inv.listing) == ["~/.acme/cli-config.json", "~/.acme/hooks.json", "~/.acme/sub/settings.json"]
 
 
 def test_config_files_are_sent_as_structure_without_any_text_value():
@@ -465,44 +467,44 @@ def test_validation_survives_malformed_values():
 
 
 def test_non_json_config_registers_only_after_confirmation():
-    base = home() / ".codex"
+    base = home() / ".tomlagent"
     base.mkdir(parents=True, exist_ok=True)
     (base / "config.toml").write_text('model = "x"\n', encoding="utf-8")
-    codex = dict(CURSOR, name="codex", title="Codex", config="~/.codex/config.toml", detect="~/.codex")
-    stub, _ = llm(json.dumps(codex))
+    tomlagent = dict(CURSOR, name="tomlagent", title="Tomlagent", config="~/.tomlagent/config.toml", detect="~/.tomlagent")
+    stub, _ = llm(json.dumps(tomlagent))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "add", "codex"], input="n\n")
-    assert result.exit_code == 1 and "agent-event before-edit --agent codex" in result.output
-    assert load_adapter("codex") is None  # shown, not registered
+        result = CliRunner().invoke(app, ["agent", "add", "tomlagent"], input="n\n")
+    assert result.exit_code == 1 and "agent-event before-edit --agent tomlagent" in result.output
+    assert load_adapter("tomlagent") is None  # shown, not registered
 
 
 def test_fix_that_changes_only_the_adapter_asks_before_saving():
-    cursor_home()
+    acme_home()
     stub, _ = llm(json.dumps(CURSOR))
     with stub:
-        assert CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n").exit_code == 0
+        assert CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n").exit_code == 0
     changed = dict(CURSOR, fields={**CURSOR["fields"], "loop": ["loop_count"]})  # same entries, new reading
     stub, _ = llm(json.dumps(changed))
     with stub:
-        declined = CliRunner().invoke(app, ["agent", "fix", "cursor"], input="n\n")
-    assert declined.exit_code == 1 and load_adapter("cursor")["fields"] == CURSOR["fields"]
+        declined = CliRunner().invoke(app, ["agent", "fix", "acme"], input="n\n")
+    assert declined.exit_code == 1 and load_adapter("acme")["fields"] == CURSOR["fields"]
     with stub:
-        accepted = CliRunner().invoke(app, ["agent", "fix", "cursor"], input="y\n")
-    assert accepted.exit_code == 0 and load_adapter("cursor")["fields"]["loop"] == ["loop_count"]
+        accepted = CliRunner().invoke(app, ["agent", "fix", "acme"], input="y\n")
+    assert accepted.exit_code == 0 and load_adapter("acme")["fields"]["loop"] == ["loop_count"]
 
 
 def test_list_and_fix_use_the_registered_adapter():
-    base = cursor_home()
+    base = acme_home()
     stub, _ = llm(json.dumps(CURSOR))
     with stub:
-        assert CliRunner().invoke(app, ["agent", "add", "cursor"], input="y\n").exit_code == 0
+        assert CliRunner().invoke(app, ["agent", "add", "acme"], input="y\n").exit_code == 0
     listed = CliRunner().invoke(app, ["agent", "list"])
-    assert "cursor" in listed.output and "registered" in listed.output
+    assert "acme" in listed.output and "registered" in listed.output
 
     fixed = dict(CURSOR, hooks=CURSOR["hooks"] + [{"harness_event": "beforeSubmitPrompt", "event": "prompt"}])
     stub, prompts = llm(json.dumps(fixed))
     with stub:
-        result = CliRunner().invoke(app, ["agent", "fix", "cursor", "--note", "prompts are not recorded"], input="y\n")
+        result = CliRunner().invoke(app, ["agent", "fix", "acme", "--note", "prompts are not recorded"], input="y\n")
     assert result.exit_code == 0, result.output
     assert "The current adapter" in prompts[-1] and "prompts are not recorded" in prompts[-1]
     assert "beforeSubmitPrompt" in json.loads((base / "hooks.json").read_text(encoding="utf-8"))["hooks"]
@@ -547,9 +549,9 @@ def test_a_version_command_whose_child_keeps_the_pipe_is_not_waited_for():
 def test_list_shows_a_record_whose_hooks_are_malformed():
     from guard.agent.adapter import adapters_dir
     adapters_dir().mkdir(parents=True, exist_ok=True)
-    (adapters_dir() / "acme.json").write_text(json.dumps(dict(CURSOR, name="acme", hooks=[{}])), encoding="utf-8")
+    (adapters_dir() / "widget.json").write_text(json.dumps(dict(CURSOR, name="widget", hooks=[{}])), encoding="utf-8")
     result = CliRunner().invoke(app, ["agent", "list"])
-    assert result.exit_code == 0 and "acme" in result.output
+    assert result.exit_code == 0 and "widget" in result.output
 
 
 def test_an_entry_template_cannot_switch_its_hook_off():
@@ -712,3 +714,22 @@ def test_the_issue_names_a_config_that_failed_to_write_without_the_full_path(mon
         cli._install_adapter(adapter, "widget")
     url = next(line for line in capsys.readouterr().out.splitlines() if "issues/new?" in line)
     assert "~/.widget/hooks.json" in unquote(url) and str(home()) not in unquote(url)
+
+
+def test_continue_zero_is_not_the_boolean_a_refusal_needs():
+    block = dict(CURSOR, output={"allow": {"*": {"exit": 0}}, "block": {"*": {"stdout": {"continue": 0}}}})
+    assert any("nothing refuses" in e for e in validate_adapter(block))
+
+
+def test_a_hook_whose_matcher_was_changed_is_not_installed():
+    from guard.agent.adapter import config_path
+    tools = dict(CURSOR, hooks=[{"harness_event": "preToolUse", "event": "before-edit", "matcher": "Write|Edit"}],
+                 entry={"command": "{command_line}", "matcher": "{matcher}"})
+    path = config_path(tools)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    full = with_guard({}, tools)
+    path.write_text(json.dumps(full), encoding="utf-8")
+    assert installed(tools)
+    full["hooks"]["preToolUse"][0]["matcher"] = "Write"
+    path.write_text(json.dumps(full), encoding="utf-8")
+    assert not installed(tools)
