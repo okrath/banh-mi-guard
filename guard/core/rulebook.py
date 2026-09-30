@@ -157,8 +157,9 @@ def _block_comments(path_lower: str) -> tuple:
         return (("<!--", "-->"),)
     if path_lower.endswith((".jsx", ".tsx", ".vue", ".svelte")):
         return (("/*", "*/"), ("<!--", "-->"))
-    return (("/*", "*/"),)
-
+    if path_lower.endswith(CODE) or path_lower.endswith(CSS):
+        return (("/*", "*/"),)
+    return ()
 
 def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[str]:
     """

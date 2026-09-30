@@ -440,3 +440,9 @@ def test_multiline_img_tag_closed_on_line_past_cap():
     assert violations[0].rule_id == "UX-002"
     assert violations[0].line_number == 1
 
+
+def test_block_comments_fallback_only_for_code_and_css():
+    from guard.core.rulebook import _block_comments
+    assert _block_comments("a.json") == ()
+    assert _block_comments("a.css") == (("/*", "*/"),)
+    assert _block_comments("a.go") == (("/*", "*/"),)
