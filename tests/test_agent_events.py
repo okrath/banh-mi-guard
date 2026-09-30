@@ -367,8 +367,9 @@ def test_a_new_prompt_wins_over_the_restarted_sessions_prompt(tmp_path):
 
 def test_oversized_payload_is_allowed_and_logged(tmp_path, monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.core.repo_setup import guard_home
-    monkeypatch.setattr(cli, "MAX_EVENT_BYTES", 100)
+    monkeypatch.setattr(agent_cmds, "MAX_EVENT_BYTES", 100)
     result = CliRunner().invoke(app, ["agent-event", "before-edit"], input=json.dumps({"x": "y" * 500}))
     assert result.exit_code == 0 and '"decision": "allow"' in result.output
     assert "larger than 100" in (guard_home() / "agent-events.log").read_text(encoding="utf-8")

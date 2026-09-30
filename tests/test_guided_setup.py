@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 import guard.cli as cli
+
+import guard.commands.agent as agent_cmds
+
+import guard.commands.config as config_cmds
+
+import guard.commands.setup as setup_cmds
 from guard.agent.adapter import CLAUDE_CODE, installed
 from guard.core.config import GuardConfig, LLMConfig, load_global_config, ocr_in_sync, save_config
 
@@ -53,7 +59,7 @@ def fake_wizard():
 
 
 def test_without_a_terminal_only_the_list_is_shown(machine, tmp_path):
-    done, left = cli.finish_setup(tmp_path)
+    done, left = setup_cmds.finish_setup(tmp_path)
     commands = " ".join(command for _, command in left)
     assert not done
     for command in ("guard config llm", "guard update ocr", "guard config commit auto", "guard agent add claude-code"):
@@ -64,13 +70,13 @@ def test_without_a_terminal_only_the_list_is_shown(machine, tmp_path):
 def test_in_a_terminal_everything_missing_is_done_in_order(machine, tmp_path, monkeypatch, capsys):
     terminal(monkeypatch)
     monkeypatch.setattr("guard.core.config.run_llm_wizard", fake_wizard)
-    cli.finish_setup(tmp_path)
+    setup_cmds.finish_setup(tmp_path)
     cfg = load_global_config()
     assert cfg.llm.api_key == "k" and cfg.commit_mode == "auto"
     assert machine["installs"] == 1 and machine["synced"] == ["m1"]  # installed, then given the LLM
     assert ocr_in_sync(cfg.llm) and installed(CLAUDE_CODE)
     capsys.readouterr()
-    cli.finish_setup(tmp_path)  # a second run finds nothing to do
+    setup_cmds.finish_setup(tmp_path)  # a second run finds nothing to do
     assert "nothing is missing" in capsys.readouterr().out and machine["synced"] == ["m1"]
 
 
@@ -79,7 +85,7 @@ def test_a_changed_llm_is_synced_without_a_question(machine, tmp_path, monkeypat
     cfg = load_global_config()
     cfg.llm, cfg.commit_mode = LLMConfig(base_url="http://llm.local/v1", api_key="k", model="m2"), "ask"
     save_config(cfg)
-    cli.finish_setup(tmp_path)  # no terminal: the sync needs no answer, so it still runs
+    setup_cmds.finish_setup(tmp_path)  # no terminal: the sync needs no answer, so it still runs
     assert machine["synced"] == ["m2"]
 
 
@@ -91,8 +97,8 @@ def test_declined_and_failed_steps_are_listed_and_the_rest_run(machine, tmp_path
 
     def broken_add(name):
         raise RuntimeError("settings locked")
-    monkeypatch.setattr(cli, "agent_add_cmd", broken_add)
-    cli.finish_setup(tmp_path)
+    monkeypatch.setattr(agent_cmds, "agent_add_cmd", broken_add)
+    setup_cmds.finish_setup(tmp_path)
     out = capsys.readouterr().out
     assert "declined" in out and "guard update ocr" in out  # listed with its command
     assert "failed" in out and "settings locked" in out  # the agent step failed ...
@@ -110,7 +116,7 @@ def test_a_crashing_ocr_sync_is_listed_and_setup_goes_on(machine, tmp_path, monk
         raise OSError("ocr cannot start")
     monkeypatch.setattr("guard.core.config.sync_to_alibaba_ocr", crash)
     terminal(monkeypatch)
-    done, left = cli.finish_setup(tmp_path)
+    done, left = setup_cmds.finish_setup(tmp_path)
     sync = dict(left)["OCR sync"]
     assert "ocr cannot start" in sync and "guard config sync" in sync  # listed with its command
     assert load_global_config().commit_mode == "auto" and "Commit mode" in dict(done)  # the step after it still ran
@@ -122,7 +128,7 @@ def test_setup_checks_the_ocr_binary_the_repository_uses(machine, tmp_path):
     repo_cfg = GuardConfig()
     repo_cfg.ocr.binary_path = "repo-ocr"  # ... but this repository names another binary
     save_config(repo_cfg, local=True, repo_path=tmp_path)
-    done, left = cli.finish_setup(tmp_path)
+    done, left = setup_cmds.finish_setup(tmp_path)
     assert "Alibaba OCR" in dict(left)  # the same binary guard post and doctor use here
     assert next(r for r in setup_health(tmp_path) if r["item"] == "Alibaba OCR")["level"] == "warn"
 
@@ -135,7 +141,7 @@ def test_what_setup_reports_is_what_happened(machine, tmp_path, monkeypatch):
     def install_elsewhere(*a, **k):  # npm succeeds, but the binary guard uses here is still missing
         return True, "installed somewhere else"
     monkeypatch.setattr("guard.core.updater.perform_ocr_upgrade", install_elsewhere)
-    done, left = cli.finish_setup(tmp_path)
+    done, left = setup_cmds.finish_setup(tmp_path)
     assert "Alibaba OCR" in dict(left) and "Claude Code hooks" in dict(left)  # neither is reported as done
     assert not installed(CLAUDE_CODE)
 
@@ -190,10 +196,10 @@ def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
     save_config(cfg)
     assert row("Alibaba OCR")["level"] == "warn" and row("Alibaba OCR")["fix"] == "guard config sync"
     assert "not chosen yet: guard config ocr always|optional" in row("Alibaba OCR")["detail"]  # even when out of sync
-    cli.finish_setup(tmp_path)  # syncs
+    setup_cmds.finish_setup(tmp_path)  # syncs
     row_ocr = row("Alibaba OCR")  # synced; the setting is not chosen yet, so doctor says it can run on every post
     assert row_ocr["level"] == "warn" and row_ocr["fix"].startswith("guard config ocr always")
-    cli.config_ocr_cmd("always")
+    config_cmds.config_ocr_cmd("always")
     assert row("Alibaba OCR")["level"] == "ok" and "every guard post" in row("Alibaba OCR")["detail"]
 
 
@@ -201,7 +207,7 @@ def test_ocr_always_runs_the_review_on_a_plain_post_but_never_in_the_hook(tmp_pa
     from guard.cli import execute_post_task, execute_pre_task
     from test_agent_events import make_repo
     repo = make_repo(tmp_path)
-    cli.config_ocr_cmd("always")
+    config_cmds.config_ocr_cmd("always")
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
     execute_post_task(repo_path=repo, hook=True)

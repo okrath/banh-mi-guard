@@ -35,7 +35,7 @@
       "description": "Scope is only what the prompt or --scope declares: dirty files are never added to it, and a restart inherits baseline and scope instead of redefining them.",
       "rationale": "pre merged every dirty file into scope, and could be re-run after editing to widen it.",
       "checks": [
-        { "files": "guard/cli.py", "forbid": "working_files \\+ prompt_files" },
+        { "files": "guard/**/*.py", "forbid": "working_files \\+ prompt_files" },
         { "files": "guard/cli.py", "require": "baseline_dirty = dict\\(old\\.baseline_dirty\\)" },
         { "files": "guard/cli.py", "require": "SCOPE-004" }
       ]
@@ -85,7 +85,7 @@
       "rationale": "One old approval let an unrelated 19-file commit through unchecked.",
       "checks": [
         { "files": "guard/cli.py", "require": "approved_fingerprints=" },
-        { "files": "guard/cli.py", "forbid": "last guard session was approved, skipping" }
+        { "files": "guard/**/*.py", "forbid": "last guard session was approved, skipping" }
       ]
     },
     {
@@ -147,7 +147,7 @@
       "description": "After a successful self-upgrade, the newly installed binary re-execs to run `hook refresh` instead of relying on the old in-process code",
       "rationale": "Discovered by the LLM gate review",
       "checks": [
-        { "files": "guard/cli.py", "require": "_refresh_with_new_version" }
+        { "files": "guard/commands/maintenance.py", "require": "_refresh_with_new_version" }
       ],
       "origin": "llm:guard-1790389155"
     },
@@ -181,8 +181,8 @@
       "rationale": "Upgrading only refreshes what guard wrote before; gaps such as missing directives or unmarked sections need a visible instruction.",
       "checks": [
         { "files": "guard/core/repo_setup.py", "require": "def setup_health\\(" },
-        { "files": "guard/cli.py", "require": "print_setup_health\\(Path\\.cwd\\(\\), \"🧩 Installation & Repository Setup\"\\)" },
-        { "files": "guard/cli.py", "require": "print_setup_health\\(target, \"🧩 guard setup check\", only_problems=True\\)" }
+        { "files": "guard/commands/maintenance.py", "require": "print_setup_health\\(Path\\.cwd\\(\\), \"🧩 Installation & Repository Setup\"\\)" },
+        { "files": "guard/commands/setup.py", "require": "print_setup_health\\(target, \"🧩 guard setup check\", only_problems=True\\)" }
       ]
     },
     {

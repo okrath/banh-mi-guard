@@ -151,7 +151,7 @@ def test_update_self_refreshes_with_the_new_binary(monkeypatch):
             returncode = 0
         return P()
 
-    with patch("guard.cli.perform_self_upgrade", return_value=(True, "upgraded")), \
+    with patch("guard.commands.maintenance.perform_self_upgrade", return_value=(True, "upgraded")), \
          patch("guard.cli.subprocess.run", side_effect=fake_run):
         result = CliRunner().invoke(app, ["update", "self"])
     assert result.exit_code == 0

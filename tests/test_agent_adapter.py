@@ -10,6 +10,8 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 import guard.cli as cli
+
+import guard.commands.agent as agent_cmds
 from guard.agent.adapter import (
     CLAUDE_CODE, AdapterError, installed, read_config, render, with_guard, without_guard, write_config,
 )
@@ -161,7 +163,7 @@ def test_add_test_and_remove_through_the_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli.agent_remove_cmd(name="claude-code")
+    agent_cmds.agent_remove_cmd(name="claude-code")
     assert read_config(settings_path()) == {"hooks": {"PreToolUse": [FOREIGN]}}
 
 

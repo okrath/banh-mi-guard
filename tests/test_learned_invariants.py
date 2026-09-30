@@ -10,6 +10,8 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 import guard.cli as cli
+
+import guard.commands.invariants as invariants_cmds
 from guard.cli import app
 from guard.core.config import GuardConfig, LLMConfig
 from guard.core.invariant_eval import DomainType
@@ -131,7 +133,7 @@ def test_prune_removes_only_learned_rules_without_checks_and_only_for_the_user(t
         path.write_text(json.dumps(data), encoding="utf-8")
         return "y"
     monkeypatch.setattr(cli.typer, "prompt", confirm_while_a_rule_is_learned)
-    cli.invariants_prune_cmd(repo=str(repo))
+    invariants_cmds.invariants_prune_cmd(repo=str(repo))
     local = json.loads((repo / ".guard" / "invariants.json").read_text(encoding="utf-8"))["invariants"]
     assert [(i["id"], bool(i["checks"])) for i in local] == [
         ("LEARNED-YES", True), ("LOCAL-OWN", False), ("LEARNED-NO", True), ("LATE", False)]

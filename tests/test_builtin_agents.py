@@ -131,10 +131,11 @@ def test_extension_add_and_remove_through_the_cli(name, monkeypatch):
     for limit in adapter.get("limits", []):
         assert limit.split(":")[0][:30] in " ".join(result.output.split())
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli.agent_remove_cmd(name=name)  # in the user's terminal (as the Claude Code adapter's own test does)
+    agent_cmds.agent_remove_cmd(name=name)  # in the user's terminal (as the Claude Code adapter's own test does)
     assert not path.exists()
 
 
@@ -149,6 +150,7 @@ def test_a_file_guard_did_not_write_is_never_replaced():
 
 def test_list_shows_every_popular_agent(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
     listed = CliRunner().invoke(app, ["agent", "list"])
     for name in POPULAR:
@@ -203,6 +205,8 @@ def test_a_changed_extension_file_is_shown_before_it_is_deleted(monkeypatch, cap
     import typer
 
     import guard.cli as cli
+
+    import guard.commands.agent as agent_cmds
     adapter = BUILT_IN["pi"]
     path = config_path(adapter)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,10 +216,10 @@ def test_a_changed_extension_file_is_shown_before_it_is_deleted(monkeypatch, cap
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: False)
     with pytest.raises(typer.Exit):
-        cli.agent_remove_cmd(name="pi")
+        agent_cmds.agent_remove_cmd(name="pi")
     assert path.exists()  # declined after seeing the difference: kept
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli.agent_remove_cmd(name="pi")
+    agent_cmds.agent_remove_cmd(name="pi")
     assert not path.exists()
 
 
@@ -226,6 +230,7 @@ def test_omp_refuses_a_stop_once_then_lets_it_through():
 
 def test_list_skips_test_records_and_doctor_warns_when_no_edit_was_refused(tmp_path, monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir, test_record_path
     from guard.core.repo_setup import setup_health
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
@@ -243,6 +248,7 @@ def test_list_skips_test_records_and_doctor_warns_when_no_edit_was_refused(tmp_p
 
 def test_guards_file_for_another_guard_is_stale_offered_again_and_removable(monkeypatch, tmp_path):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_state
     from guard.core.repo_setup import setup_health
     adapter = BUILT_IN["omp"]
@@ -260,7 +266,7 @@ def test_guards_file_for_another_guard_is_stale_offered_again_and_removable(monk
     path.write_text(extension_text(adapter, ["D:/old/guard.exe"]), encoding="utf-8")
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
-    cli.agent_remove_cmd(name="omp")  # guard's own file: the difference is shown, then it goes
+    agent_cmds.agent_remove_cmd(name="omp")  # guard's own file: the difference is shown, then it goes
     assert not path.exists()
     path.write_bytes(b"\xff\xfe not text")
     assert extension_state(adapter) == "foreign"  # never a crash
@@ -287,6 +293,7 @@ def test_doctor_skips_a_broken_registered_record(tmp_path):
 
 def test_grok_snake_case_events_count_in_agent_test(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.core.repo_setup import guard_home
     assert CliRunner().invoke(app, ["agent", "test", "grok"]).exit_code == 0
     with open(guard_home() / "agent-events.log", "a", encoding="utf-8") as f:
@@ -405,6 +412,7 @@ def test_zcode_hooks_count_as_on_only_when_enabled_is_exactly_true(value):
 
 def test_an_extension_file_changed_while_the_diff_was_shown_is_left_alone(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_path
     path = extension_path(BUILT_IN["pi"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,6 +427,7 @@ def test_an_extension_file_changed_while_the_diff_was_shown_is_left_alone(monkey
 
 def test_a_guard_file_changed_before_removal_is_confirmed_is_not_deleted(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_path
     path = extension_path(BUILT_IN["pi"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -432,7 +441,7 @@ def test_a_guard_file_changed_before_removal_is_confirmed_is_not_deleted(monkeyp
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     cli_result = None
     try:
-        cli.agent_remove_cmd(name="pi")
+        agent_cmds.agent_remove_cmd(name="pi")
     except cli.typer.Exit as e:
         cli_result = e.exit_code
     assert cli_result == 1 and path.exists()
@@ -440,35 +449,37 @@ def test_a_guard_file_changed_before_removal_is_confirmed_is_not_deleted(monkeyp
 
 def test_zcode_switch_turned_on_by_guard_is_said_and_switched_back_on_remove(monkeypatch, capsys):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
     path.parent.mkdir(parents=True, exist_ok=True)
     mine = {"type": "process", "command": "node my-audit.js"}
     path.write_text(json.dumps({"hooks": {"events": {"Stop": [mine]}}}), encoding="utf-8")  # no hooks.enabled
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli._install_adapter(zcode, "zcode")
+    agent_cmds._install_adapter(zcode, "zcode")
     assert "hook(s) already there start running too" in capsys.readouterr().out
     assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["enabled"] is True
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
-    cli.agent_remove_cmd(name="zcode")
+    agent_cmds.agent_remove_cmd(name="zcode")
     left = json.loads(path.read_text(encoding="utf-8"))
     assert "enabled" not in left["hooks"] and left["hooks"]["events"]["Stop"] == [mine]  # as before guard came
 
 
 def test_a_zcode_switch_the_user_set_is_left_on_by_remove(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"hooks": {"enabled": True, "events": {}}}), encoding="utf-8")
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli._install_adapter(zcode, "zcode")
+    agent_cmds._install_adapter(zcode, "zcode")
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     # no record says guard switched it on, so remove asks: the user keeps it
     monkeypatch.setattr(cli.typer, "confirm", lambda text, **k: "Switch it off too" not in text)
-    cli.agent_remove_cmd(name="zcode")
+    agent_cmds.agent_remove_cmd(name="zcode")
     assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["enabled"] is True
 
 
@@ -491,6 +502,7 @@ def test_presence_without_a_detect_folder_needs_the_config_file():
 
 def test_an_empty_file_that_appeared_after_the_diff_is_not_replaced(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_path
     path = extension_path(BUILT_IN["pi"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -553,6 +565,7 @@ def test_doctor_never_says_an_edit_was_refused_by_an_agent_that_cannot_refuse_on
 
 def test_a_switch_record_from_an_earlier_add_stays_while_that_switch_is_on(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -562,16 +575,17 @@ def test_a_switch_record_from_an_earlier_add_stays_while_that_switch_is_on(monke
     # guard's hooks were taken out by hand, the switch left on: a new add must not forget who turned it on
     path.write_text(json.dumps({"hooks": {"enabled": True, "events": {}}}), encoding="utf-8")
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli._install_adapter(zcode, "zcode")
+    agent_cmds._install_adapter(zcode, "zcode")
     assert json.loads(switched_path("zcode").read_text(encoding="utf-8")) == ["hooks.enabled"]
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
-    cli.agent_remove_cmd(name="zcode")
+    agent_cmds.agent_remove_cmd(name="zcode")
     assert "enabled" not in json.loads(path.read_text(encoding="utf-8")).get("hooks", {})
 
 
 def test_a_switch_record_whose_switch_is_off_is_dropped_on_add(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -580,12 +594,13 @@ def test_a_switch_record_whose_switch_is_off_is_dropped_on_add(monkeypatch):
     switched_path("zcode").write_text('["hooks.enabled"]', encoding="utf-8")
     path.write_text(json.dumps({"hooks": {"enabled": False, "events": {}}}), encoding="utf-8")  # the user turned it off
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli._install_adapter(zcode, "zcode")
+    agent_cmds._install_adapter(zcode, "zcode")
     assert not switched_path("zcode").exists()
 
 def test_a_config_write_that_fails_leaves_no_switch_record(monkeypatch):
     import typer
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -597,12 +612,13 @@ def test_a_config_write_that_fails_leaves_no_switch_record(monkeypatch):
     monkeypatch.setattr("guard.agent.adapter.write_config", fail)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
     with pytest.raises(typer.Exit):
-        cli._install_adapter(zcode, "zcode")
+        agent_cmds._install_adapter(zcode, "zcode")
     assert not switched_path("zcode").exists()
 
 
 def test_a_switch_the_user_set_to_null_is_theirs_and_never_recorded(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_on
     zcode = BUILT_IN["zcode"]
     assert switched_on(zcode, {"hooks": {"enabled": None}}) == [] and switched_on(zcode, {"hooks": {}}) == ["hooks.enabled"]
@@ -611,6 +627,7 @@ def test_a_switch_the_user_set_to_null_is_theirs_and_never_recorded(monkeypatch)
 
 def test_a_switch_record_naming_another_setting_is_ignored_by_remove(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -622,7 +639,7 @@ def test_a_switch_record_naming_another_setting_is_ignored_by_remove(monkeypatch
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
-    cli.agent_remove_cmd(name="zcode")
+    agent_cmds.agent_remove_cmd(name="zcode")
     assert json.loads(path.read_text(encoding="utf-8"))["custom"] == {"on": True}
 
 
@@ -637,6 +654,7 @@ def test_a_parent_the_user_set_to_null_is_never_replaced():
 @pytest.mark.parametrize("record", ["not json", '{"hooks.enabled": true}', '[{"k": 1}]'])
 def test_remove_stops_when_the_switch_record_cannot_be_read(monkeypatch, record):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -647,7 +665,7 @@ def test_remove_stops_when_the_switch_record_cannot_be_read(monkeypatch, record)
     switched_path("zcode").write_text(record, encoding="utf-8")
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
     with pytest.raises(cli.typer.Exit):
-        cli.agent_remove_cmd(name="zcode")
+        agent_cmds.agent_remove_cmd(name="zcode")
     assert json.loads(path.read_text(encoding="utf-8")) == installed_config and switched_path("zcode").exists()
 
 
@@ -685,6 +703,7 @@ def test_hand_added_hooks_are_tested_again_after_their_config_changed(tmp_path):
 
 def test_remove_of_an_install_older_than_the_switch_record_asks_about_the_switch(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)
@@ -695,7 +714,7 @@ def test_remove_of_an_install_older_than_the_switch_record_asks_about_the_switch
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.typer, "confirm", lambda text, **k: asked.append(text) or True)
-    cli.agent_remove_cmd(name="zcode")
+    agent_cmds.agent_remove_cmd(name="zcode")
     assert any("Switch it off too" in q for q in asked)
     assert "enabled" not in json.loads(path.read_text(encoding="utf-8")).get("hooks", {})
 
@@ -728,6 +747,7 @@ def test_a_hand_added_hook_test_older_than_the_fingerprint_is_unverified_not_cha
 def test_remove_says_so_when_the_switch_record_cannot_be_deleted(monkeypatch, capsys):
     import typer
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent import adapter as adapter_mod
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
@@ -747,5 +767,5 @@ def test_remove_says_so_when_the_switch_record_cannot_be_deleted(monkeypatch, ca
         return real_unlink(self, *a, **k)
     monkeypatch.setattr(Path, "unlink", locked)
     with pytest.raises(typer.Exit):
-        cli.agent_remove_cmd(name="zcode")
+        agent_cmds.agent_remove_cmd(name="zcode")
     assert "Delete it yourself before adding guard again" in " ".join(capsys.readouterr().out.split())

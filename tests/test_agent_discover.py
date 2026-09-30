@@ -132,6 +132,7 @@ def test_an_llm_failure_still_offers_the_way_forward():
 
 def test_list_survives_a_broken_record(monkeypatch):
     import guard.cli as cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
     adapters_dir().mkdir(parents=True, exist_ok=True)
@@ -609,7 +610,7 @@ def test_fix_with_a_note_goes_on_for_an_agent_nothing_points_to(monkeypatch):
     def propose(name, inv, previous=None, log=""):
         seen["log"] = log
         raise SystemExit(0)
-    monkeypatch.setattr("guard.cli._proposed_adapter", propose)
+    monkeypatch.setattr("guard.commands.agent._proposed_adapter", propose)
     CliRunner().invoke(app, ["agent", "fix", "gizmo", "--note", "hooks live in ~/.gizmo/hooks.json"])
     assert "hooks live in" in seen.get("log", "")
     result = CliRunner().invoke(app, ["agent", "fix", "gizmo"])
@@ -635,14 +636,15 @@ def test_fix_summary_survives_a_field_path_that_is_not_text():
 def test_a_config_guard_cannot_read_ends_with_the_way_forward(monkeypatch, capsys):
     import typer
     from guard import cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import AdapterError
 
     def unreadable(*a, **k):
         raise AdapterError("not JSON")
     monkeypatch.setattr("guard.agent.adapter.read_config", unreadable)
-    monkeypatch.setattr(cli, "_registered_ok", lambda *a, **k: None)
+    monkeypatch.setattr(agent_cmds, "_registered_ok", lambda *a, **k: None)
     with pytest.raises(typer.Exit):
-        cli._install_adapter(dict(CURSOR), CURSOR["name"])
+        agent_cmds._install_adapter(dict(CURSOR), CURSOR["name"])
     out = capsys.readouterr().out
     assert "not JSON" in out and "guard agent fix" in out and "issues/new?" in out
 
@@ -650,6 +652,7 @@ def test_a_config_guard_cannot_read_ends_with_the_way_forward(monkeypatch, capsy
 def test_a_failed_config_write_keeps_the_adapter_as_it_was(monkeypatch, capsys):
     import typer
     from guard import cli
+    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir, config_path
     adapter = dict(CURSOR, name="widget", config="~/.widget/hooks.json", detect="~/.widget")
     config_path(adapter).parent.mkdir(parents=True, exist_ok=True)
@@ -660,10 +663,10 @@ def test_a_failed_config_write_keeps_the_adapter_as_it_was(monkeypatch, capsys):
     def fail(*a, **k):
         raise OSError("disk full")
     monkeypatch.setattr("guard.agent.adapter.write_config", fail)
-    monkeypatch.setattr(cli, "_registered_ok", lambda *a, **k: None)
+    monkeypatch.setattr(agent_cmds, "_registered_ok", lambda *a, **k: None)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
     with pytest.raises(typer.Exit):
-        cli._install_adapter(adapter, "widget")
+        agent_cmds._install_adapter(adapter, "widget")
     assert record.read_text(encoding="utf-8") == '{"name": "widget", "old": true}'
     out = capsys.readouterr().out
     assert "disk full" in out and "issues/new?" in out
@@ -702,16 +705,17 @@ def test_the_issue_names_a_config_that_failed_to_write_without_the_full_path(mon
     import typer
     from urllib.parse import unquote
     from guard import cli
+    import guard.commands.agent as agent_cmds
     adapter = dict(CURSOR, name="widget", config="~/.widget/hooks.json", detect="~/.widget")
     (home() / ".widget").mkdir(parents=True, exist_ok=True)
 
     def fail(*a, **k):
         raise OSError(13, "Permission denied", str(home() / ".widget" / "hooks.json"))
     monkeypatch.setattr("guard.agent.adapter.write_config", fail)
-    monkeypatch.setattr(cli, "_registered_ok", lambda *a, **k: None)
+    monkeypatch.setattr(agent_cmds, "_registered_ok", lambda *a, **k: None)
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
     with pytest.raises(typer.Exit):
-        cli._install_adapter(adapter, "widget")
+        agent_cmds._install_adapter(adapter, "widget")
     url = next(line for line in capsys.readouterr().out.splitlines() if "issues/new?" in line)
     assert "~/.widget/hooks.json" in unquote(url) and str(home()) not in unquote(url)
 
