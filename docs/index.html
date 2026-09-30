@@ -279,7 +279,7 @@
     <section id="quality-matrix">
       <h2>3. 2D Quality Matrix: Platform Domains × Quality Pillars</h2>
       <p>
-        Instead of only checking syntax, Guard evaluates code across a two-dimensional matrix combining <strong>5 Platform Domains</strong> (frontend, backend, fullstack, infra, mobile) and <strong>7 Cross-Cutting Quality Pillars</strong>. Each concern is covered by a deterministic rule, a project invariant or the LLM review; see <a href="https://github.com/okrath/banh-mi-guard/blob/main/docs/quality-pillars.md">quality-pillars.md</a> for which.
+        Guard looks at a change across <strong>5 Platform Domains</strong> (frontend, backend, fullstack, infra, mobile) and <strong>7 Cross-Cutting Quality Pillars</strong>. In each cell, a <code>rule ID</code> is a deterministic check on the diff, run on every <code>guard post</code> at no token cost (<code>DEAD-003</code> and <code>LAZY-002</code> run with <code>--focus dead-code</code> / <code>--focus simplicity</code>); what follows the <code>·</code>, or a cell without an ID, is what the LLM review is asked to look at. Most rules read the lines a change adds and skip docs, tests, comments and lines over 2,000 characters (the LLM review still sees them); for those line rules, a line marked <code>guard-allow &lt;RULE&gt;: &lt;reason&gt;</code> in a comment stays in the report as a LOW note. <a href="https://github.com/okrath/banh-mi-guard/blob/main/docs/quality-pillars.md">quality-pillars.md</a> lists every rule.
       </p>
       <table>
         <thead>
@@ -296,44 +296,54 @@
         </thead>
         <tbody>
           <tr>
-            <td><strong>Frontend</strong> (React, Vue, Tailwind)</td>
-            <td>XSS prevention, CSP, token leaks</td>
-            <td>Dangling listeners, detached DOM</td>
-            <td>Blocking sync I/O, re-render lag</td>
-            <td>UI states (loading, disabled)</td>
-            <td>Escape key, backdrop, mobile view</td>
-            <td>Orphan components, commented JSX blocks</td>
-            <td>Native Web APIs, no premature abstractions</td>
+            <td><strong>Frontend</strong> (React, Vue, Svelte)</td>
+            <td><code>SEC-001</code> <code>SEC-003</code> <code>SEC-005</code> <code>SEC-006</code> <code>SEC-007</code> <code>SEC-008</code> secrets, HTML sinks, eval, TLS off, open CORS, tokens in localStorage · CSP</td>
+            <td><code>PERF-001</code> <code>PERF-003</code> global listeners, intervals with no clearInterval in the same file's diff lines · detached DOM</td>
+            <td><code>PERF-002</code> blocking sync I/O · re-renders</td>
+            <td><code>STAB-001</code> deep property access · UI states</td>
+            <td><code>UX-001</code> <code>UX-002</code> hidden focus ring, images without alt · keyboard, modals, mobile view</td>
+            <td><code>DEAD-001</code> <code>DEAD-002</code> <code>DEAD-REF</code></td>
+            <td><code>LAZY-001</code> <code>LAZY-003</code></td>
           </tr>
           <tr>
-            <td><strong>Backend</strong> (Go, Python, Rust, Nest)</td>
-            <td>SQL injection, Auth middleware, RBAC</td>
-            <td>Connection leaks, unclosed streams</td>
-            <td>N+1 queries, async blocking</td>
-            <td>JSON Schema compatibility, ACID</td>
-            <td>Standardized error codes &amp; status</td>
-            <td>Unused imports, dead helper functions</td>
-            <td>No redundant packages, YAGNI logic</td>
+            <td><strong>Backend</strong> (Python, Go, Node, Rust)</td>
+            <td><code>SEC-001</code> <code>SEC-002</code> <code>SEC-004</code> <code>SEC-005</code> <code>SEC-006</code> <code>SEC-007</code> secrets, SQL, deserialization, shell/eval, TLS off, open CORS · auth, RBAC</td>
+            <td><code>PERF-003</code> intervals with no clearInterval in the same file's diff lines (Node) · unclosed streams and connections</td>
+            <td><code>PERF-002</code> blocking sync I/O in Node · N+1 queries, async blocking</td>
+            <td>build and tests, project invariants · schema compatibility, atomic writes</td>
+            <td>error codes and status</td>
+            <td><code>DEAD-001</code> <code>DEAD-002</code> <code>DEAD-003</code> <code>DEAD-REF</code></td>
+            <td><code>LAZY-001</code> <code>LAZY-002</code> <code>LAZY-003</code></td>
           </tr>
           <tr>
-            <td><strong>Infra / DevOps</strong> (Docker, K8s, Terraform)</td>
-            <td>Forbid 0.0.0.0, no hardcoded secrets</td>
-            <td>Container OOM limits, quotas</td>
-            <td>Fast startup, lightweight images</td>
-            <td>Zero-downtime rolling updates</td>
-            <td>Liveness &amp; readiness probe health</td>
-            <td>Orphan compose files, stale scripts</td>
-            <td>Lightweight manifests, minimal base images</td>
+            <td><strong>Fullstack</strong> (both in one repository)</td>
+            <td>every frontend and backend rule, on its own files</td>
+            <td>as frontend and backend</td>
+            <td>as frontend and backend</td>
+            <td>the API contract between both halves: project invariants · the LLM review</td>
+            <td>as frontend and backend</td>
+            <td><code>DEAD-REF</code> a removed key still used by the other half</td>
+            <td><code>LAZY-001</code> <code>LAZY-002</code> <code>LAZY-003</code></td>
           </tr>
           <tr>
-            <td><strong>Mobile</strong> (Flutter, React Native, Swift)</td>
-            <td>Runtime permissions check, keychain</td>
-            <td>Unreleased Bitmaps, retained controllers</td>
-            <td>Smooth 60/120 FPS, battery efficiency</td>
-            <td>Offline cache synchronization</td>
-            <td>SafeArea boundaries, dynamic notch</td>
-            <td>Unused assets, commented native bridges</td>
-            <td>Native UI primitives, zero bloated SDKs</td>
+            <td><strong>Infra / DevOps</strong> (Docker, Kubernetes, Compose)</td>
+            <td><code>SEC-001</code> <code>INFRA-001</code> <code>INFRA-003</code> <code>SEC-006</code> secrets, privileged or host access, root user, TLS off · open ports</td>
+            <td><code>INFRA-004</code> no resource limits in the workload lines the diff shows · quotas</td>
+            <td>image size, startup time</td>
+            <td><code>INFRA-002</code> unpinned or :latest images · rollout safety</td>
+            <td><code>INFRA-005</code> no liveness or readiness probe</td>
+            <td><code>DEAD-001</code> orphan files · stale scripts</td>
+            <td>minimal manifests and base images</td>
+          </tr>
+          <tr>
+            <td><strong>Mobile</strong> (Android, iOS, Flutter, React Native)</td>
+            <td><code>SEC-001</code> <code>MOB-001</code> <code>MOB-002</code> secrets, debuggable Android builds, cleartext traffic, backups · iOS ATS, permissions, keychain</td>
+            <td>retained controllers, bitmaps</td>
+            <td>frame rate, battery</td>
+            <td>offline sync</td>
+            <td>safe areas, notch</td>
+            <td><code>DEAD-001</code> <code>DEAD-002</code> unused assets, commented code</td>
+            <td>native UI primitives, no heavy SDKs</td>
           </tr>
         </tbody>
       </table>
