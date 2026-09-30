@@ -131,7 +131,7 @@ guard config llm
 The interactive wizard offers three ways to reach an LLM:
 1. **OpenAI / OpenAI-Compatible**: OpenAI, **Ollama** (`http://localhost:11434/v1`), **DeepSeek** (`https://api.deepseek.com/v1`), OpenRouter, vLLM, or Local Gateways (`http://127.0.0.1:8090/v1`).
 2. **Anthropic**: Claude API (any current Claude model id).
-3. **My agent CLI**: `claude` or `codex` on this machine answers the review gate through your subscription, with no API key or gateway: Claude with its tools and your MCP servers off; Codex without your config, in its read-only sandbox (it can still read files on this machine, as its sandbox allows); both in an empty folder outside any repository. Alibaba OCR cannot use a CLI (it calls an HTTP endpoint with tool calls): it keeps its own LLM, and `guard doctor` says so.
+3. **My agent CLI**: `claude` or `codex` on this machine answers the review gate through your subscription, with no API key or gateway: Claude with its tools and your MCP servers off; Codex without your config and without its shell tool, in its read-only sandbox; both in an empty folder outside any repository, with the review rules in the CLI's system prompt. Guard checks the CLI by its sign-in and model list (codex reads its catalog locally; claude answers `/model`, usually without a model call) and offers those models to choose from. Alibaba OCR cannot use a CLI (it calls an HTTP endpoint with tool calls): it keeps its own LLM, and `guard doctor` says so.
 
 Verify connectivity with an instant, token-free latency ping:
 ```bash

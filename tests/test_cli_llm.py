@@ -73,17 +73,55 @@ def test_a_cli_failure_is_an_llm_failure_never_an_answer(runs, monkeypatch):
     answers["claude"] = "not json"
     with pytest.raises(LLMClientError, match="not JSON"):
         call_llm(cfg, "review this")
-    ok, msg, _ = ping_llm(cfg)
-    assert ok is False and "not JSON" in msg
     monkeypatch.setattr(cli_llm.shutil, "which", lambda b: None)
     with pytest.raises(LLMClientError, match="not on PATH"):
         call_llm(cfg, "review this")
 
 
-def test_ping_reports_the_cli_that_answered(runs):
-    ok, msg, _ = ping_llm(LLMConfig(protocol=LLMProtocol.CLI, cli_agent="claude", model=""))
-    assert ok is True and msg == "claude answered: the answer"  # the answer's first line
+@pytest.fixture
+def probes(monkeypatch):
+    """The CLIs' own status and model-list commands, as they print them; any model call would be recorded."""
+    seen = []
+    out = {
+        "auth": json.dumps({"loggedIn": True, "authMethod": "claude.ai"}),
+        "/model": json.dumps({"is_error": False, "num_turns": 0, "total_cost_usd": 0, "result": "Current model: `Opus` (default)\nUsage: /model <name>. "
+                              "Available: sonnet, opus, haiku, default, or a full model ID."}),
+        "login": "Logged in using ChatGPT",
+        "debug": json.dumps({"models": [{"slug": "gpt-b", "visibility": "list", "priority": 2},
+                                        {"slug": "gpt-hidden", "visibility": "hide", "priority": 1},
+                                        {"slug": "gpt-a", "visibility": "list", "priority": 1}]}),
+    }
 
+    def fake(cmd, text, cwd, timeout, env):
+        seen.append((cmd, text))
+        key = "/model" if text == "/model" else cmd[1]
+        code = 0 if key in out else 1
+        return subprocess.CompletedProcess(cmd, code, out.get(key, ""), "")
+    monkeypatch.setattr(cli_llm, "_run", fake)
+    monkeypatch.setattr(cli_llm.shutil, "which", lambda b: f"C:/bin/{b}.exe")
+    return seen, out
+
+
+def test_the_cli_is_tested_by_its_sign_in_and_models_without_a_model_call(probes):
+    seen, _ = probes
+    ok, msg, models = cli_llm.probe("claude")
+    assert ok and models == ["sonnet", "opus", "haiku"] and "signed in" in msg
+    ok, msg, models = cli_llm.probe("codex")
+    assert ok and models == ["gpt-a", "gpt-b"]  # hidden ones left out, in the CLI's own order
+    assert not any("exec" in cmd for cmd, _ in seen)  # codex never ran a prompt
+    assert all(text in ("", "/model") for _, text in seen)  # claude got only its local /model command
+    ok, msg, _ = ping_llm(LLMConfig(protocol=LLMProtocol.CLI, cli_agent="codex", model="gpt-a"))
+    assert ok and "gpt-a" in msg
+
+
+def test_a_cli_that_is_not_signed_in_says_how_to_sign_in(probes):
+    _, out = probes
+    out["auth"] = json.dumps({"loggedIn": False})
+    ok, msg, models = cli_llm.probe("claude")
+    assert not ok and "claude auth login" in msg and models == []
+    del out["login"]  # codex login status exits 1
+    ok, msg, _ = cli_llm.probe("codex")
+    assert not ok and "codex login" in msg
 
 def test_ocr_is_never_pointed_at_a_cli():
     ok, msg = sync_to_alibaba_ocr(LLMConfig(protocol=LLMProtocol.CLI, cli_agent="claude", model=""))
@@ -170,3 +208,87 @@ def test_review_text_cannot_close_its_data_marker_early(runs):
 def test_a_cli_protocol_is_ready_only_with_its_agent_chosen():
     assert not LLMConfig(protocol=LLMProtocol.CLI, cli_agent="", api_key="left-over").ready
     assert LLMConfig(protocol=LLMProtocol.CLI, cli_agent="codex").ready
+
+
+def test_a_missing_model_list_is_not_a_success(probes):
+    _, out = probes
+    del out["debug"]
+    ok, msg, _ = cli_llm.probe("codex")
+    assert not ok and "signed in, but its model list" in msg
+
+
+def test_the_probe_keeps_to_the_configured_timeout(probes, monkeypatch):
+    seen = []
+    real = cli_llm._run
+    monkeypatch.setattr(cli_llm, "_run", lambda cmd, text, cwd, timeout, env: seen.append(timeout) or real(cmd, text, cwd, timeout, env))
+    ping_llm(LLMConfig(protocol=LLMProtocol.CLI, cli_agent="codex", model="", timeout=7))
+    assert seen and all(t == 7 for t in seen)
+
+
+def test_the_wizard_keeps_a_model_only_for_the_cli_it_was_chosen_for(probes, monkeypatch, tmp_path):
+    from guard.core import config as config_mod
+    cfg = config_mod.GuardConfig()
+    cfg.llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent="claude", model="opus")
+    answers = iter(["codex", ""])  # switch to codex, press Enter for the model
+    monkeypatch.setattr(config_mod.Prompt, "ask", lambda *a, **k: next(answers))
+    monkeypatch.setattr(config_mod, "save_config", lambda c, **k: tmp_path / "config.json")
+    saved = config_mod._cli_wizard(cfg, ["claude", "codex"], local=False, repo_path=None)
+    assert saved.llm.cli_agent == "codex" and saved.llm.model == ""
+
+
+def test_a_claude_answer_that_lists_no_models_is_not_a_success(probes):
+    _, out = probes
+    out["/model"] = json.dumps({"is_error": False, "num_turns": 1, "result": "Hello! How can I help?"})
+    ok, msg, models = cli_llm.probe("claude")
+    assert not ok and models == [] and "could not be read" in msg
+
+
+def test_codex_saying_it_is_not_logged_in_is_not_signed_in(probes):
+    _, out = probes
+    out["login"] = "Not logged in"
+    ok, msg, _ = cli_llm.probe("codex")
+    assert not ok and "not signed in" in msg
+
+
+def test_claude_keeps_its_own_sign_in_variables(runs, monkeypatch):
+    calls, _ = runs
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "kept-for-sign-in")
+    cli_llm.call("claude", "review this")
+    assert calls[0]["env"].get("ANTHROPIC_AUTH_TOKEN") == "kept-for-sign-in"
+
+
+def test_a_model_list_command_that_fails_lists_nothing(probes, monkeypatch):
+    real = cli_llm._run
+
+    def failing_list(cmd, text, cwd, timeout, env):
+        res = real(cmd, text, cwd, timeout, env)
+        if text == "/model" or "debug" in cmd:  # parseable output, but the command failed
+            return subprocess.CompletedProcess(cmd, 1, res.stdout, "error")
+        return res
+    monkeypatch.setattr(cli_llm, "_run", failing_list)
+    for agent in ("claude", "codex"):
+        ok, msg, models = cli_llm.probe(agent)
+        assert not ok and models == [] and "model list" in msg
+
+
+def test_one_cli_never_gets_the_others_credentials(runs, monkeypatch):
+    calls, _ = runs
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "claude-only")
+    monkeypatch.setenv("OPENAI_API_KEY", "codex-only")
+    cli_llm.call("codex", "review this")
+    cli_llm.call("claude", "review this")
+    codex_env, claude_env = calls[0]["env"], calls[1]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in codex_env and codex_env.get("OPENAI_API_KEY") == "codex-only"
+    assert "OPENAI_API_KEY" not in claude_env and claude_env.get("ANTHROPIC_AUTH_TOKEN") == "claude-only"
+
+
+@pytest.mark.parametrize("wording", [
+    "Available: sonnet, opus, haiku, or a full model ID.",
+    "Available models: sonnet, opus, haiku",
+    "Current model: opus\nModels: sonnet, opus, haiku or a full model ID",
+])
+def test_claude_models_are_read_from_its_usual_wordings(probes, wording):
+    _, out = probes
+    out["/model"] = json.dumps({"is_error": False, "num_turns": 0, "result": wording})
+    ok, _, models = cli_llm.probe("claude")
+    assert ok and models == ["sonnet", "opus", "haiku"]

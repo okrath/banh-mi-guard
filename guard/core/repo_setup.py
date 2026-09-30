@@ -587,7 +587,11 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
                 refuses = "before-edit" in (adapter.get("can_block") or [])
                 now = config_fingerprint(config_path(adapter))  # None: unreadable now, so nothing to compare with
                 same_file = isinstance(tested, dict) and now is not None and tested.get("config") == now
-                if isinstance(tested, dict) and tested.get("events") and not same_file:
+                unknown = isinstance(tested, dict) and (now is None or not tested.get("config"))
+                if isinstance(tested, dict) and tested.get("events") and unknown:
+                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; guard cannot tell whether its "
+                        f"config is the one the last test ({str(tested.get('at'))[:10]}) saw", f"guard agent test {name}")
+                elif isinstance(tested, dict) and tested.get("events") and not same_file:
                     add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; its config changed since the "
                         f"last test ({str(tested.get('at'))[:10]})", f"guard agent test {name}")
                 elif isinstance(tested, dict) and tested.get("events") and (tested.get("blocked_edit") or not refuses):

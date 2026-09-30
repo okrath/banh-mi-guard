@@ -707,3 +707,45 @@ def test_a_config_fingerprint_names_its_file_and_an_unreadable_one_has_none(tmp_
     assert config_fingerprint(tmp_path / "a.toml") != config_fingerprint(tmp_path / "b.toml")
     assert config_fingerprint(tmp_path / "gone.toml").endswith(":missing")
     assert config_fingerprint(tmp_path) is None  # a folder cannot be read as a file: no evidence
+
+
+def test_a_hand_added_hook_test_older_than_the_fingerprint_is_unverified_not_changed(tmp_path):
+    from guard.agent.adapter import adapters_dir, test_record_path
+    from guard.core.repo_setup import setup_health
+    conf = home() / ".acme" / "config.toml"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("[hooks]\n", encoding="utf-8")
+    adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
+    adapter.update(name="acme", title="Acme", config="~/.acme/config.toml", detect="~/.acme")
+    adapters_dir().mkdir(parents=True, exist_ok=True)
+    (adapters_dir() / "acme.json").write_text(json.dumps(adapter), encoding="utf-8")
+    test_record_path("acme").write_text(json.dumps({"at": "2026-09-28", "events": 3, "blocked_edit": True}),
+                                        encoding="utf-8")  # written before tests kept the config's fingerprint
+    rows = [str(r) for r in setup_health(tmp_path) if "Acme" in str(r)]
+    assert any("cannot tell whether" in r for r in rows) and not any("changed since" in r for r in rows)
+
+
+def test_remove_says_so_when_the_switch_record_cannot_be_deleted(monkeypatch, capsys):
+    import typer
+    import guard.cli as cli
+    from guard.agent import adapter as adapter_mod
+    from guard.agent.adapter import switched_path
+    zcode = BUILT_IN["zcode"]
+    path = config_path(zcode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(with_guard({"hooks": {"events": {}}}, zcode, COMMAND)), encoding="utf-8")
+    switched_path("zcode").parent.mkdir(parents=True, exist_ok=True)
+    switched_path("zcode").write_text('["hooks.enabled"]', encoding="utf-8")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
+    real_unlink = Path.unlink
+
+    def locked(self, *a, **k):
+        if self.name == "zcode.switched.json":
+            raise PermissionError("in use")
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, "unlink", locked)
+    with pytest.raises(typer.Exit):
+        cli.agent_remove_cmd(name="zcode")
+    assert "Delete it yourself before adding guard again" in " ".join(capsys.readouterr().out.split())

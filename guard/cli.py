@@ -1080,11 +1080,17 @@ def config_test_cmd(
     Ping test the currently configured LLM endpoint.
     """
     from guard.core.llm_client import ping_llm
+    from guard.core.config import LLMProtocol
     cfg = load_config(Path(repo) if repo else None)
-    console.print(f"[cyan]Testing connection to [bold]{cfg.llm.base_url}[/bold] (model: {cfg.llm.model})...[/cyan]")
+    if cfg.llm.protocol == LLMProtocol.CLI:
+        console.print(f"[cyan]Checking the [bold]{cfg.llm.cli_agent or '(none chosen)'}[/bold] CLI (model: "
+                      f"{cfg.llm.model or 'its default'}): its sign-in and models...[/cyan]")
+    else:
+        console.print(f"[cyan]Testing connection to [bold]{cfg.llm.base_url}[/bold] (model: {cfg.llm.model})...[/cyan]")
     success, msg, latency = ping_llm(cfg.llm)
     if success:
-        console.print(f"[bold green]✅ Ping SUCCESS![/bold green] Response time: {latency:.1f}ms")
+        console.print(f"[bold green]✅ Ping SUCCESS![/bold green] Response time: {latency:.1f}ms"
+                      + (f" — {msg}" if cfg.llm.protocol == LLMProtocol.CLI else ""), highlight=False)
     else:
         console.print(f"[bold red]❌ Ping FAILED:[/bold red] {msg}")
 
@@ -1768,6 +1774,17 @@ def _unchanged_since_diff(path: Path, shown: dict) -> None:
         raise typer.Exit(code=1)
 
 
+def _forget_switches(name: str, path: Path) -> None:
+    """Delete the record of what guard switched on; one left behind would be trusted by a later add, so it is said."""
+    from guard.agent.adapter import switched_path
+    try:
+        switched_path(name).unlink(missing_ok=True)
+    except OSError as e:
+        console.print(f"[bold red]❌ Guard's hooks are out of {path}, but {switched_path(name)} could not be deleted "
+                      f"({e}). Delete it yourself before adding guard again.[/bold red]", highlight=False)
+        raise typer.Exit(code=1)
+
+
 def _file_state(path: Path):
     """A file's bytes, None when there is none (an empty file is not an absent one), False when it cannot be read."""
     try:
@@ -2194,7 +2211,7 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
             after = _drop_at(after, key.split("."))
     change = diff(path, before, after)
     if not change:
-        switched_path(name).unlink(missing_ok=True)  # nothing of guard's there: nothing to switch back later
+        _forget_switches(name, path)  # nothing of guard's there: nothing to switch back later
         console.print(f"[green]No guard hooks in {path}.[/green]")
         return
     _show_diff(change)
@@ -2206,7 +2223,7 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
         raise typer.Exit(code=1)
     _unchanged_since_diff(path, before)
     write_config(path, after)
-    switched_path(name).unlink(missing_ok=True)
+    _forget_switches(name, path)
     console.print(f"[bold green]✅ Guard's hooks removed from {path}.[/bold green]")
 
 

@@ -236,19 +236,25 @@ def _cli_wizard(current_cfg: GuardConfig, found: List[str], local: bool, repo_pa
                       "[bold]guard config llm[/bold] again.")
         return current_cfg
     agent = Prompt.ask("Agent CLI", choices=found, default=current_cfg.llm.cli_agent if current_cfg.llm.cli_agent in found else found[0])
-    console.print("[dim]Model: Enter keeps the CLI's own default.[/dim]")
-    model = Prompt.ask("Model", default=current_cfg.llm.model if current_cfg.llm.protocol == LLMProtocol.CLI else "")
-    new_llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent=agent, model=model, base_url="", api_key="",
-                        timeout=current_cfg.llm.timeout)
-    with console.status(f"[cyan]Asking {agent} a one-line question...[/cyan]"):
-        from guard.core.llm_client import ping_llm
-        success, msg, latency = ping_llm(new_llm)
+    from guard.core import cli_llm
+    with console.status(f"[cyan]Checking {agent}'s sign-in and models...[/cyan]"):
+        success, msg, models = cli_llm.probe(agent, timeout=current_cfg.llm.timeout)
     if success:
-        console.print(f"[bold green]✅ {agent} answered[/bold green] ({latency / 1000:.1f}s)")
+        console.print(f"[bold green]✅ {agent} is signed in[/bold green]")
     else:
-        console.print(f"[bold red]❌ {agent} did not answer:[/bold red] {msg}")
+        console.print(f"[bold red]❌ {msg}[/bold red]")
         if not Confirm.ask("Save it anyway?", default=False):
             return current_cfg
+    same_cli = current_cfg.llm.protocol == LLMProtocol.CLI and current_cfg.llm.cli_agent == agent
+    kept = current_cfg.llm.model if same_cli else ""
+    for i, name in enumerate(models, 1):  # the CLI's own list: a number picks one, a name or full ID works too
+        console.print(f"  {i}. {name}")
+    console.print("[dim]Model: a number from the list, a model name, or Enter for the CLI's own default.[/dim]")
+    model = Prompt.ask("Model", default=kept).strip()
+    if model.isdigit() and 1 <= int(model) <= len(models):
+        model = models[int(model) - 1]
+    new_llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent=agent, model=model, base_url="", api_key="",
+                        timeout=current_cfg.llm.timeout)
     current_cfg.llm = new_llm
     target_path = save_config(current_cfg, local=local, repo_path=repo_path)
     console.print(f"[bold green]💾 Saved at:[/bold green] [dim]{target_path}[/dim]")

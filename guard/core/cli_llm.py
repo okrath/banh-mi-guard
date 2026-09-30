@@ -5,10 +5,13 @@ subscription answers. Guard sends one plain-text prompt and reads one text answe
 What the nested CLI may do is kept to answering: Claude runs with its built-in tools off, no MCP
 server of the user's (`--strict-mcp-config`) and no saved session; Codex runs read-only, without the
 user's config (so none of its MCP servers) and without keeping a session. Both run in an empty
-temporary folder outside any repository, so guard's own hooks see no session there. The whole text
-(system part included) goes on stdin, never on the command line: on Windows `claude` is a `.cmd`
-shim, and cmd.exe would cut an argument at a newline and run what follows a `|`. No environment
-switch turns guard's hooks off: an agent could set one for its own commands.
+temporary folder outside any repository, so guard's own hooks see no session there. The review text
+goes on stdin and the rules in a file the CLI reads as its system prompt, never on the command line:
+on Windows `claude` is a `.cmd` shim, and cmd.exe would cut an argument at a newline and run what
+follows a `|`. No environment switch turns guard's hooks off: an agent could set one for its own
+commands.
+
+`probe` tests a CLI without a review prompt: its own sign-in status and its model list.
 
 Alibaba OCR cannot use this: it only calls an HTTP endpoint, with tool calls. `guard config` says so.
 """
@@ -16,6 +19,7 @@ Alibaba OCR cannot use this: it only calls an HTTP endpoint, with tool calls. `g
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -36,9 +40,20 @@ SESSION_VARS = {"CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "
 CHILD_ENV = {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "HOME", "USERPROFILE", "HOMEDRIVE",
              "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "TEMP", "TMP", "TMPDIR", "LANG",
              "LC_ALL", "TERM", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "USER",
-             "USERNAME", "LOGNAME", "SHELL", "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY",
-             "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-             "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"}
+             "USERNAME", "LOGNAME", "SHELL", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE",
+             "NODE_EXTRA_CA_CERTS"}
+# each CLI's own sign-in and API settings: one CLI never sees the other's credentials
+AGENT_ENV = {
+    "claude": {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+               "CLAUDE_CONFIG_DIR"},
+    "codex": {"CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"},
+}
+
+
+def _child_env(agent: str) -> Dict[str, str]:
+    """What this CLI needs to start and sign in, and never the session markers of the agent running guard."""
+    allowed = CHILD_ENV | AGENT_ENV.get(agent, set())
+    return {k: v for k, v in os.environ.items() if k.upper() in allowed and k not in SESSION_VARS}
 
 
 UNTRUSTED_OPEN, UNTRUSTED_CLOSE = "<untrusted_review_input>", "</untrusted_review_input>"
@@ -54,6 +69,81 @@ def find(agent: str) -> Optional[str]:
     """The CLI's executable on PATH, or None."""
     spec = AGENTS.get(agent)
     return shutil.which(spec["binary"]) if spec else None
+
+
+def _quiet(agent: str, cmd: List[str], text: str = "", timeout: float = 60) -> subprocess.CompletedProcess:
+    """A short command of the CLI's own (status, model list), in guard's empty folder, with the CLI's environment."""
+    env = _child_env(agent)
+    with tempfile.TemporaryDirectory(prefix="guard-llm-", ignore_cleanup_errors=True) as work:
+        return _run(cmd, text, work, timeout, env)
+
+
+def _models(agent: str, binary: str, timeout: float = 60) -> List[str]:
+    """
+    The models the CLI offers, as it names them, read from the CLI itself: codex prints its model
+    catalog locally; claude answers `/model` (the aliases it accepts; measured 2026-09-29 with claude
+    2.1.284: no model turn, no cost; another version may answer it through the model, which the user
+    accepts for a connection test).
+    """
+    if agent == "claude":
+        res = _quiet(agent, [binary, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
+                      "--no-session-persistence"], "/model", timeout)
+        if res.returncode != 0:
+            return []  # a failed command lists nothing, whatever it printed
+        try:
+            data = json.loads(res.stdout)
+            text = str(data.get("result") or "") if isinstance(data, dict) else ""
+        except (ValueError, AttributeError):
+            return []
+        # "… Available: sonnet, opus, haiku, …, default, or a full model ID." (or "Available models:", "Models:")
+        m = re.search(r"(?im)^.*?\b(?:available(?:\s+models)?|models)\s*:\s*(.+)$", text)
+        listed = re.split(r",?\s+or\s+", m.group(1), maxsplit=1)[0] if m else ""
+        return [m.strip(" .`") for m in listed.split(",") if m.strip(" .`") and m.strip(" .`") != "default"]
+    res = _quiet(agent, [binary, "debug", "models"], "", timeout)
+    if res.returncode != 0:
+        return []
+    try:
+        catalog = json.loads(res.stdout).get("models") or []
+    except (ValueError, AttributeError):
+        return []
+    shown = [m for m in catalog if isinstance(m, dict) and m.get("visibility") == "list" and isinstance(m.get("slug"), str)]
+    return [m["slug"] for m in sorted(shown, key=lambda m: m.get("priority") if isinstance(m.get("priority"), int) else 99)]
+
+
+def probe(agent: str, timeout: Optional[float] = None) -> tuple:
+    """
+    (ready, what to tell the user, the models it offers), with no review prompt: the CLI's own sign-in
+    status (`claude auth status`, `codex login status`) and its model list. Ready means both answered;
+    each command gets `timeout` (60 s when none is set).
+    """
+    timeout = timeout or 60
+    binary = find(agent)
+    if not binary:
+        return False, f"`{AGENTS.get(agent, {}).get('binary', agent)}` is not on PATH", []
+    status = [binary, "auth", "status"] if agent == "claude" else [binary, "login", "status"]
+    try:
+        res = _quiet(agent, status, "", timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"{agent} did not run: {type(e).__name__}: {e}", []
+    if agent == "claude":
+        try:
+            signed_in = bool(json.loads(res.stdout).get("loggedIn"))
+        except (ValueError, AttributeError):
+            signed_in = False
+    else:
+        said = " ".join((res.stdout + res.stderr).lower().split())
+        # "Logged in using ChatGPT"; "Not logged in" also holds the words, so it is refused first
+        signed_in = res.returncode == 0 and "not logged in" not in said and said.startswith("logged in")
+    if not signed_in:
+        return False, f"{agent} is not signed in: run `{AGENTS[agent]['binary']} {'auth login' if agent == 'claude' else 'login'}`", []
+    try:
+        models = _models(agent, binary, timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"{agent} is signed in, but its model list did not come ({type(e).__name__})", []
+    if not models:
+        return False, f"{agent} is signed in, but its model list could not be read", []
+    shown = ", ".join(models[:8]) + (", …" if len(models) > 8 else "")
+    return True, f"{agent} is signed in; models: {shown}", models
 
 
 def installed() -> List[str]:
@@ -139,7 +229,7 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
             system_file.write_text(f"{system_prompt}\n\n{UNTRUSTED_RULE}", encoding="utf-8")
         # only what the CLI needs (CHILD_ENV), never attached to the session of the agent that runs
         # guard (its messaging socket and id)
-        env = {k: v for k, v in os.environ.items() if k.upper() in CHILD_ENV and k not in SESSION_VARS}
+        env = _child_env(agent)
         try:
             res = _run(_command(agent, binary, model, answer_file, system_file), text, work, timeout, env)
         except subprocess.TimeoutExpired as e:

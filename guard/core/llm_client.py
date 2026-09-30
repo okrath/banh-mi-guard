@@ -25,14 +25,12 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     Priority 2: Fallback to lightweight message if /models is unsupported
     """
     start = time.perf_counter()
-    if cfg.protocol == LLMProtocol.CLI:  # one short question through the agent CLI: it answers, or says why not
+    if cfg.protocol == LLMProtocol.CLI:  # the agent CLI's sign-in and model list, no review prompt
         from guard.core import cli_llm
-        try:
-            answer = cli_llm.call(cfg.cli_agent, "Reply with the single word OK.", model=cfg.model, timeout=cfg.timeout)
-        except cli_llm.CLILLMError as e:
-            return False, str(e), (time.perf_counter() - start) * 1000
-        first = answer.strip().splitlines()[0][:80] if answer.strip() else ""
-        return bool(answer), f"{cfg.cli_agent} answered: {first}", (time.perf_counter() - start) * 1000
+        ok, msg, models = cli_llm.probe(cfg.cli_agent, timeout=cfg.timeout)
+        if ok and cfg.model and models and cfg.model not in models:
+            msg += f" ({cfg.model!r} is not in its list: it may still accept a full model ID)"
+        return ok, msg, (time.perf_counter() - start) * 1000
     headers = {"Content-Type": "application/json"}
 
     try:
