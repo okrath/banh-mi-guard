@@ -40,7 +40,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | :--- | :--- | :--- |
 | Global `resize`/`scroll`/`mousemove`/`keydown` listener added with no `removeEventListener` in the diff | Rule | `PERF-001` (HIGH) |
 | `setInterval` added with no `clearInterval(` call (outside strings and comments) in the lines of the same file the diff shows (JS/TS, Vue, Svelte) | Rule | `PERF-003` (MEDIUM) |
-| A new Kubernetes workload (Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Pod) whose YAML document sets no `resources.limits` in the lines the diff shows (judged per document, not per container) | Rule | `INFRA-004` (MEDIUM) |
+| A new Kubernetes workload without `resources.limits` | LLM review (`--focus memory`) | — |
 | Unclosed streams, sockets, DB connections; retained closures; DOM leaks | LLM review (`--focus memory`) | — |
 
 ## 3. ⚡ Performance & Latency
@@ -72,7 +72,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Removed keyboard handlers (`keydown`, `'Escape'`, `keyCode 27`) when a template invariant asks to keep them | Template invariant heuristic | frontend template |
 | Keyboard focus ring removed (`outline: none` / `outline: 0` in CSS or markup), a hint to check for a `:focus-visible` style | Rule | `UX-001` (LOW) |
 | Image without alt text (an `<img>` tag on one line with no `alt`, `[alt]` or `{alt}`, props not spread) | Rule | `UX-002` (MEDIUM) |
-| A new long-running Kubernetes workload with no liveness or readiness probe | Rule | `INFRA-005` (LOW) |
+| A long-running Kubernetes workload with no liveness or readiness probe | LLM review | — |
 | Responsive layout, focus handling, visual feedback, modal dismissal | LLM review (`--focus ux`) | — |
 
 ## 6. 🧹 Code & Asset Hygiene (Dead Code Gate)
@@ -107,7 +107,7 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 | Frontend | `SEC-001` `SEC-003` `SEC-005` `SEC-006` `SEC-007` `SEC-008` | `PERF-001` `PERF-003` | `PERF-002` | `STAB-001` | `UX-001` `UX-002` | `DEAD-*` | `LAZY-*` |
 | Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | `PERF-003` (Node) | `PERF-002` (Node) | build check, invariants, `STAB-001` | LLM | `DEAD-*` | `LAZY-*` |
 | Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-*` |
-| Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | `INFRA-004` | LLM | `INFRA-002` | `INFRA-005` | `DEAD-001` | LLM |
+| Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | LLM | LLM | `INFRA-002` | LLM | `DEAD-001` | LLM |
 | Mobile | `SEC-001` `SEC-006` `MOB-001` `MOB-002` | `PERF-003` (React Native) | LLM | LLM | LLM | `DEAD-001` `DEAD-002` | LLM |
 
 ---

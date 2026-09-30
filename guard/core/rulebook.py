@@ -304,9 +304,6 @@ LINE_RULES = [
 
 MAX_RULE_LINE = 2000  # longer lines are minified or generated: the line rules skip them
 MAX_IMG_TAG = 2000  # an <img tag still open after this much text is dropped, not rescanned line by line
-# A Kubernetes workload whose `kind:` line is added here: the change brings the whole manifest
-WORKLOAD_KIND = re.compile(r"^\s*kind\s*:\s*(Deployment|StatefulSet|DaemonSet|ReplicaSet|Job|CronJob|Pod)\s*$")
-LONG_RUNNING = {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"}
 
 
 class OCRRulebookRunner:
@@ -526,74 +523,8 @@ class OCRRulebookRunner:
                         snippet=added_code[:80],
                     ))
 
-        violations.extend(self._workload_rules(diff_text))
         return violations
 
-    def _workload_rules(self, diff_text: str) -> List[RuleViolation]:
-        """
-        A Kubernetes workload added by this change (its `kind:` line is added) with containers but no
-        resource limits (INFRA-004), or, when it runs for good, no liveness or readiness probe (INFRA-005).
-        Each YAML document (`---`) is judged on its own lines; a limit outside the lines of an edited one
-        cannot be seen, so only workloads whose `kind:` line is added are judged.
-        """
-        found: List[RuleViolation] = []
-        docs: List[dict] = []
-        name, line_num = None, 0
-
-        def new_doc():
-            docs.append({"file": name, "kinds": set(), "at": None, "lines": [], "allow": {}})
-
-        for line in diff_text.splitlines():
-            if line.startswith("+++ b/"):
-                name, line_num = line[6:].strip(), 0
-                new_doc()
-            elif line.startswith("@@"):
-                m = re.search(r"\+(\d+)", line)
-                line_num = int(m.group(1)) - 1 if m else 0
-            elif name and name.lower().endswith(YAML) and line[:1] in ("+", " ") and not line.startswith("+++"):
-                line_num += 1
-                code = line[1:]
-                if code.strip() == "---":
-                    new_doc()
-                    continue
-                doc = docs[-1]
-                doc["lines"].append(code)
-                containers = re.match(r"^\s*containers\s*:", code)
-                if containers and doc["at"] is None:
-                    doc["at"] = line_num
-                if line.startswith("+"):
-                    kind = WORKLOAD_KIND.match(code)
-                    if kind:
-                        doc["kinds"].add(kind.group(1))
-                    if kind or containers:
-                        p_lower = name.replace("\\", "/").lower()
-                        cut = _comment_start(code, _hash_comments(p_lower), blocks=_block_comments(p_lower))
-                        allow = self.SUPPRESS_COMMENT.match(code[cut:]) if cut >= 0 else None
-                        if allow:
-                            doc["allow"][allow.group(1)] = allow.group(2).strip()[:120]
-        for doc in docs:
-            f = doc["file"]
-            path = f.replace("\\", "/").lower()
-            if not doc["kinds"] or doc["at"] is None or _is_test_path(path) or _is_docs_path(path):
-                continue
-            text = "\n".join(doc["lines"])
-            if "{{" in text:
-                continue  # a template (Helm): its values decide the limits and probes
-            missing = []  # `limits:` / `livenessProbe:` in block or flow style (`resources: {limits: ...}`)
-            if not re.search(r"(?:^|[\s{,])limits\s*:", text, re.M):
-                missing.append(("INFRA-004", "MEDIUM", "Containers without resources.limits: one of them can take "
-                                "the node's memory and CPU, and it gets killed at random. Set requests and limits."))
-            if doc["kinds"] & LONG_RUNNING and not re.search(r"(?:^|[\s{,])(?:liveness|readiness)Probe\s*:", text, re.M):
-                missing.append(("INFRA-005", "LOW", "A long-running workload without a liveness or readiness probe: "
-                                "traffic reaches pods that are not ready, and a hung one is never restarted."))
-            for rule_id, severity, advice in missing:
-                reason = doc["allow"].get(rule_id)
-                found.append(RuleViolation(
-                    rule_id=rule_id, severity="LOW" if reason else severity, file_path=f, line_number=doc["at"],
-                    message=f"{rule_id} suppressed by author: {reason}" if reason else advice,
-                    snippet="containers:",
-                ))
-        return found
 
     def _multiline_img(self, path_lower: str, path: str, line_num: int, code: str) -> List[RuleViolation]:
         """UX-002 for an <img tag spread over several added lines (JSX): judged once its `>` arrives."""

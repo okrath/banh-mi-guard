@@ -158,41 +158,6 @@ def test_a_very_long_line_is_skipped_quickly():
     assert time.monotonic() - start < 2
 
 
-DEPLOYMENT = ["apiVersion: apps/v1", "kind: Deployment", "metadata:", "  name: api", "spec:", "  template:",
-              "    spec:", "      containers:", "        - name: api", "          image: registry.example.com/api:1.4.2"]
-
-
-def workload(path: str, lines: list) -> list:
-    diff = f"+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines)
-    return sorted((v.rule_id, v.severity) for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id.startswith("INFRA-00"))
-
-
-def test_a_new_workload_needs_limits_and_probes():
-    assert workload("k8s/api.yaml", DEPLOYMENT) == [("INFRA-004", "MEDIUM"), ("INFRA-005", "LOW")]
-    ready = DEPLOYMENT + ["          resources:", "            limits:", "              memory: 256Mi",
-                          "          readinessProbe:", "            httpGet: {path: /health, port: 8080}"]
-    assert workload("k8s/api.yaml", ready) == []
-
-
-def test_a_job_needs_limits_but_no_probe():
-    job = [line.replace("Deployment", "Job") for line in DEPLOYMENT]
-    assert workload("k8s/migrate.yaml", job) == [("INFRA-004", "MEDIUM")]
-
-
-def test_an_edited_manifest_is_not_judged_on_the_lines_it_shows():
-    diff = ("+++ b/k8s/api.yaml\n@@ -20,3 +20,4 @@\n       containers:\n+        - name: sidecar\n"
-            "+          image: registry.example.com/proxy:2.1.0\n")
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id in ("INFRA-004", "INFRA-005")] == []
-
-
-def test_yaml_that_is_not_a_workload_is_left_alone():
-    assert workload(".github/workflows/ci.yml", ["jobs:", "  test:", "    container:", "      image: python:3.12"]) == []
-
-
-def test_a_helm_template_is_left_to_its_values():
-    templated = DEPLOYMENT + ["          resources: {{- toYaml .Values.resources | nindent 12 }}"]
-    assert workload("chart/templates/deployment.yaml", templated) == []
-
 
 def test_a_parenthesis_inside_a_string_does_not_close_the_sanitize_call():
     diff = "+++ b/web/view.js\n@@ -0,0 +1,1 @@\n+node.innerHTML = DOMPurify.sanitize(\")\") + userInput;\n"
@@ -243,12 +208,6 @@ def test_a_clear_interval_in_a_string_or_comment_does_not_count():
     assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
 
 
-def test_each_yaml_document_is_judged_on_its_own_limits():
-    limited = DEPLOYMENT + ["          resources:", "            limits: {memory: 256Mi}",
-                            "          readinessProbe: {httpGet: {path: /h, port: 80}}"]
-    second = [line.replace("name: api", "name: worker") for line in DEPLOYMENT]
-    assert workload("k8s/all.yaml", limited + ["---"] + second) == [("INFRA-004", "MEDIUM"), ("INFRA-005", "LOW")]
-
 
 def test_an_edited_dockerfile_reports_only_what_the_diff_can_show():
     edited = "+++ b/Dockerfile\n@@ -8,1 +8,2 @@\n FROM node:20-slim AS app\n+FROM build AS runtime\n+USER root\n"
@@ -272,7 +231,6 @@ def test_intervals_in_docs_and_comments_are_not_code():
     for diff in ("+++ b/docs/guide.js\n@@ -0,0 +1,1 @@\n+setInterval(tick, 10)\n",
                  "+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+run() // setInterval(tick) is gone\n"):
         assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == []
-    assert workload("docs/examples/api.yaml", DEPLOYMENT) == []
 
 
 def test_code_after_a_closed_block_comment_is_read():
@@ -323,13 +281,6 @@ def test_a_block_comment_across_lines_is_not_code():
     assert not found("web/a.js", "/* eval(input) */ run()")
 
 
-def test_workload_limits_in_flow_style_and_guard_allow():
-    flow = DEPLOYMENT + ["          resources: {limits: {memory: 1Gi}}"]
-    assert ("INFRA-004", "MEDIUM") not in workload("k8s/api.yaml", flow)
-    allowed = [line + "  # guard-allow INFRA-004: limits come from a LimitRange" if line.strip() == "containers:" else line
-               for line in DEPLOYMENT]
-    assert ("INFRA-004", "LOW") in workload("k8s/api.yaml", allowed)
-
 
 def test_comments_opened_or_closed_on_context_lines():
     inside = "+++ b/web/a.js\n@@ -1,1 +1,3 @@\n /*\n+eval(userInput)\n+*/\n"
@@ -355,11 +306,6 @@ def test_an_image_tag_over_several_lines():
     described = '+++ b/web/A.jsx\n@@ -0,0 +1,3 @@\n+<img\n+  src={logo} alt="Logo"\n+/>\n'
     assert [v for v in OCRRulebookRunner().scan_diff(described) if v.rule_id == "UX-002"] == []
 
-
-def test_a_workload_whose_containers_line_is_context():
-    diff = ("+++ b/k8s/api.yaml\n@@ -1,3 +1,4 @@\n+kind: Deployment\n spec:\n   template:\n"
-            "     spec:\n       containers:\n       - name: api\n")
-    assert "INFRA-004" in [v.rule_id for v in OCRRulebookRunner().scan_diff(diff)]
 
 
 def test_a_comment_closed_on_its_line_leaves_the_next_line_code():
