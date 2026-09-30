@@ -129,7 +129,7 @@ def test_the_lock_file_is_never_opened_through_a_link(tmp_path):
 
 def test_doctor_shows_error_text_literally(tmp_path, monkeypatch):
     import guard.core.untracked as untracked
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     repo = make_repo(tmp_path)
     monkeypatch.setattr(untracked, "untracked_entries", lambda r: (_ for _ in ()).throw(RuntimeError("[red]boom")))
     rows = [r for r in setup_health(repo) if r["item"] == "Untracked paths"]

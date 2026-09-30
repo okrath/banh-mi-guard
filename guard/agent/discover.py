@@ -111,7 +111,7 @@ def _config_dirs(name: str) -> List[Path]:
     for env in ("APPDATA", "LOCALAPPDATA"):
         if os.environ.get(env):
             dirs.append(Path(os.environ[env]) / name)
-    from guard.agent.adapter import _inside_home
+    from guard.agent.adapter_validation import _inside_home
     # checked where it really is (links resolved): a folder that leads into a repository is skipped
     return [d for d in dirs if d.is_dir() and _inside_home(str(d / "config"))]
 

@@ -131,7 +131,7 @@ def test_ocr_is_never_pointed_at_a_cli():
 def test_doctor_names_the_cli_and_says_ocr_needs_its_own_endpoint(tmp_path, monkeypatch):
     import guard.core.config as config
     from guard.core.config import GuardConfig
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     cfg = GuardConfig(llm=LLMConfig(protocol=LLMProtocol.CLI, cli_agent="claude", model=""))
     monkeypatch.setattr(config, "load_global_config", lambda: cfg)
     monkeypatch.setattr("shutil.which", lambda b: f"C:/bin/{b}.exe")

@@ -112,7 +112,7 @@ def _cannot_set_up(name: str, problem: str, inv=None) -> None:
 
 def _proposed_adapter(name: str, inv, previous: Optional[dict] = None, log: str = "") -> dict:
     """The LLM's adapter after validation (one retry with the problems named), or exit with what to do next."""
-    from guard.agent.adapter import NOT_JSON, validate_adapter
+    from guard.agent.adapter_validation import NOT_JSON, validate_adapter
     from guard.agent.discover import propose
     from guard.core.llm_client import LLMClientError
     problems: List[str] = []
@@ -340,7 +340,8 @@ def _registered_ok(adapter: dict, name: str) -> None:
     A registered adapter is a file anyone can edit: it is validated again before guard writes with
     it, and it must be the adapter of the agent asked for (`name`), not another agent's record.
     """
-    from guard.agent.adapter import BUILT_IN, NOT_JSON, validate_adapter
+    from guard.agent.adapter import BUILT_IN
+    from guard.agent.adapter_validation import NOT_JSON, validate_adapter
     if name in BUILT_IN and adapter is BUILT_IN[name]:
         return  # shipped with this guard version
     problems = [p for p in validate_adapter(adapter) if p != NOT_JSON]

@@ -12,7 +12,8 @@ import pytest
 from typer.testing import CliRunner
 
 from guard.agent import discover
-from guard.agent.adapter import installed, load_adapter, validate_adapter, with_guard, without_guard
+from guard.agent.adapter import installed, load_adapter, with_guard, without_guard
+from guard.agent.adapter_validation import validate_adapter
 from guard.cli import app
 
 SECRET = "sk_live_9988776655aabbccddeeff"  # the repository's dummy-key form for tests
@@ -618,7 +619,7 @@ def test_fix_with_a_note_goes_on_for_an_agent_nothing_points_to(monkeypatch):
 
 
 def test_a_redirected_appdata_folder_is_a_user_config(tmp_path, monkeypatch):
-    from guard.agent.adapter import _inside_home
+    from guard.agent.adapter_validation import _inside_home
     roaming = tmp_path / "profiles" / "me" / "Roaming"
     (roaming / "Acme").mkdir(parents=True)
     monkeypatch.setenv("APPDATA", str(roaming))
@@ -673,13 +674,14 @@ def test_a_failed_config_write_keeps_the_adapter_as_it_was(monkeypatch, capsys):
 
 
 def test_malformed_values_in_a_config_or_record_are_refused_quietly():
-    from guard.agent.adapter import NAME, _is_guard_hook, _is_number
+    from guard.agent.adapter import NAME, _is_guard_hook
+    from guard.agent.adapter_validation import _is_number
     assert not NAME.match("cursor\n") and not _is_number(float("nan")) and not _is_number(float("inf"))
     assert not _is_guard_hook({"command": "guard", "args": 5})
 
 
 def test_a_repository_above_a_moved_appdata_folder_is_seen(tmp_path, monkeypatch):
-    from guard.agent.adapter import _inside_home
+    from guard.agent.adapter_validation import _inside_home
     checkout = tmp_path / "work"
     (checkout / ".git").mkdir(parents=True)
     roaming = checkout / "Roaming"

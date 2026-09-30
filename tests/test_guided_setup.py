@@ -123,7 +123,7 @@ def test_a_crashing_ocr_sync_is_listed_and_setup_goes_on(machine, tmp_path, monk
 
 
 def test_setup_checks_the_ocr_binary_the_repository_uses(machine, tmp_path):
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     machine["ocr"] = True  # the global `ocr` is installed ...
     repo_cfg = GuardConfig()
     repo_cfg.ocr.binary_path = "repo-ocr"  # ... but this repository names another binary
@@ -175,7 +175,7 @@ def test_ocr_syncs_run_one_at_a_time():
 
 
 def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
 
     def row(item):
         return next(r for r in setup_health(tmp_path) if r["item"] == item)

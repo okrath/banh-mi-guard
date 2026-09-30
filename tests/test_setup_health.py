@@ -11,7 +11,8 @@ import pytest
 from typer.testing import CliRunner
 
 from guard.cli import app
-from guard.core.repo_setup import DIRECTIVE_END, DIRECTIVE_START, install_global, setup_health
+from guard.core.repo_setup import DIRECTIVE_END, DIRECTIVE_START, install_global
+from guard.core.setup_health import setup_health
 
 
 @pytest.fixture
@@ -50,7 +51,7 @@ def test_complete_install_reports_ok(fake_machine, tmp_path):
     cfg.ocr.always = False  # and the user chose when OCR runs
     save_config(cfg)
     _remember_ocr_sync(cfg.llm)
-    with patch("guard.core.repo_setup.shutil.which", return_value="ocr"):
+    with patch("guard.core.setup_health.shutil.which", return_value="ocr"):
         levels = {r["item"]: r["level"] for r in setup_health(repo)}
     assert levels["Git hooks"] == "ok"
     assert levels["Agent directives"] == "ok"
@@ -131,7 +132,7 @@ def test_commit_mode_is_asked_until_chosen(fake_machine, tmp_path):
 
 def test_missing_ocr_is_reported_with_the_install_command(fake_machine, tmp_path):
     repo = make_repo(tmp_path / "app")
-    with patch("guard.core.repo_setup.shutil.which", return_value=None):
+    with patch("guard.core.setup_health.shutil.which", return_value=None):
         rows = by_item(setup_health(repo))
     assert rows[("Alibaba OCR", "warn")]["fix"].startswith("npm install -g @alibaba-group/open-code-review")
 

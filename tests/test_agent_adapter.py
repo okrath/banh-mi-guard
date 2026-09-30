@@ -142,7 +142,7 @@ def test_add_test_and_remove_through_the_cli(tmp_path, monkeypatch):
     assert "already" in CliRunner().invoke(app, ["agent", "add", "claude-code"]).output
 
     # health: the hooks are reported
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     rows = [r for r in setup_health(tmp_path) if r["item"] == "Agent hooks"]
     assert rows and rows[0]["level"] == "ok"
 
@@ -168,7 +168,7 @@ def test_add_test_and_remove_through_the_cli(tmp_path, monkeypatch):
 
 
 def test_install_offers_the_adapter_when_claude_code_is_here(tmp_path):
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     assert not [r for r in setup_health(tmp_path) if r["item"] == "Agent hooks"]  # no ~/.claude: nothing to offer
     settings_path().parent.mkdir(parents=True)
     row = [r for r in setup_health(tmp_path) if r["item"] == "Agent hooks"][0]

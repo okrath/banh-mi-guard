@@ -12,9 +12,9 @@ import pytest
 from typer.testing import CliRunner
 
 from guard.agent.adapter import (
-    BUILT_IN, config_path, extension_text, installed, load_adapter, render, validate_adapter, with_guard,
-    without_guard,
+    BUILT_IN, config_path, extension_text, installed, load_adapter, render, with_guard, without_guard,
 )
+from guard.agent.adapter_validation import validate_adapter
 from guard.agent.events import Decision, normalise
 from guard.cli import app
 
@@ -167,7 +167,7 @@ def test_protection_says_only_what_each_agent_can_refuse():
 
 def test_doctor_shows_each_agents_protection_and_last_test(tmp_path):
     from guard.agent.adapter import test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     (home() / ".omp").mkdir(parents=True, exist_ok=True)
     rows = [r for r in setup_health(tmp_path) if r["item"] == "Agent hooks"]
     assert any("Oh My Pi" in r["detail"] and r["fix"] == "guard agent add omp" for r in rows)
@@ -232,7 +232,7 @@ def test_list_skips_test_records_and_doctor_warns_when_no_edit_was_refused(tmp_p
     import guard.cli as cli
     import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
     adapters_dir().mkdir(parents=True, exist_ok=True)
     test_record_path("claude-code").write_text(json.dumps({"at": "2026-09-29", "events": 3, "blocked_edit": False}),
@@ -250,7 +250,7 @@ def test_guards_file_for_another_guard_is_stale_offered_again_and_removable(monk
     import guard.cli as cli
     import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_state
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     adapter = BUILT_IN["omp"]
     path = config_path(adapter)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,7 +283,7 @@ def test_a_first_add_into_switched_off_hooks_says_so(monkeypatch):
 
 def test_doctor_skips_a_broken_registered_record(tmp_path):
     from guard.agent.adapter import adapters_dir
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     adapters_dir().mkdir(parents=True, exist_ok=True)
     (home() / ".acme").mkdir(parents=True, exist_ok=True)
     (adapters_dir() / "acme.json").write_text(json.dumps({"name": "acme", "hooks": [{}], "detect": "~/.acme"}),
@@ -369,7 +369,7 @@ def test_doctor_and_install_find_an_agent_by_its_config_when_it_has_no_detect_fo
 
 def test_doctor_reads_a_test_record_that_is_not_an_object_as_not_tested(tmp_path):
     from guard.agent.adapter import test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     test_record_path("claude-code").parent.mkdir(parents=True, exist_ok=True)
     test_record_path("claude-code").write_text("[]", encoding="utf-8")
     assert isinstance(setup_health(tmp_path), list)  # no AttributeError
@@ -523,7 +523,7 @@ def test_antigravity_tells_a_stop_it_cannot_refuse():
 def test_doctor_says_a_cli_review_without_an_agent_chosen(tmp_path, monkeypatch):
     from guard.core import config as config_mod
     from guard.core.config import LLMConfig, LLMProtocol
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     cfg = config_mod.load_global_config()
     cfg.llm = LLMConfig(protocol=LLMProtocol.CLI, cli_agent="", api_key="left-over")
     monkeypatch.setattr(config_mod, "load_global_config", lambda: cfg)
@@ -533,7 +533,7 @@ def test_doctor_says_a_cli_review_without_an_agent_chosen(tmp_path, monkeypatch)
 
 def test_doctor_trusts_the_last_test_for_hooks_added_by_hand_to_a_config_that_is_not_json(tmp_path):
     from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     (home() / ".acme").mkdir(parents=True, exist_ok=True)
     (home() / ".acme" / "config.toml").write_text("[hooks]\n", encoding="utf-8")
     adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
@@ -550,7 +550,7 @@ def test_doctor_trusts_the_last_test_for_hooks_added_by_hand_to_a_config_that_is
 
 def test_doctor_never_says_an_edit_was_refused_by_an_agent_that_cannot_refuse_one(tmp_path):
     from guard.agent.adapter import adapters_dir, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
     adapter.update(name="acme", title="Acme", config="~/.acme/hooks.json", detect="~/.acme", can_block=[])
     adapters_dir().mkdir(parents=True, exist_ok=True)
@@ -671,7 +671,7 @@ def test_remove_stops_when_the_switch_record_cannot_be_read(monkeypatch, record)
 
 def test_hand_added_hooks_that_refused_no_edit_are_not_healthy(tmp_path):
     from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     (home() / ".acme").mkdir(parents=True, exist_ok=True)
     (home() / ".acme" / "config.toml").write_text("[hooks]\n", encoding="utf-8")
     adapter = {k: v for k, v in BUILT_IN["cursor"].items() if k not in ("protection_note", "limits")}
@@ -686,7 +686,7 @@ def test_hand_added_hooks_that_refused_no_edit_are_not_healthy(tmp_path):
 
 def test_hand_added_hooks_are_tested_again_after_their_config_changed(tmp_path):
     from guard.agent.adapter import adapters_dir, config_fingerprint, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     conf = home() / ".acme" / "config.toml"
     conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text("[hooks]\n", encoding="utf-8")
@@ -730,7 +730,7 @@ def test_a_config_fingerprint_names_its_file_and_an_unreadable_one_has_none(tmp_
 
 def test_a_hand_added_hook_test_older_than_the_fingerprint_is_unverified_not_changed(tmp_path):
     from guard.agent.adapter import adapters_dir, test_record_path
-    from guard.core.repo_setup import setup_health
+    from guard.core.setup_health import setup_health
     conf = home() / ".acme" / "config.toml"
     conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text("[hooks]\n", encoding="utf-8")

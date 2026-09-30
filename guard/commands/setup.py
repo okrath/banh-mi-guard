@@ -13,8 +13,10 @@ from rich.table import Table
 from guard.cli import app, console
 from guard.core.config import load_config
 from guard.core.repo_setup import (
-    ensure_repo_setup, git_root, install_global, install_workspace, refresh_after_upgrade, refresh_repo, setup_health, uninstall_global, uninstall_workspace,
+    ensure_repo_setup, git_root, install_global, install_workspace, refresh_after_upgrade, refresh_repo,
+    uninstall_global, uninstall_workspace,
 )
+from guard.core.setup_health import setup_health
 from guard.core.updater import perform_ocr_upgrade
 from guard.hooks.installer import HookInstaller
 

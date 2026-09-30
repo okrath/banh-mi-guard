@@ -10,15 +10,9 @@ from pathlib import Path
 from guard.cli import execute_pre_task
 from guard.core import repo_setup
 from guard.core.repo_setup import (
-    DIRECTIVE_END,
-    DIRECTIVE_START,
-    HOOK_BLOCK_START,
-    ensure_repo_setup,
-    guard_home,
-    refresh_after_upgrade,
-    refresh_directive_block,
-    setup_health,
+    DIRECTIVE_END, DIRECTIVE_START, HOOK_BLOCK_START, ensure_repo_setup, guard_home, refresh_after_upgrade, refresh_directive_block,
 )
+from guard.core.setup_health import setup_health
 from guard.hooks.templates import AGENT_DIRECTIVES_TEMPLATE
 
 AGENT_MD = "# App\n\n## Core invariants\n\n1. **Chat never times out**\n"
