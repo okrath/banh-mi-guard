@@ -46,7 +46,7 @@
       "rationale": "Mid-task commits, renames and paths with spaces or Vietnamese characters used to escape the audit.",
       "checks": [
         { "files": "guard/cli.py", "require": "get_diff\\(base_ref=pre\\.base_ref" },
-        { "files": "guard/core/ocr_engine.py", "require": "\"--porcelain\", \"-z\"" }
+        { "files": "guard/core/diff_inspector.py", "require": "\"--porcelain\", \"-z\"" }
       ]
     },
     {
@@ -64,8 +64,8 @@
       "description": "SEC-003 cannot be silenced by a comment that mentions 'sanitize'.",
       "rationale": "Any innerHTML line containing the word 'sanitize' used to be skipped.",
       "checks": [
-        { "files": "guard/core/ocr_engine.py", "forbid": "\"sanitize\" not in added_code" },
-        { "files": "guard/core/ocr_engine.py", "require": "def _unsafe_html_sinks\\(" }
+        { "files": "guard/**/*.py", "forbid": "\"sanitize\" not in added_code" },
+        { "files": "guard/core/rulebook.py", "require": "def _unsafe_html_sinks\\(" }
       ]
     },
     {
