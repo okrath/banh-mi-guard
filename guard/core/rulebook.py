@@ -119,17 +119,17 @@ def _call_arguments(code: str, open_paren: int) -> str:
     return code[open_paren + 1:]  # not closed on this line: the rest of it
 
 
-def _comment_start(code: str, hash_comments: bool, spans: Optional[list] = None) -> int:
+def _comment_start(code: str, hash_comments: bool, spans: Optional[list] = None, blocks: tuple = ()) -> int:
     """
-    Where the line's comment begins, outside any string (`#` or `//` by language, or a `/*` or `<!--` not
-    closed on the line); -1 for none. A block comment closed on the line (`/* note */ run(x)`) is not the
+    Where the line's comment begins, outside any string (`#` or `//` by language, or a block comment
+    not closed on the line); -1 for none. A block comment closed on the line (`/* note */ run(x)`) is not the
     end of the code: the scan goes on after it, and its (start, end) goes into `spans` when given.
     """
     closed_until = 0
     for k, ch, in_string in _scan(code):
         if in_string or k < closed_until:
             continue
-        for opening, closing in (("/*", "*/"), ("<!--", "-->")):
+        for opening, closing in blocks:
             if code.startswith(opening, k):
                 end = code.find(closing, k + len(opening))
                 if end < 0:
@@ -149,11 +149,23 @@ def _hash_comments(path_lower: str) -> bool:
     return path_lower.endswith(PY + YAML + (".sh", ".rb", ".toml")) or _is_dockerfile(path_lower)
 
 
+def _block_comments(path_lower: str) -> tuple:
+    """Block comment pairs (opening, closing) allowed in the file type."""
+    if _hash_comments(path_lower):
+        return ()
+    if path_lower.endswith((".html", ".htm", ".xml", ".svg")):
+        return (("<!--", "-->"),)
+    if path_lower.endswith((".jsx", ".tsx", ".vue", ".svelte")):
+        return (("/*", "*/"), ("<!--", "-->"))
+    return (("/*", "*/"),)
+
+
 def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[str]:
     """
-    The line without the part inside a `/*` or `<!--` comment an earlier line left open (None when all of it
+    The line without the part inside a block comment an earlier line left open (None when all of it
     is), noting in `open_comments` whether this line leaves one open for the next.
     """
+    blocks = _block_comments(path_lower)
     closing = open_comments.pop(path_lower, None)
     if closing:
         end = code.find(closing)
@@ -161,8 +173,8 @@ def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[
             open_comments[path_lower] = closing
             return None
         code = code[end + len(closing):]
-    cut = _comment_start(code, _hash_comments(path_lower))
-    for opening, closer in (("/*", "*/"), ("<!--", "-->")):
+    cut = _comment_start(code, _hash_comments(path_lower), blocks=blocks)
+    for opening, closer in blocks:
         if cut >= 0 and code.startswith(opening, cut):
             open_comments[path_lower] = closer
     return code
@@ -290,6 +302,7 @@ LINE_RULES = [
 
 
 MAX_RULE_LINE = 2000  # longer lines are minified or generated: the line rules skip them
+MAX_IMG_TAG = 2000  # an <img tag still open after this much text is dropped, not rescanned line by line
 # A Kubernetes workload whose `kind:` line is added here: the change brings the whole manifest
 WORKLOAD_KIND = re.compile(r"^\s*kind\s*:\s*(Deployment|StatefulSet|DaemonSet|ReplicaSet|Job|CronJob|Pod)\s*$")
 LONG_RUNNING = {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"}
@@ -350,7 +363,8 @@ class OCRRulebookRunner:
                 if len(line) > MAX_RULE_LINE:
                     continue
                 spans: list = []
-                cut = _comment_start(visible or "", _hash_comments(name.replace("\\", "/").lower()), spans)
+                p_lower = name.replace("\\", "/").lower()
+                cut = _comment_start(visible or "", _hash_comments(p_lower), spans, _block_comments(p_lower))
                 body = (visible or "")[:cut] if cut >= 0 else (visible or "")
                 for a, b in spans:
                     body = body[:a] + " " * (b - a) + body[b:]
@@ -464,7 +478,7 @@ class OCRRulebookRunner:
 
                 # Rule 4b: an interval started with no clearInterval anywhere in the change (Memory Safety)
                 spans = []
-                cut = _comment_start(visible or "", _hash_comments(cf_lower), spans)
+                cut = _comment_start(visible or "", _hash_comments(cf_lower), spans, _block_comments(cf_lower))
                 interval_code = (visible or "")[:cut] if cut >= 0 else (visible or "")
                 for a, b in spans:
                     interval_code = interval_code[:a] + " " * (b - a) + interval_code[b:]
@@ -551,7 +565,8 @@ class OCRRulebookRunner:
                     if kind:
                         doc["kinds"].add(kind.group(1))
                     if kind or containers:
-                        cut = _comment_start(code, True)
+                        p_lower = name.replace("\\", "/").lower()
+                        cut = _comment_start(code, _hash_comments(p_lower), blocks=_block_comments(p_lower))
                         allow = self.SUPPRESS_COMMENT.match(code[cut:]) if cut >= 0 else None
                         if allow:
                             doc["allow"][allow.group(1)] = allow.group(2).strip()[:120]
@@ -588,11 +603,14 @@ class OCRRulebookRunner:
             end = _tag_end(tag)
             if end >= 0:
                 found = [v for v in self._line_rules(path_lower, path, start, tag[:end + 1]) if v.rule_id == "UX-002"]
+            elif len(tag) > MAX_IMG_TAG:
+                start, tag = None, ""
             else:
                 self._open_img[path_lower] = (start, tag)
         last = code.lower().rfind("<img")
         if last >= 0 and _tag_end(code[last:]) < 0:
-            self._open_img[path_lower] = (line_num, code[last:])
+            if len(code[last:]) <= MAX_IMG_TAG:
+                self._open_img[path_lower] = (line_num, code[last:])
         return found
 
     def _file_context(self, path_lower: str, code: str) -> None:
@@ -611,7 +629,7 @@ class OCRRulebookRunner:
         # `//` in C-family languages (in Python `//` divides). The rules read the code before it; a
         # guard-allow counts only there, never in a string that looks like a comment
         spans: list = []
-        cut = _comment_start(code, _hash_comments(path_lower), spans)
+        cut = _comment_start(code, _hash_comments(path_lower), spans, _block_comments(path_lower))
         body, comment = (code[:cut], code[cut:]) if cut >= 0 else (code, "")
         if cut == 0:
             return found  # the whole line is a comment

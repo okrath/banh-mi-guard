@@ -396,3 +396,47 @@ def test_a_greater_than_inside_a_quoted_attribute_does_not_end_the_image_tag():
 def test_a_clear_interval_in_a_closed_block_comment_does_not_count():
     diff = "+++ b/web/a.ts\n@@ -0,0 +1,2 @@\n+/* clearInterval(id) */\n+const id = setInterval(tick, 1000)\n"
     assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
+
+
+def test_yaml_glob_does_not_open_block_comment():
+    diff = "+++ b/k8s/deploy.yaml\n@@ -0,0 +1,2 @@\n+include: foo/*\n+  privileged: true\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "INFRA-001"] == ["INFRA-001"]
+
+
+def test_python_glob_and_division_do_not_open_block_comment():
+    diff = '+++ b/app/run.py\n@@ -0,0 +1,2 @@\n+paths = glob("src/*")\n+eval(user_input)\n'
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "SEC-005"] == ["SEC-005"]
+    diff2 = "+++ b/app/run.py\n@@ -0,0 +1,2 @@\n+x = a /* b\n+eval(user_input)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff2) if v.rule_id == "SEC-005"] == ["SEC-005"]
+
+
+def test_js_block_comment_suppresses_rule():
+    diff = "+++ b/web/a.js\n@@ -0,0 +1,3 @@\n+/*\n+eval(userInput)\n+*/\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "SEC-005"] == []
+
+
+def test_html_block_comment_suppresses_img_rule():
+    diff = '+++ b/web/index.html\n@@ -0,0 +1,3 @@\n+<!--\n+<img src="a.png">\n+-->\n'
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == []
+
+
+def test_unclosed_img_tag_over_max_length_dropped():
+    padding = "+  " + "x" * 80 + "\n"
+    diff = f'+++ b/web/A.jsx\n@@ -0,0 +1,33 @@\n+<img\n{padding * 30}+/>\n'
+    violations = OCRRulebookRunner().scan_diff(diff)
+    assert [v for v in violations if v.rule_id == "UX-002"] == []
+
+
+def test_html_literal_slash_star_does_not_hide_img():
+    diff = '+++ b/web/index.html\n@@ -0,0 +1,2 @@\n+<p>path/*</p>\n+<img src="a.png">\n'
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == ["UX-002"]
+
+
+def test_multiline_img_tag_closed_on_line_past_cap():
+    tail = "x" * 2000
+    diff = f"+++ b/web/A.jsx\n@@ -0,0 +1,2 @@\n+<img src={{logo}}\n+/> {tail}\n"
+    violations = [v for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"]
+    assert len(violations) == 1
+    assert violations[0].rule_id == "UX-002"
+    assert violations[0].line_number == 1
+
