@@ -2,9 +2,11 @@
 Unit tests for Supply-Chain Security & Update Quarantine Checker (Alibaba OCR).
 """
 
+import sys
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
 from guard.core.updater import (
     UpdateSecurityStatus,
     VersionCheckResult,
@@ -164,6 +166,13 @@ def test_get_cached_update_notice(tmp_path):
         assert "v9.9.9" in notice
 
 
+@pytest.fixture
+def clean_pip_env(monkeypatch):
+    monkeypatch.delenv("PIPX_HOME", raising=False)
+    monkeypatch.delenv("PIPX_BIN_DIR", raising=False)
+    monkeypatch.setattr(sys, "executable", "C:/Python311/python.exe")
+
+
 def test_perform_self_upgrade_pipx():
     from guard.core.updater import perform_self_upgrade
 
@@ -181,7 +190,7 @@ def test_perform_self_upgrade_pipx():
         assert "--force" in called_cmd
 
 
-def test_perform_self_upgrade_pip_fallback():
+def test_perform_self_upgrade_pip_fallback(clean_pip_env):
     from guard.core.updater import perform_self_upgrade
 
     mock_proc = MagicMock()
@@ -198,7 +207,7 @@ def test_perform_self_upgrade_pip_fallback():
         assert "--no-cache-dir" in called_cmd
 
 
-def test_perform_self_upgrade_windows_fail_restores(tmp_path):
+def test_perform_self_upgrade_windows_fail_restores(clean_pip_env, tmp_path):
     from pathlib import Path
     from guard.core.updater import perform_self_upgrade
 
@@ -221,7 +230,7 @@ def test_perform_self_upgrade_windows_fail_restores(tmp_path):
         assert exe_path.read_text(encoding="utf-8") == "old_binary"
 
 
-def test_perform_self_upgrade_windows_success_clean(tmp_path):
+def test_perform_self_upgrade_windows_success_clean(clean_pip_env, tmp_path):
     from pathlib import Path
     from guard.core.updater import perform_self_upgrade
 
