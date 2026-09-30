@@ -5,6 +5,7 @@ listed and removed by the user.
 """
 
 import json
+import sys
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -49,7 +50,11 @@ def test_a_learned_rule_needs_a_check_that_holds(tmp_path):
     assert "VACUOUS: a check pattern needs a literal" in notes  # `.` holds on any non-empty file
     assert "ALT-ANY: the `require` pattern matches unrelated text" in notes  # a literal does not save `.*|foo`
     assert "NEVER-FIRES: the `forbid` pattern cannot be shown to match" in notes  # `(?!)` fails everywhere
-    assert "ATOMIC-NEVER: the `forbid` pattern cannot be shown to match" in notes
+    # Python 3.11+ supports atomic groups in re; Python 3.10 rejects (?>...) as an invalid pattern
+    if sys.version_info >= (3, 11):
+        assert "ATOMIC-NEVER: the `forbid` pattern cannot be shown to match" in notes
+    else:
+        assert "ATOMIC-NEVER:" in notes
     assert "LONG-ANY: the `require` pattern matches unrelated text" in notes  # random text of any length
 
 

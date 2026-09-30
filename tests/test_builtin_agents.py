@@ -457,7 +457,8 @@ def test_zcode_switch_turned_on_by_guard_is_said_and_switched_back_on_remove(mon
     path.write_text(json.dumps({"hooks": {"events": {"Stop": [mine]}}}), encoding="utf-8")  # no hooks.enabled
     monkeypatch.setattr(cli.typer, "confirm", lambda *a, **k: True)
     agent_cmds._install_adapter(zcode, "zcode")
-    assert "hook(s) already there start running too" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "hook(s) already there start running too" in " ".join(out.split())
     assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["enabled"] is True
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)

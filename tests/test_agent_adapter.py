@@ -132,7 +132,8 @@ def test_add_test_and_remove_through_the_cli(tmp_path, monkeypatch):
     with pytest.MonkeyPatch.context() as mp:  # local: never undo conftest's HOME isolation
         mp.setattr(cli.typer, "confirm", edit_meanwhile)
         result = CliRunner().invoke(app, ["agent", "add", "claude-code"])
-    assert result.exit_code == 1 and "changed while you were reading" in result.output
+    flat = " ".join(result.output.split())
+    assert result.exit_code == 1 and "changed while you were reading" in flat
     assert read_config(settings_path()) == {"hooks": {"PreToolUse": [FOREIGN]}, "model": "new"}  # their change kept
     settings_path().write_text(json.dumps({"hooks": {"PreToolUse": [FOREIGN]}}), encoding="utf-8")
     result = CliRunner().invoke(app, ["agent", "add", "claude-code"], input="y\n")

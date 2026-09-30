@@ -369,7 +369,8 @@ def test_non_json_config_prints_entries_and_leaves_the_file_alone():
     with stub:
         result = CliRunner().invoke(app, ["agent", "add", "tomlagent"], input="y\n")
     assert result.exit_code == 0, result.output
-    assert "is not JSON" in result.output and "agent-event before-edit --agent tomlagent" in result.output
+    flat = " ".join(result.output.split())
+    assert "is not JSON" in flat and "agent-event before-edit --agent tomlagent" in flat
     assert (base / "config.toml").read_text(encoding="utf-8").endswith(f'"{SECRET}"\n')  # untouched
     assert load_adapter("tomlagent") is not None
     assert SECRET not in "\n".join(prompts) and "token = <text>" in "\n".join(prompts)
