@@ -109,7 +109,12 @@ def load_global_config() -> GuardConfig:
 def save_config(config: GuardConfig, local: bool = False, repo_path: Optional[Path] = None) -> Path:
     target_path = get_local_config_path(repo_path) if local else get_global_config_path()
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, "w", encoding="utf-8") as f:
+    # the file can hold an API key: created readable by its owner only; an existing file is narrowed too
+    # (POSIX; on Windows the mode cannot express this and the user profile's ACL applies)
+    fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if os.name != "nt":
+        os.chmod(target_path, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
         json.dump(config.model_dump(mode="json"), f, indent=2)
     return target_path
 

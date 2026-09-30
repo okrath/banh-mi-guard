@@ -174,9 +174,8 @@ def test_ocr_syncs_run_one_at_a_time():
     assert all(order[i][0] == "in" and order[i + 1] == ("out", order[i][1]) for i in range(0, 6, 2))  # never interleaved
 
 
-def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
+def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path, monkeypatch):
     from guard.core.setup_health import setup_health
-
     def row(item):
         return next(r for r in setup_health(tmp_path) if r["item"] == item)
     assert row("LLM")["level"] == "missing" and row("LLM")["fix"] == "guard config llm"
@@ -199,11 +198,37 @@ def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path):
     setup_cmds.finish_setup(tmp_path)  # syncs
     row_ocr = row("Alibaba OCR")  # synced; the setting is not chosen yet, so doctor says it can run on every post
     assert row_ocr["level"] == "warn" and row_ocr["fix"].startswith("guard config ocr always")
+    import sys
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
     config_cmds.config_ocr_cmd("always")
     assert row("Alibaba OCR")["level"] == "ok" and "every guard post" in row("Alibaba OCR")["detail"]
 
+def test_config_ocr_cmd_refuses_without_tty(monkeypatch):
+    import sys
+    import typer
+    import pytest
+    cfg = load_global_config()
+    initial = cfg.ocr.always
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    with pytest.raises(typer.Exit) as exc:
+        config_cmds.config_ocr_cmd("always")
+    assert exc.value.exit_code == 1
+    assert load_global_config().ocr.always == initial
 
-def test_ocr_always_runs_the_review_on_a_plain_post_but_never_in_the_hook(tmp_path, fake_ocr_review):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    with pytest.raises(typer.Exit) as exc:
+        config_cmds.config_ocr_cmd("always")
+    assert exc.value.exit_code == 1
+    assert load_global_config().ocr.always == initial
+
+
+def test_ocr_always_runs_the_review_on_a_plain_post_but_never_in_the_hook(tmp_path, fake_ocr_review, monkeypatch):
+    import sys
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
     from guard.cli import execute_post_task, execute_pre_task
     from test_agent_events import make_repo
     repo = make_repo(tmp_path)

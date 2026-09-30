@@ -82,3 +82,22 @@ def test_local_llm_wizard_never_writes_the_machine_wide_ocr_config(tmp_path):
          patch("guard.core.config.sync_to_alibaba_ocr") as sync:
         run_llm_wizard(local=True, repo_path=tmp_path)
     sync.assert_not_called()
+
+
+def test_save_config_file_permissions(tmp_path):
+    import os
+    import pytest
+    if os.name == "nt":
+        pytest.skip("POSIX file permissions (0o600) cannot be expressed on Windows")
+    repo = tmp_path / "repo"
+    cfg = GuardConfig(llm=LLMConfig(api_key="secret-key"))
+
+    # Create new file
+    path = save_config(cfg, local=True, repo_path=repo)
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+    # Existing file with 0o644 mode gets restricted to 0o600
+    os.chmod(path, 0o644)
+    assert (path.stat().st_mode & 0o777) == 0o644
+    path = save_config(cfg, local=True, repo_path=repo)
+    assert (path.stat().st_mode & 0o777) == 0o600

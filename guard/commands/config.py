@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -89,10 +90,14 @@ def config_ocr_cmd(
 ):
     """
     Choose whether every guard post runs the Alibaba OCR review (machine-wide, ~/.guard/config.json).
+    For the user, in an interactive terminal.
     It takes minutes; a failed review or a high/critical finding blocks. The Git hook never runs it.
     """
     if mode not in ("always", "optional"):
         console.print("[bold red]❌ The mode is `always` or `optional`.[/bold red]")
+        raise typer.Exit(code=1)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ Whether every guard post runs the Alibaba OCR review is the user's decision: run guard config ocr yourself in an interactive terminal.[/bold red]")
         raise typer.Exit(code=1)
     cfg = load_global_config()
     cfg.ocr.always = mode == "always"

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
-    { name = "Orca Team", email = "admin@orca.local" }
+    { name = "Orca Team", email = "30043763+trungngoprogramming@users.noreply.github.com" }
 ]
 dependencies = [
     "typer>=0.12.0",

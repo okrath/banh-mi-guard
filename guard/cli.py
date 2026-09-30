@@ -696,6 +696,8 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
     if build_cmd:
         start_t = time.perf_counter()
         try:
+            # detect_build_command returns guard's own fixed commands (never user config); shell=True needed for npm/pnpm on Windows.
+            # Turn into an argument list before ever reading a build command from config.
             p = subprocess.run(
                 build_cmd,
                 shell=True,
