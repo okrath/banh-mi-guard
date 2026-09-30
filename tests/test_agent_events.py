@@ -4,12 +4,15 @@ outside the scope, when it stops, and when it commits.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from typer.testing import CliRunner
 
-from guard.agent.events import AgentEvent, decide, load_state, normalise
+from guard.agent.events import AgentEvent, _pid_alive, decide, load_state, normalise
 from guard.cli import app, execute_post_task, execute_pre_task
 from guard.core.session import SessionManager
 
@@ -396,3 +399,19 @@ def test_pre_keeps_fingerprints_of_commands_still_running(tmp_path):
     bash(repo, "node long-job.js", call_id="long")
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     assert "long" in load_state(repo).get("bash", {})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only test for reaping unreaped child processes")
+def test_posix_zombie_process_is_not_reported_alive():
+    import sys
+    import time
+    import guard.agent.events as events
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+    time.sleep(0.5)
+    assert events._pid_alive(child.pid) is False
+
+
+def test_pid_alive_rejects_non_positive_and_non_int():
+    assert _pid_alive(0) is False
+    assert _pid_alive(-1) is False
+    assert _pid_alive("12") is False

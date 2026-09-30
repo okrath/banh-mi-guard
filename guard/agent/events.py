@@ -332,6 +332,9 @@ POST_MARKER = "post-running.json"
 
 
 def _pid_alive(pid: int) -> bool:
+    # Reject non-positive or non-integer PIDs to prevent POSIX waitpid reaping / signal broadcast
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     if os.name == "nt":  # os.kill(pid, 0) would terminate the process on Windows
         import ctypes
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -342,6 +345,12 @@ def _pid_alive(pid: int) -> bool:
         ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
         kernel32.CloseHandle(handle)
         return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        # Reap our finished child so zombie processes are not treated as alive on POSIX
+        if os.waitpid(pid, os.WNOHANG)[0] != 0:
+            return False
+    except ChildProcessError:
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
