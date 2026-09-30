@@ -144,11 +144,74 @@ def _comment_start(code: str, hash_comments: bool, spans: Optional[list] = None)
     return -1
 
 
+def _hash_comments(path_lower: str) -> bool:
+    """`#` starts a comment in Python, YAML, shell and Dockerfiles; elsewhere `//` does (in Python `//` divides)."""
+    return path_lower.endswith(PY + YAML + (".sh", ".rb", ".toml")) or _is_dockerfile(path_lower)
+
+
+def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[str]:
+    """
+    The line without the part inside a `/*` or `<!--` comment an earlier line left open (None when all of it
+    is), noting in `open_comments` whether this line leaves one open for the next.
+    """
+    closing = open_comments.pop(path_lower, None)
+    if closing:
+        end = code.find(closing)
+        if end < 0:
+            open_comments[path_lower] = closing
+            return None
+        code = code[end + len(closing):]
+    cut = _comment_start(code, _hash_comments(path_lower))
+    for opening, closer in (("/*", "*/"), ("<!--", "-->")):
+        if cut >= 0 and code.startswith(opening, cut):
+            open_comments[path_lower] = closer
+    return code
+
+
+def _tag_end(tag: str) -> int:
+    """Where a tag closes: its first `>` outside `{...}` and quotes that is not part of `=>`; -1 when it goes on."""
+    depth, quote = 0, ""
+    for k, ch in enumerate(tag):
+        if quote:
+            if ch == quote and tag[k - 1:k] != "\\":
+                quote = ""
+            continue
+        if depth <= 0 and ch in "'\"":
+            quote = ch
+            continue
+        depth += (ch == "{") - (ch == "}")
+        if ch == ">" and depth <= 0 and tag[k - 1:k] != "=":
+            return k
+    return -1
+
+
 def _mask_strings(code: str) -> str:
-    """The line with the inside of every string blanked: what remains is code."""
-    chars = list(code)
+    """The line with the inside of every string blanked, except `${...}` in template strings: what remains is code."""
+    chars, quote, depth, inner, escaped = list(code), "", 0, "", False
     for k, ch, in_string in _scan(code):
-        if in_string and ch not in "'\"`":
+        if not in_string:
+            quote, depth, inner, escaped = "", 0, "", False
+            continue
+        if not quote:
+            quote = ch
+        if quote == "`" and code.startswith("${", k) and not depth:
+            depth = 1
+            continue
+        if depth:
+            if inner:
+                if ch == inner and not escaped:
+                    inner = ""
+                else:
+                    chars[k] = " "
+                escaped = ch == "\\" and not escaped
+            elif ch in "'\"":
+                inner, escaped = ch, False
+            elif ch == "{" and code[k - 1] != "$":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            continue
+        if ch not in "'\"`":
             chars[k] = " "
     return "".join(chars)
 
@@ -275,14 +338,23 @@ class OCRRulebookRunner:
         current_file = "unknown"
         line_num = 0
         # per file, from its added and context lines: whether it clears an interval anywhere
-        cleared, name, last_user = set(), None, {}
+        cleared, name, last_user, open_comments = set(), None, {}, {}
         for line in diff_text.splitlines():
             if line.startswith("+++ b/"):
                 name = line[6:].strip()
-            elif name and line[:1] in ("+", " ") and len(line) <= MAX_RULE_LINE:
+            elif name and line.startswith("@@"):
+                open_comments.pop(name.replace("\\", "/").lower(), None)  # lines between hunks are unseen
+            elif name and line[:1] in ("+", " "):
                 code = line[1:]
-                cut = _comment_start(code, False)
-                if re.search(r"\bclearInterval\s*\(", _mask_strings(code[:cut] if cut >= 0 else code)):
+                visible = _carry_comment(open_comments, name.replace("\\", "/").lower(), code)
+                if len(line) > MAX_RULE_LINE:
+                    continue
+                spans: list = []
+                cut = _comment_start(visible or "", _hash_comments(name.replace("\\", "/").lower()), spans)
+                body = (visible or "")[:cut] if cut >= 0 else (visible or "")
+                for a, b in spans:
+                    body = body[:a] + " " * (b - a) + body[b:]
+                if visible and re.search(r"\bclearInterval\s*\(", _mask_strings(body)):
                     cleared.add(name)  # a real call, not the word in a string or a comment
                 user = re.match(r"(?i)^USER\s+(\S+)", code.strip())
                 if user:
@@ -290,7 +362,8 @@ class OCRRulebookRunner:
         # Dockerfiles that end as another user may switch to root for a build step
         self._ends_as_user = {f for f, u in last_user.items() if u not in ("root", "0")}
         self._stages = set()
-        self._open_comment = {}  # file -> the `*/` or `-->` that closes a comment left open on an added line
+        self._open_comment = {}  # file -> the `*/` or `-->` that closes a comment left open on a diff line
+        self._open_img = {}  # file -> (line, text so far) of an <img tag not closed on its first line
 
         for line in diff_text.splitlines():
             if line.startswith("+++ b/"):
@@ -300,12 +373,15 @@ class OCRRulebookRunner:
                 continue
             if line.startswith(" "):  # a context line: only what the rules need to know about the file
                 line_num += 1
+                _carry_comment(self._open_comment, current_file.replace("\\", "/").lower(), line[1:])
                 self._file_context(current_file.lower(), line[1:].strip())
                 continue
             if line.startswith("@@"):
                 match = re.search(r"\+(\d+)", line)
                 if match:
                     line_num = int(match.group(1)) - 1
+                self._open_comment.pop(current_file.replace("\\", "/").lower(), None)
+                self._open_img.pop(current_file.replace("\\", "/").lower(), None)
                 continue
 
             if line.startswith("+") and not line.startswith("+++"):
@@ -316,6 +392,9 @@ class OCRRulebookRunner:
                 is_doc_file = any(cf_lower.endswith(ext) for ext in [".md", ".markdown", ".txt", ".rst"])
                 is_test_file = _is_test_path(cf_lower)
                 is_js_ts = any(cf_lower.endswith(ext) for ext in [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"])
+                # the code of the line outside a comment an earlier line left open (None: all comment)
+                visible = _carry_comment(self._open_comment, cf_lower, added_code)
+                visible = visible.strip() if visible is not None else None
 
                 # Rule 1: Hardcoded Secrets (Security - Always scanned on ALL files)
                 if self.SECRET_REGEX.search(added_code):
@@ -384,8 +463,12 @@ class OCRRulebookRunner:
                     ))
 
                 # Rule 4b: an interval started with no clearInterval anywhere in the change (Memory Safety)
-                cut = _comment_start(added_code, False)
-                interval_code = added_code[:cut] if cut >= 0 else added_code
+                spans = []
+                cut = _comment_start(visible or "", _hash_comments(cf_lower), spans)
+                interval_code = (visible or "")[:cut] if cut >= 0 else (visible or "")
+                for a, b in spans:
+                    interval_code = interval_code[:a] + " " * (b - a) + interval_code[b:]
+                interval_code = _mask_strings(interval_code)
                 if cf_lower.endswith(JS) and self.DANGLING_INTERVAL.search(interval_code) and current_file not in cleared \
                         and not is_test_file and not _is_docs_path(cf_lower) and len(added_code) <= MAX_RULE_LINE:
                     violations.append(RuleViolation(
@@ -411,8 +494,10 @@ class OCRRulebookRunner:
 
                 # Rules 7+: the line rules of the quality matrix (security, infra, mobile); a line is
                 # judged before it adds to what the file defines (`FROM node AS node` is still an image)
-                if not is_test_file:
-                    violations.extend(self._line_rules(cf_lower, current_file, line_num, added_code))
+                if not is_test_file and visible is not None:
+                    violations.extend(self._line_rules(cf_lower, current_file, line_num, visible))
+                    if cf_lower.endswith(MARKUP):
+                        violations.extend(self._multiline_img(cf_lower, current_file, line_num, visible))
                 self._file_context(cf_lower, added_code)
 
                 # Rule 6: Deep property dereference without optional chaining (Stability)
@@ -458,13 +543,13 @@ class OCRRulebookRunner:
                     continue
                 doc = docs[-1]
                 doc["lines"].append(code)
+                containers = re.match(r"^\s*containers\s*:", code)
+                if containers and doc["at"] is None:
+                    doc["at"] = line_num
                 if line.startswith("+"):
                     kind = WORKLOAD_KIND.match(code)
                     if kind:
                         doc["kinds"].add(kind.group(1))
-                    containers = re.match(r"^\s*containers\s*:", code)
-                    if containers and doc["at"] is None:
-                        doc["at"] = line_num
                     if kind or containers:
                         cut = _comment_start(code, True)
                         allow = self.SUPPRESS_COMMENT.match(code[cut:]) if cut >= 0 else None
@@ -494,6 +579,22 @@ class OCRRulebookRunner:
                 ))
         return found
 
+    def _multiline_img(self, path_lower: str, path: str, line_num: int, code: str) -> List[RuleViolation]:
+        """UX-002 for an <img tag spread over several added lines (JSX): judged once its `>` arrives."""
+        found: List[RuleViolation] = []
+        start, tag = self._open_img.pop(path_lower, (None, ""))
+        if start is not None:
+            tag += " " + code
+            end = _tag_end(tag)
+            if end >= 0:
+                found = [v for v in self._line_rules(path_lower, path, start, tag[:end + 1]) if v.rule_id == "UX-002"]
+            else:
+                self._open_img[path_lower] = (start, tag)
+        last = code.lower().rfind("<img")
+        if last >= 0 and _tag_end(code[last:]) < 0:
+            self._open_img[path_lower] = (line_num, code[last:])
+        return found
+
     def _file_context(self, path_lower: str, code: str) -> None:
         """Follow a Dockerfile line by line (added and context lines): the stage names defined so far."""
         if _is_dockerfile(path_lower) and len(code) <= MAX_RULE_LINE:
@@ -503,38 +604,31 @@ class OCRRulebookRunner:
 
     def _line_rules(self, path_lower: str, path: str, line_num: int, code: str) -> List[RuleViolation]:
         found: List[RuleViolation] = []
-        closing = self._open_comment.get(path_lower)
-        if closing:
-            end = code.find(closing)
-            if end < 0:
-                return found  # still inside the comment
-            del self._open_comment[path_lower]
-            code = code[end + len(closing):].strip()
         if code.startswith(("#", "//")) or (code.startswith("*") and not path_lower.endswith(CSS)) \
                 or len(code) > MAX_RULE_LINE or _is_docs_path(path_lower):
             return found  # a comment or a docs page talks about code; a minified or generated line is not read
         # the line's own comment, found outside strings: `#` in Python, YAML, shell and Dockerfiles,
         # `//` in C-family languages (in Python `//` divides). The rules read the code before it; a
         # guard-allow counts only there, never in a string that looks like a comment
-        hash_comments = path_lower.endswith(PY + YAML + (".sh", ".rb", ".toml")) or _is_dockerfile(path_lower)
         spans: list = []
-        cut = _comment_start(code, hash_comments, spans)
+        cut = _comment_start(code, _hash_comments(path_lower), spans)
         body, comment = (code[:cut], code[cut:]) if cut >= 0 else (code, "")
-        for opening, closer in (("/*", "*/"), ("<!--", "-->")):
-            if comment.startswith(opening):
-                self._open_comment[path_lower] = closer  # left open: the next lines are comment too
         if cut == 0:
             return found  # the whole line is a comment
         for a, b in spans:  # a comment closed on the line is not code; what follows it is
             body = body[:a] + " " * (b - a) + body[b:]
-        suppress = self.SUPPRESS_COMMENT.match(comment)
+        # a guard-allow in the line's comment, or in a comment closed on the line (`/* guard-allow ... */ x`)
+        suppress = next(filter(None, (self.SUPPRESS_COMMENT.match(c)
+                                      for c in [comment] + [code[a:b] for a, b in spans])), None)
         for rule_id, severity, applies, pattern, advice in LINE_RULES:
             if not applies(path_lower) or any(v.rule_id == rule_id for v in found):
                 continue
             # a name quoted in prose (``pickle.loads()`` in a docstring) is not a call. Text inside strings is
             # read like code: a string may hold code that runs (`${eval(x)}`, f-strings), and a security rule
             # would rather report a sentence that mentions eval( than miss a call
-            if not any(m.start() == 0 or body[m.start() - 1] != "`" for m in pattern.finditer(body)):
+            if not any((m.start() == 0 or body[m.start() - 1] != "`")
+                       and (rule_id != "UX-002" or _tag_end(body[m.start():]) >= 0)
+                       for m in pattern.finditer(body)):
                 continue
             base = re.match(r"(?i)^FROM\s+(?:--platform=\S+\s+)?(\S+)", body) if _is_dockerfile(path_lower) else None
             if rule_id == "INFRA-002" and base:

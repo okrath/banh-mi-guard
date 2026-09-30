@@ -105,10 +105,10 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 | Domain | 🛡️ Security | 🧠 Memory | ⚡ Performance | 🧱 Integrity | ♿ UX | 🧹 Hygiene | 🛋️ Simplicity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | Frontend | `SEC-001` `SEC-003` `SEC-005` `SEC-006` `SEC-007` `SEC-008` | `PERF-001` `PERF-003` | `PERF-002` | `STAB-001` | `UX-001` `UX-002` | `DEAD-*` | `LAZY-*` |
-| Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | `PERF-003` (Node) | `PERF-002` (Node) | build check, invariants | LLM | `DEAD-*` | `LAZY-*` |
+| Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | `PERF-003` (Node) | `PERF-002` (Node) | build check, invariants, `STAB-001` | LLM | `DEAD-*` | `LAZY-*` |
 | Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-*` |
 | Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | `INFRA-004` | LLM | `INFRA-002` | `INFRA-005` | `DEAD-001` | LLM |
-| Mobile | `SEC-001` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` `DEAD-002` | LLM |
+| Mobile | `SEC-001` `SEC-006` `MOB-001` `MOB-002` | `PERF-003` (React Native) | LLM | LLM | LLM | `DEAD-001` `DEAD-002` | LLM |
 
 ---
 

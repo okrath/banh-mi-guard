@@ -329,3 +329,70 @@ def test_workload_limits_in_flow_style_and_guard_allow():
     allowed = [line + "  # guard-allow INFRA-004: limits come from a LimitRange" if line.strip() == "containers:" else line
                for line in DEPLOYMENT]
     assert ("INFRA-004", "LOW") in workload("k8s/api.yaml", allowed)
+
+
+def test_comments_opened_or_closed_on_context_lines():
+    inside = "+++ b/web/a.js\n@@ -1,1 +1,3 @@\n /*\n+eval(userInput)\n+*/\n"
+    assert [v for v in OCRRulebookRunner().scan_diff(inside) if v.rule_id == "SEC-005"] == []
+    closed = "+++ b/web/a.js\n@@ -1,2 +1,3 @@\n /*\n */\n+eval(real)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(closed) if v.rule_id == "SEC-005"] == ["SEC-005"]
+
+
+def test_interval_rules_skip_comments_and_strings():
+    commented = "+++ b/web/a.ts\n@@ -0,0 +1,4 @@\n+/*\n+clearInterval(id)\n+*/\n+const id = setInterval(tick, 1000)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(commented) if v.rule_id == "PERF-003"] == ["PERF-003"]
+    quoted = '+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+logger.debug("setInterval(")\n'
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(quoted) if v.rule_id == "PERF-003"] == []
+
+
+def test_guard_allow_in_a_closed_block_comment():
+    assert found("web/a.js", "/* guard-allow SEC-005: fixed expression */ eval(constant)") == [("SEC-005", "LOW")]
+
+
+def test_an_image_tag_over_several_lines():
+    diff = '+++ b/web/A.jsx\n@@ -0,0 +1,3 @@\n+<img\n+  src={logo}\n+/>\n'
+    assert [(v.rule_id, v.line_number) for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == [("UX-002", 1)]
+    described = '+++ b/web/A.jsx\n@@ -0,0 +1,3 @@\n+<img\n+  src={logo} alt="Logo"\n+/>\n'
+    assert [v for v in OCRRulebookRunner().scan_diff(described) if v.rule_id == "UX-002"] == []
+
+
+def test_a_workload_whose_containers_line_is_context():
+    diff = ("+++ b/k8s/api.yaml\n@@ -1,3 +1,4 @@\n+kind: Deployment\n spec:\n   template:\n"
+            "     spec:\n       containers:\n       - name: api\n")
+    assert "INFRA-004" in [v.rule_id for v in OCRRulebookRunner().scan_diff(diff)]
+
+
+def test_a_comment_closed_on_its_line_leaves_the_next_line_code():
+    diff = "+++ b/web/a.js\n@@ -0,0 +1,2 @@\n+x = 1; /* note */ y = 2\n+eval(userInput)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "SEC-005"] == ["SEC-005"]
+
+
+def test_an_interval_inside_a_template_interpolation_is_code():
+    diff = "+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+const s = `${setInterval(tick, 1000)}`\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
+
+
+def test_a_hunk_gap_ends_an_open_comment():
+    diff = "+++ b/web/a.js\n@@ -1,1 +1,2 @@\n+/* starts here\n@@ -40,1 +41,2 @@\n+eval(userInput)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "SEC-005"] == ["SEC-005"]
+
+
+def test_a_comparison_inside_jsx_does_not_end_the_image_tag():
+    diff = '+++ b/web/A.jsx\n@@ -0,0 +1,4 @@\n+<img\n+  src={n > 1 ? a : b}\n+  alt="Logo"\n+/>\n'
+    assert [v for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == []
+
+
+def test_only_template_interpolations_outside_nested_strings_are_code():
+    for line in ('const s = "${setInterval(tick, 1000)}"', 'const s = `${"setInterval(x)"}`'):
+        diff = f"+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+{line}\n"
+        assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == []
+
+
+def test_a_greater_than_inside_a_quoted_attribute_does_not_end_the_image_tag():
+    diff = '+++ b/web/A.jsx\n@@ -0,0 +1,4 @@\n+<img\n+  title="x > y"\n+  alt="A"\n+/>\n'
+    assert [v for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == []
+
+
+def test_a_clear_interval_in_a_closed_block_comment_does_not_count():
+    diff = "+++ b/web/a.ts\n@@ -0,0 +1,2 @@\n+/* clearInterval(id) */\n+const id = setInterval(tick, 1000)\n"
+    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
