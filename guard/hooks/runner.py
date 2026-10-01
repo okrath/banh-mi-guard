@@ -35,7 +35,7 @@ def run_sandwich_task(
     target_repo = Path(repo_path or Path.cwd()).resolve()
 
     console.print(f"[bold cyan]🛡️  [1/3] EXECUTING PRE-TASK GUARD[/bold cyan]")
-    from guard.cli import execute_pre_task
+    from guard.task_flow import execute_pre_task
     pre_success = execute_pre_task(
         prompt=prompt, repo_path=target_repo, scope=scope, allow_dirty=allow_dirty, force=force,
     )
@@ -54,7 +54,7 @@ def run_sandwich_task(
         return 1
 
     console.print(f"\n[bold magenta]🧪 [3/3] EXECUTING POST-TASK GUARD VERIFICATION[/bold magenta]")
-    from guard.cli import execute_post_task
+    from guard.task_flow import execute_post_task
     post_passed = execute_post_task(repo_path=target_repo, auto_fix=auto_fix)
 
     if proc.returncode != 0:
