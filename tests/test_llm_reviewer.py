@@ -259,3 +259,60 @@ def test_every_piece_of_an_oversized_file_names_the_file(monkeypatch):
     assert all(len(b) <= 200 for b in batches)  # the continuation header counts toward the limit
     prefix = "diff --git a/big.py b/big.py\n[continued: next part of this file's diff]\n"
     assert batches[0] + "".join(b[len(prefix):] for b in batches[1:]) == raw  # nothing lost or repeated
+
+
+def test_contracts_included_in_llm_prompt():
+    from unittest.mock import patch
+    from guard.core.session import DomainContract
+
+    contracts = [
+        DomainContract(category="API_ENDPOINT", name="GET /api/v1/items", description="Returns all items"),
+        DomainContract(category="UI_STATE", name="loading_spinner", description="Visible while fetching items"),
+    ]
+    captured = {}
+
+    def fake_call(**kwargs):
+        captured["kwargs"] = kwargs
+        return "SCORE: 8.5\nSUMMARY: ok\nFINDINGS: None"
+
+    with patch("guard.core.llm_reviewer.call_llm", side_effect=fake_call):
+        verdict = LLMReviewerEngine(config=_llm_config()).review(
+            prompt="Refactor items view",
+            domain=DomainType.BACKEND,
+            contracts=contracts,
+        )
+
+    assert verdict.review_mode == "llm_deep"
+    call_kw = captured["kwargs"]
+    prompt = call_kw["prompt"]
+    full_prompt = prompt + "\n" + call_kw.get("system_prompt", "")
+
+    for c in contracts:
+        assert c.category in prompt
+        assert c.name in prompt
+        assert c.description in prompt
+        assert f"- [{c.category}] {c.name}: {c.description}" in prompt
+
+    assert "preserved, changed or removed" in full_prompt
+
+
+@pytest.mark.parametrize("contracts", [None, []])
+def test_contracts_none_or_empty_says_none_recorded(contracts):
+    from unittest.mock import patch
+
+    captured = {}
+
+    def fake_call(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return "SCORE: 8.5\nSUMMARY: ok\nFINDINGS: None"
+
+    with patch("guard.core.llm_reviewer.call_llm", side_effect=fake_call):
+        verdict = LLMReviewerEngine(config=_llm_config()).review(
+            prompt="Update items",
+            domain=DomainType.BACKEND,
+            contracts=contracts,
+        )
+
+    assert verdict.review_mode == "llm_deep"
+    assert "Baseline contracts recorded at guard pre (what callers rely on):" in captured["prompt"]
+    assert "- none recorded" in captured["prompt"]

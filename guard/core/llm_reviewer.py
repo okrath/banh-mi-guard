@@ -304,6 +304,7 @@ class LLMReviewerEngine:
             "Only the facts in the report are verified: the build status is exactly as stated, and no behavioral test suite has run unless stated.\n"
             "A passing build does NOT prove behavior is preserved. Invariants marked UNVERIFIED must be judged from the diff itself.\n"
             "Deleted files and large deletions must be justified by the task prompt; REVISE when the diff removes behavior the task did not ask to remove.\n"
+            "For each listed contract, say whether the diff preserved, changed or removed it; a contract that the diff changes or removes when the task did not ask for it is a correctness finding naming the contract.\n"
             "Evaluate across 3 pillars:\n"
             "1. Technical Audit (Code integrity, memory leaks, dangling listeners, breaking API changes, security vulnerabilities)\n"
             "2. Invariants & Contracts (Ensure baseline UI states, interactions, and DB schemas are preserved)\n"
@@ -342,6 +343,9 @@ class LLMReviewerEngine:
         invariants_info = "\n".join(
             f"- [{c.status.upper()}] {c.id}: {c.description} ({c.notes})" for c in (invariant_result.checks if invariant_result else [])
         ) or "- none declared"
+        contracts_info = "\n".join(
+            f"- [{c.category}] {c.name}: {c.description}" for c in (contracts or [])
+        ) or "- none recorded"
         evidence_info = "\n".join(f"- {e}" for e in (evidence or [])) or "- none"
         known_info = "\n".join(f"- {r.get('id')}: {r.get('description')}" for r in (known_rules or [])) or "- none"
         ledger_info = "\n".join(
@@ -362,6 +366,8 @@ Out of Scope Files: {diff_summary.out_of_scope_files if diff_summary else []}
 All Touched Files: {files_summary}
 Invariants:
 {invariants_info}
+Baseline contracts recorded at guard pre (what callers rely on):
+{contracts_info}
 Every project rule that exists now (team file, local file, learned earlier in this session; never propose one again, not even reworded):
 {known_info}
 Verified evidence (computed by guard over the whole repository, valid for every diff part):
