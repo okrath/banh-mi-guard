@@ -103,7 +103,7 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
         for c in pre.existing_contracts:
             md.append(f"  - `[{c.category}]` **{c.name}**: {c.description}")
     else:
-        md.append("  - Initializing scoped module or no conflicting baseline contracts detected.")
+        md.append("  - No contract hints in the scanned files (up to 5 scoped files; keywords depend on the detected domain, e.g. routes, auth and transactions for a backend, UI states for a frontend, ports, volumes and secrets for infra, permissions and offline storage for mobile).")
 
     # Expected Impact Range
     md.append("\n* **Expected Impact Range (Target Files):**")
