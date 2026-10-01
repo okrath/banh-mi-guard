@@ -85,7 +85,7 @@ def test_the_third_revise_hands_the_decision_to_the_user(tmp_path):
     repo = make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=_revise()):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=_revise()):
         for _ in range(2):
             assert execute_post_task(repo_path=repo) is False
         assert SessionManager(repo).load_local_session().status == SessionStatus.NEEDS_FIX
@@ -101,7 +101,7 @@ def test_the_third_revise_hands_the_decision_to_the_user(tmp_path):
     assert decide(AgentEvent(event="stop", cwd=str(repo))).action == "allow"  # stopping to ask is right
 
     # neither another round, a restart nor a reset takes the decision away from the user
-    with patch("guard.cli.LLMReviewerEngine.review") as review:
+    with patch("guard.task_flow.LLMReviewerEngine.review") as review:
         assert execute_post_task(repo_path=repo) is False
     assert review.call_count == 0
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo, force=True) is False
@@ -137,19 +137,19 @@ def test_an_approval_keeps_every_advisory_and_deferral_as_follow_ups(tmp_path):
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
     first = _revise()
     first.findings.append(Finding(id="adv00001", severity="low", kind="style", description="rename a"))
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=first):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=first):
         execute_post_task(repo_path=repo)
     fid = first.findings[0].id
     assert CliRunner().invoke(app, ["finding", fid, "--defer", "tracked in phase 9", "--repo", str(repo)]).exit_code == 0
     approved = LLMReviewVerdict(verdict=ReviewVerdict.APPROVED, score=8, summary="ok", findings=[], review_mode="llm_deep")
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=approved):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=approved):
         assert execute_post_task(repo_path=repo) is True
     followups = SessionManager(repo).load_local_session().post.followups
     assert sorted(f["id"] for f in followups) == sorted([fid, "adv00001"])
 
     # an approval by the heuristic gate alone (LLM not answering) keeps them too
     heuristic = approved.model_copy(update={"review_mode": "heuristic"})
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=heuristic):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=heuristic):
         assert execute_post_task(repo_path=repo) is True
     followups = SessionManager(repo).load_local_session().post.followups
     assert sorted(f["id"] for f in followups) == sorted([fid, "adv00001"])
@@ -162,9 +162,9 @@ def test_guard_accept_is_the_users_and_approves_only_what_was_reviewed(tmp_path,
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
     first = _revise()
     first.findings.append(Finding(id="adv00001", severity="low", kind="style", description="rename a"))
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=first):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=first):
         execute_post_task(repo_path=repo)  # the advisory is raised only in the first round
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=_revise()):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=_revise()):
         for _ in range(2):
             execute_post_task(repo_path=repo)
     monkeypatch.chdir(repo)
@@ -211,7 +211,7 @@ def test_guard_accept_is_the_users_and_approves_only_what_was_reviewed(tmp_path,
     assert session.revise_budget == 6 and session.status == SessionStatus.NEEDS_FIX
     assert "needs_user" not in (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")  # report follows
 
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=_revise()):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=_revise()):
         for _ in range(3):
             execute_post_task(repo_path=repo)
     assert accept("a") == 0
@@ -227,7 +227,7 @@ def test_a_deferral_is_recorded_for_the_next_review(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
-    with patch("guard.cli.LLMReviewerEngine.review", return_value=_revise()):
+    with patch("guard.task_flow.LLMReviewerEngine.review", return_value=_revise()):
         execute_post_task(repo_path=repo)
     fid = SessionManager(repo).load_local_session().findings_ledger[0]["id"]
     monkeypatch.chdir(repo)

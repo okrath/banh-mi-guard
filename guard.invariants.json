@@ -36,8 +36,8 @@
       "rationale": "pre merged every dirty file into scope, and could be re-run after editing to widen it.",
       "checks": [
         { "files": "guard/**/*.py", "forbid": "working_files \\+ prompt_files" },
-        { "files": "guard/cli.py", "require": "baseline_dirty = dict\\(old\\.baseline_dirty\\)" },
-        { "files": "guard/cli.py", "require": "SCOPE-004" }
+        { "files": "guard/**/*.py", "require": "baseline_dirty = dict\\(old\\.baseline_dirty\\)" },
+        { "files": "guard/**/*.py", "require": "SCOPE-004" }
       ]
     },
     {
@@ -45,7 +45,7 @@
       "description": "Post audits against the base commit recorded at pre, with raw porcelain -z paths.",
       "rationale": "Mid-task commits, renames and paths with spaces or Vietnamese characters used to escape the audit.",
       "checks": [
-        { "files": "guard/cli.py", "require": "get_diff\\(base_ref=pre\\.base_ref" },
+        { "files": "guard/**/*.py", "require": "get_diff\\(base_ref=pre\\.base_ref" },
         { "files": "guard/core/diff_inspector.py", "require": "\"--porcelain\", \"-z\"" }
       ]
     },
@@ -84,7 +84,7 @@
       "description": "An approved session covers only the exact file contents it approved.",
       "rationale": "One old approval let an unrelated 19-file commit through unchecked.",
       "checks": [
-        { "files": "guard/cli.py", "require": "approved_fingerprints=" },
+        { "files": "guard/**/*.py", "require": "approved_fingerprints=" },
         { "files": "guard/**/*.py", "forbid": "last guard session was approved, skipping" }
       ]
     },
@@ -93,7 +93,7 @@
       "description": "The rulebook cannot be weakened silently, and learned rules are written only after they pass on the current code.",
       "rationale": "Guard now writes LLM-discovered rules into guard.invariants.json; without these checks an agent could delete a failing rule to pass the gate.",
       "checks": [
-        { "files": "guard/cli.py", "require": "rule_id=\"INV-WEAKENED\"" },
+        { "files": "guard/**/*.py", "require": "rule_id=\"INV-WEAKENED\"" },
         { "files": "guard/core/project_invariants.py", "require": "def removed_or_relaxed\\(" },
         { "files": "guard/core/project_invariants.py", "require": "if status != STATUS_PASSED:\\s+rejected\\.append" }
       ]
