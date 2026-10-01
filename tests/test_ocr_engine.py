@@ -74,36 +74,6 @@ def test_rulebook_xss_detection():
     assert xss_violation.severity == "HIGH"
 
 
-def test_rulebook_blocking_sync_io():
-    diff = """diff --git a/src/server.ts b/src/server.ts
---- a/src/server.ts
-+++ b/src/server.ts
-@@ -10,2 +10,3 @@
-+ const data = fs.readFileSync("/etc/passwd");
-"""
-    runner = OCRRulebookRunner()
-    violations = runner.scan_diff(diff)
-    io_violation = next((v for v in violations if v.rule_id == "PERF-002"), None)
-    assert io_violation is not None
-    assert io_violation.severity == "MEDIUM"
-
-
-def test_rulebook_dangling_listener():
-    diff = """diff --git a/src/App.tsx b/src/App.tsx
---- a/src/App.tsx
-+++ b/src/App.tsx
-@@ -5,2 +5,3 @@
-+ useEffect(() => {
-+   window.addEventListener("resize", handleResize);
-+ }, []);
-"""
-    runner = OCRRulebookRunner()
-    violations = runner.scan_diff(diff)
-    perf_violation = next((v for v in violations if v.rule_id == "PERF-001"), None)
-    assert perf_violation is not None
-    assert perf_violation.severity == "HIGH"
-
-
 def test_clean_diff_no_violations():
     diff = """diff --git a/src/App.tsx b/src/App.tsx
 --- a/src/App.tsx

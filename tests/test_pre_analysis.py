@@ -800,3 +800,35 @@ def test_cache_works_in_a_real_guard_folder(tmp_path):
     (tmp_path / "repo").mkdir()
     _save_cache(guard_dir, "k", "answer")
     assert _load_cache(guard_dir, "k") == "answer"
+def test_none_contract_only_valid_alone():
+    from guard.domains.pre_analysis import _parse_llm_response
+
+    # Single - none is valid
+    valid_none = "TASK_DOMAIN: backend\nREPO_DOMAIN: backend\nREASON: api\nCONTRACTS:\n- none\n"
+    task, repo_domain, reason, contracts, malformed, has_section = _parse_llm_response(valid_none)
+    assert malformed == 0
+    assert contracts == []
+    assert has_section is True
+
+    # - none together with contract row is unparsable
+    none_with_row = (
+        "TASK_DOMAIN: backend\nREPO_DOMAIN: backend\nREASON: api\nCONTRACTS:\n"
+        "- none\n"
+        "- API_ENDPOINT | list_users | routes.py:list_users | Return users list\n"
+    )
+    task, repo_domain, reason, contracts, malformed, has_section = _parse_llm_response(none_with_row)
+    assert malformed > 0
+
+    # Contract row before - none is unparsable
+    row_with_none = (
+        "TASK_DOMAIN: backend\nREPO_DOMAIN: backend\nREASON: api\nCONTRACTS:\n"
+        "- API_ENDPOINT | list_users | routes.py:list_users | Return users list\n"
+        "- none\n"
+    )
+    task, repo_domain, reason, contracts, malformed, has_section = _parse_llm_response(row_with_none)
+    assert malformed > 0
+
+    # - none twice is unparsable
+    duplicate_none = "TASK_DOMAIN: backend\nREPO_DOMAIN: backend\nREASON: api\nCONTRACTS:\n- none\n- none\n"
+    task, repo_domain, reason, contracts, malformed, has_section = _parse_llm_response(duplicate_none)
+    assert malformed > 0

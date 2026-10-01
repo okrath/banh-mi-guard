@@ -94,7 +94,7 @@ def test_hygiene_violations_reporter():
         files_modified=["temp_helper.py"],
         rule_violations=[
             RuleViolation(rule_id="DEAD-001", severity="HIGH", file_path="temp_helper.py", message="Temporary draft file"),
-            RuleViolation(rule_id="DEAD-002", severity="MEDIUM", file_path="temp_helper.py", line_number=5, message="Commented-out code"),
+            RuleViolation(rule_id="DEAD-REF", severity="HIGH", file_path="temp_helper.py", line_number=5, message="Referenced removed export"),
         ],
         all_passed=False,
         muse_verdict="REVISE",
@@ -103,7 +103,7 @@ def test_hygiene_violations_reporter():
     md = generate_post_task_markdown(post)
     assert "Code & Asset Hygiene Alerts (Dead Code Gate):" in md
     assert "DEAD-001" in md
-    assert "DEAD-002" in md
+    assert "DEAD-REF" in md
 
     # Ensure terminal render handles hygiene table without errors
     render_post_task_terminal(post)

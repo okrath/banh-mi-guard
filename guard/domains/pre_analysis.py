@@ -400,6 +400,7 @@ def _parse_llm_response(text: str) -> Tuple[Optional[DomainType], Optional[Domai
     in_contracts = False
     has_contracts_section = False
     contract_lines_count = 0
+    none_count = 0
 
     task_domain_count = 0
     repo_domain_count = 0
@@ -461,6 +462,7 @@ def _parse_llm_response(text: str) -> Tuple[Optional[DomainType], Optional[Domai
                 continue
             item = line[1:].strip()
             if item.lower() == "none":
+                none_count += 1
                 continue
             parts = [p.strip() for p in item.split("|", 3)]
             if len(parts) == 4 and all(parts):
@@ -484,6 +486,8 @@ def _parse_llm_response(text: str) -> Tuple[Optional[DomainType], Optional[Domai
         malformed_count += 1
 
     if in_contracts and contract_lines_count == 0:
+        malformed_count += 1
+    if none_count > 0 and contract_lines_count != 1:
         malformed_count += 1
 
     return task_domain, repo_domain, reason, contracts, malformed_count, has_contracts_section
