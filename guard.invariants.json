@@ -65,7 +65,7 @@
       "rationale": "Any innerHTML line containing the word 'sanitize' used to be skipped.",
       "checks": [
         { "files": "guard/**/*.py", "forbid": "\"sanitize\" not in added_code" },
-        { "files": "guard/core/rulebook.py", "require": "def _unsafe_html_sinks\\(" }
+        { "files": "guard/core/*.py", "require": "def _unsafe_html_sinks\\(" }
       ]
     },
     {

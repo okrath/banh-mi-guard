@@ -10,300 +10,34 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 
-
-class RuleViolation(BaseModel):
-    rule_id: str
-    severity: str  # "CRITICAL", "HIGH", "MEDIUM", "LOW"
-    file_path: str
-    line_number: Optional[int] = None
-    message: str
-    snippet: str = ""
-
-
-def _unsafe_html_sinks(code: str) -> int:
-    """
-    Count innerHTML / outerHTML assignments on one line whose value is not provably safe.
-    Safe values: an empty literal, or a value that is exactly one DOMPurify.sanitize(...) call.
-    """
-    code = re.sub(r"\s//.*$", "", code)  # drop trailing line comment
-    unsafe = 0
-    for m in re.finditer(r"\b(?:inner|outer)HTML\s*\+?=(?!=)", code):
-        rhs = code[m.end():]
-        # value runs until the first `;` that is not inside a string or parentheses
-        depth, quote, end = 0, "", len(rhs)
-        for k, ch in enumerate(rhs):
-            if quote:
-                if ch == quote and rhs[k - 1] != "\\":
-                    quote = ""
-            elif ch in "'\"`":
-                quote = ch
-            elif ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            elif ch == ";" and depth <= 0:
-                end = k
-                break
-        value = rhs[:end].strip()
-        if re.fullmatch(r"(['\"`])\1", value):
-            continue
-        call = re.match(r"DOMPurify\.sanitize\(", value)
-        if call:
-            # the call's own closing parenthesis, not one inside a string argument (`sanitize(")") + x`)
-            depth, quote, closed = 0, "", None
-            for k in range(call.end() - 1, len(value)):
-                ch = value[k]
-                if quote:
-                    if ch == quote and value[k - 1] != "\\":
-                        quote = ""
-                elif ch in "'\"`":
-                    quote = ch
-                elif ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        closed = k
-                        break
-            # safe only when the sanitize call closes and nothing follows it
-            if closed is None or value[closed + 1:].strip():
-                unsafe += 1
-            continue
-        unsafe += 1
-    return unsafe
-
-
-PY = (".py",)
-JS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
-CODE = PY + JS + (".go", ".rb", ".php", ".java", ".kt", ".cs", ".rs", ".swift", ".dart")
-YAML = (".yaml", ".yml")
-CSS = (".css", ".scss", ".sass", ".less")
-MARKUP = (".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte")
-
-
-def _is_test_path(path: str) -> bool:
-    """A test file: in a tests/, test/ or __tests__/ folder, or named test_*, *_test.*, *.test.* or *.spec.*."""
-    parts = path.split("/")
-    name = parts[-1]
-    return any(p in ("tests", "test", "__tests__") for p in parts[:-1]) or name.startswith("test_") or \
-        bool(re.search(r"(?:_test|\.test|\.spec)\.[a-z0-9]+$", name))
-
-
-def _scan(code: str, start: int = 0):
-    """(index, character, in_string) for each character from `start`, following ' " ` strings and escapes."""
-    quote, escaped = "", False
-    for k in range(start, len(code)):
-        ch = code[k]
-        if quote:
-            yield k, ch, True
-            if ch == quote and not escaped:
-                quote = ""
-            escaped = ch == "\\" and not escaped
-        elif ch in "'\"`":
-            quote = ch
-            yield k, ch, True
-        else:
-            yield k, ch, False
-
-
-def _call_arguments(code: str, open_paren: int) -> str:
-    """The text between a call's parenthesis at `open_paren` and the one that closes it (strings skipped)."""
-    depth = 0
-    for k, ch, in_string in _scan(code, open_paren):
-        if in_string:
-            continue
-        depth += ch == "("
-        depth -= ch == ")"
-        if depth == 0:
-            return code[open_paren + 1:k]
-    return code[open_paren + 1:]  # not closed on this line: the rest of it
-
-
-def _comment_start(code: str, hash_comments: bool, spans: Optional[list] = None, blocks: tuple = ()) -> int:
-    """
-    Where the line's comment begins, outside any string (`#` or `//` by language, or a block comment
-    not closed on the line); -1 for none. A block comment closed on the line (`/* note */ run(x)`) is not the
-    end of the code: the scan goes on after it, and its (start, end) goes into `spans` when given.
-    """
-    closed_until = 0
-    for k, ch, in_string in _scan(code):
-        if in_string or k < closed_until:
-            continue
-        for opening, closing in blocks:
-            if code.startswith(opening, k):
-                end = code.find(closing, k + len(opening))
-                if end < 0:
-                    return k
-                closed_until = end + len(closing)
-                if spans is not None:
-                    spans.append((k, closed_until))
-        if k < closed_until:
-            continue
-        if (hash_comments and ch == "#") or (not hash_comments and code.startswith("//", k)):
-            return k
-    return -1
-
-
-def _hash_comments(path_lower: str) -> bool:
-    """`#` starts a comment in Python, YAML, shell and Dockerfiles; elsewhere `//` does (in Python `//` divides)."""
-    return path_lower.endswith(PY + YAML + (".sh", ".rb", ".toml")) or _is_dockerfile(path_lower)
-
-
-def _block_comments(path_lower: str) -> tuple:
-    """Block comment pairs (opening, closing) allowed in the file type."""
-    if _hash_comments(path_lower):
-        return ()
-    if path_lower.endswith((".html", ".htm", ".xml", ".svg")):
-        return (("<!--", "-->"),)
-    if path_lower.endswith((".jsx", ".tsx", ".vue", ".svelte")):
-        return (("/*", "*/"), ("<!--", "-->"))
-    if path_lower.endswith(CODE) or path_lower.endswith(CSS):
-        return (("/*", "*/"),)
-    return ()
-
-def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[str]:
-    """
-    The line without the part inside a block comment an earlier line left open (None when all of it
-    is), noting in `open_comments` whether this line leaves one open for the next.
-    """
-    blocks = _block_comments(path_lower)
-    closing = open_comments.pop(path_lower, None)
-    if closing:
-        end = code.find(closing)
-        if end < 0:
-            open_comments[path_lower] = closing
-            return None
-        code = code[end + len(closing):]
-    cut = _comment_start(code, _hash_comments(path_lower), blocks=blocks)
-    for opening, closer in blocks:
-        if cut >= 0 and code.startswith(opening, cut):
-            open_comments[path_lower] = closer
-    return code
-
-
-def _tag_end(tag: str) -> int:
-    """Where a tag closes: its first `>` outside `{...}` and quotes that is not part of `=>`; -1 when it goes on."""
-    depth, quote = 0, ""
-    for k, ch in enumerate(tag):
-        if quote:
-            if ch == quote and tag[k - 1:k] != "\\":
-                quote = ""
-            continue
-        if depth <= 0 and ch in "'\"":
-            quote = ch
-            continue
-        depth += (ch == "{") - (ch == "}")
-        if ch == ">" and depth <= 0 and tag[k - 1:k] != "=":
-            return k
-    return -1
-
-
-def _mask_strings(code: str) -> str:
-    """The line with the inside of every string blanked, except `${...}` in template strings: what remains is code."""
-    chars, quote, depth, inner, escaped = list(code), "", 0, "", False
-    for k, ch, in_string in _scan(code):
-        if not in_string:
-            quote, depth, inner, escaped = "", 0, "", False
-            continue
-        if not quote:
-            quote = ch
-        if quote == "`" and code.startswith("${", k) and not depth:
-            depth = 1
-            continue
-        if depth:
-            if inner:
-                if ch == inner and not escaped:
-                    inner = ""
-                else:
-                    chars[k] = " "
-                escaped = ch == "\\" and not escaped
-            elif ch in "'\"":
-                inner, escaped = ch, False
-            elif ch == "{" and code[k - 1] != "$":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            continue
-        if ch not in "'\"`":
-            chars[k] = " "
-    return "".join(chars)
-
-
-def _is_docs_path(path: str) -> bool:
-    """A documentation page or example: in a docs/ or doc/ folder."""
-    return any(p in ("docs", "doc") for p in path.split("/")[:-1])
-
-
-def _unsafe_yaml_load(code: str) -> bool:
-    """A yaml.load( call whose own arguments name no SafeLoader (as code, not inside a string)."""
-    return any(not re.search(r"\bC?SafeLoader\b", _mask_strings(_call_arguments(code, m.end() - 1)))
-               for m in re.finditer(r"\byaml\.load(?:_all)?\(", code))
-
-
-def _is_dockerfile(path: str) -> bool:
-    name = path.rsplit("/", 1)[-1]
-    return name == "dockerfile" or name.startswith("dockerfile.") or name.endswith(".dockerfile")
-
-
-# Line rules, checked on each added line of a matching file (never docs or tests): (rule, severity,
-# which files, pattern, what to do instead). Each is narrow on purpose: a line that matches is
-# nearly always the problem, and `guard-allow <RULE>: <reason>` on the line keeps it as a LOW note.
-LINE_RULES = [
-    ("SEC-004", "HIGH", lambda f: f.endswith(PY),
-     re.compile(r"\byaml\.(?:unsafe_)?load(?:_all)?\(|\b(?:pickle|cPickle|dill|marshal)\.loads?\("),
-     "Deserializing data this way can run code (yaml.load without SafeLoader, pickle/marshal): use "
-     "yaml.safe_load or JSON for anything that is not your own trusted file."),
-    ("SEC-005", "HIGH", lambda f: f.endswith(PY),
-     re.compile(r"\bsubprocess\.\w+\(.*\bshell\s*=\s*True|\bos\.(?:system|popen)\(|(?<![\w.])(?<!def )(?:eval|exec)\("),
-     "A string is run as a shell command or as code: pass subprocess an argument list without "
-     "shell=True, and parse values instead of eval/exec."),
-    ("SEC-005", "HIGH", lambda f: f.endswith(JS),
-     re.compile(r"(?:(?<![\w.$])|(?<=\bwindow\.)|(?<=\bglobalThis\.)|(?<=\bself\.))eval\(|\bnew\s+Function\("),
-     "eval / new Function runs a string as code: parse the value (JSON.parse) or call the function directly."),
-    ("SEC-006", "HIGH", lambda f: f.endswith(CODE) or f.endswith(YAML) or _is_dockerfile(f),
-     re.compile(r"(?i)\b(?:requests|httpx|session|client|urllib3?|aiohttp|http|ssl|get|post|put|patch|delete|request)\b.*\bverify\s*=\s*False\b|rejectUnauthorized\s*:\s*false\b|InsecureSkipVerify\s*:\s*true\b|"
-                r"NODE_TLS_REJECT_UNAUTHORIZED[\"']?(?:\s*[:=]\s*|\s+)[\"']?0\b|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)\b"),
-     "TLS certificate checking is turned off, so any server can pretend to be this one: trust the right "
-     "CA bundle instead."),
-    ("SEC-007", "MEDIUM", lambda f: f.endswith(CODE) or f.endswith(YAML),
-     re.compile(r"Access-Control-Allow-Origin[\"']?\s*[:,=]\s*[\"']\*[\"']|allow_origins\s*=\s*\[\s*[\"']\*[\"']|"
-                r"\borigin\s*:\s*[\"']\*[\"']"),
-     "CORS is open to every origin: list the origins that may call this API."),
-    ("SEC-008", "MEDIUM", lambda f: f.endswith(JS),
-     re.compile(r"(?i)localStorage(?:\.setItem\(\s*|\[\s*(?=[^\]]*\]\s*=(?!=))|\.(?=[\w$]+\s*=(?!=)))"
-                r"[\"'`]?[^\"'`\]=]*(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
-     "A credential goes into localStorage, which every script on the page can read: prefer an HttpOnly cookie."),
-    ("INFRA-001", "HIGH", lambda f: f.endswith(YAML),
-     re.compile(r"^\s*(?:privileged|allowPrivilegeEscalation|hostNetwork|hostPID|hostIPC)\s*:\s*true\b"),
-     "The container gets host-level privileges: drop them, or grant only the capability it needs."),
-    ("INFRA-002", "MEDIUM", _is_dockerfile,
-     re.compile(r"(?i)^FROM\s+(?:--platform=\S+\s+)?(?!scratch\b)(?:[\w.-]+:\d+/)?[^\s:@$]+(?::latest)?(?:\s+AS\s+\S+)?\s*$"),
-     "The base image has no pinned tag or digest (or is :latest): builds change under you; pin a version."),
-    ("INFRA-002", "MEDIUM", lambda f: f.endswith(YAML),
-     re.compile(r"^\s*-?\s*image\s*:\s*[\"']?(?!/)(?![^\s\"']*\.(?:png|jpe?g|gif|svg|webp|avif|ico)\b)(?:[\w.-]+:\d+/)?[^\s:\"'@${}]+(?::latest)?[\"']?\s*$"),
-     "The image has no pinned tag or digest (or is :latest): deployments change under you; pin a version."),
-    ("INFRA-003", "MEDIUM", _is_dockerfile,
-     re.compile(r"(?i)^USER\s+(?:root|0)(?::\S+)?\s*$"),
-     "The container runs as root: add a user and switch to it."),
-    ("MOB-001", "HIGH", lambda f: f.endswith("androidmanifest.xml") and "/debug/" not in f,
-     re.compile(r"android:(?:debuggable|usesCleartextTraffic)\s*=\s*[\"']true[\"']"),
-     "The app ships debuggable, or allows plain-HTTP traffic (usesCleartextTraffic): turn it off, or allow "
-     "only the hosts that need it in a network security config."),
-    ("UX-001", "LOW", lambda f: f.endswith(CSS) or f.endswith(MARKUP),
-     re.compile(r"(?i)^(?!.*:not\(\s*:focus-visible\s*\)).*?\boutline\s*:\s*[\"']?(?:none|0)(?![\w.])"),
-     "The keyboard focus ring is removed, so keyboard users cannot see where they are: style :focus-visible "
-     "instead of removing the outline."),
-    ("UX-002", "MEDIUM", lambda f: f.endswith(MARKUP),
-     re.compile(r"(?i)<img\b(?=(?:(?!<img\b).)*>)(?!(?:(?!<img\b).)*(?:\balt\s*=|\[alt\]|\{alt\}))(?!(?:(?!<img\b).)*\{\s*\.\.\.)"),
-     "An image has no alt text, so screen readers announce nothing useful: add alt (alt=\"\" for decoration)."),
-    ("MOB-002", "MEDIUM", lambda f: f.endswith("androidmanifest.xml"),
-     re.compile(r"android:allowBackup\s*=\s*[\"']true[\"']"),
-     "App data goes into device backups (android:allowBackup): turn it off unless backups are intended."),
-]
-
-
-MAX_RULE_LINE = 2000  # longer lines are minified or generated: the line rules skip them
-MAX_IMG_TAG = 2000  # an <img tag still open after this much text is dropped, not rescanned line by line
+from guard.core.code_text import (
+    CODE,
+    CSS,
+    JS,
+    MARKUP,
+    PY,
+    YAML,
+    _block_comments,
+    _call_arguments,
+    _carry_comment,
+    _comment_start,
+    _hash_comments,
+    _is_dockerfile,
+    _is_docs_path,
+    _is_test_path,
+    _mask_strings,
+    _scan,
+    _tag_end,
+)  # noqa: F401
+from guard.core.rules import (
+    LINE_RULES,
+    MAX_IMG_TAG,
+    MAX_RULE_LINE,
+    RuleViolation,
+    SUPPRESS_COMMENT,
+    _unsafe_html_sinks,
+    _unsafe_yaml_load,
+)  # noqa: F401
 
 
 class OCRRulebookRunner:
