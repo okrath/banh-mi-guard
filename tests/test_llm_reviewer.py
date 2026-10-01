@@ -316,3 +316,27 @@ def test_contracts_none_or_empty_says_none_recorded(contracts):
     assert verdict.review_mode == "llm_deep"
     assert "Baseline contracts recorded at guard pre (what callers rely on):" in captured["prompt"]
     assert "- none recorded" in captured["prompt"]
+@pytest.mark.parametrize("focus", ["all", "security"])
+def test_review_prompt_contains_checklist(focus):
+    from unittest.mock import patch
+
+    captured = {}
+
+    def fake_call(**kwargs):
+        captured["system_prompt"] = kwargs.get("system_prompt", "")
+        captured["prompt"] = kwargs.get("prompt", "")
+        return "SCORE: 8.5\nSUMMARY: ok\nFINDINGS: None"
+
+    with patch("guard.core.llm_reviewer.call_llm", side_effect=fake_call):
+        LLMReviewerEngine(config=_llm_config()).review(
+            prompt="Refactor code",
+            domain=DomainType.BACKEND,
+            focus=focus,
+        )
+
+    full_text = captured["system_prompt"] + "\n" + captured["prompt"]
+    assert "Leaks:" in full_text
+    assert "Null dereference:" in full_text
+    assert "Blocking calls" in full_text
+    assert "dead-code" in full_text
+    assert "over-engineering" in full_text

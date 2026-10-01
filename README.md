@@ -310,9 +310,9 @@ Every change is checked twice, once before and once after the developer or agent
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
 │ • Diff Inspector (0-cost): Diff audit & blast radius check  │
-│ • Static rules: secrets, injection, listeners, infra, UX    │
+│ • Static rules: secrets, injection, XSS, infra, UX         │
 │ • Alibaba OCR (LLM, --full): Reviews the task's changes     │
-│ • Hygiene Engine (0-cost): Detects orphan files & dead code │
+│ • Hygiene Engine (0-cost): Detects orphan files & draft names│
 │ • Project Health Check: Automated compile & test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
 │ ➔ Compiles: "### 🧪 POST-TASK VERIFICATION"                 │
@@ -351,17 +351,17 @@ The domain selects the **template invariants** used when the repository has no p
 
 ## Code Hygiene & Dead Code Gate
 
-AI coding agents often leave behind code rot: scratchpad files, commented-out dead code blocks, and unreferenced helper functions. `guard` prevents codebase rot via a **Two-Tier Hygiene Scanner**:
+AI coding agents often leave behind code rot: scratchpad files, commented-out dead code blocks, and unreferenced helper functions. `guard` prevents codebase rot via deterministic checks on newly added files and removed references, while commented-out code, unused imports and private functions are checked by the LLM review in every language:
 
 | Rule ID | Severity | Inspection Rule | Detection Target |
 | :--- | :--- | :--- | :--- |
 | **`DEAD-001`** | `HIGH` / `MEDIUM` | **Orphan & Draft Files** | Unreferenced newly added files or draft names (`*.tmp`, `*backup*`, `temp_*`, `test_scratch*`). |
-| **`DEAD-002`** | `MEDIUM` | **Commented-Out Code** | Blocks of 3+ consecutive lines of commented source code instead of clean Git deletion. |
-| **`DEAD-003`** | `MEDIUM` / `LOW` | **Unused Symbols & Imports** | AST analysis flags unreferenced private helpers (`def _foo`) and unused imported symbols. |
+| **`DEAD-REF`** | `HIGH` | **Removed References** | Removed string keys, exports or CSS classes that are still referenced elsewhere in the repository. |
+| — | — | **Commented Code & Unused Symbols** | Commented-out code blocks, unused imports and private functions are checked by the LLM review in every language. |
 
 ### Two-Tier Execution Strategy
-1. **Commit-Level (Diff-Level, <50ms):** Automatically runs during `guard post` and Git hooks. Checks newly added files for orphan status and diff additions (`+`) for commented-out code.
-2. **Focus-Level (Full-File Deep Scan):** Triggered via `--focus dead-code`. Scans entire touched files and AST to detect all unreferenced helpers, unused imports, and zombie code blocks.
+1. **Commit-Level (Diff-Level, <50ms):** Automatically runs during `guard post` and Git hooks. Checks newly added files for orphan status.
+2. **Focus-Level (Full-File Deep Scan):** Triggered via `--focus dead-code`. Scans touched files for orphan files and directs LLM scrutiny to dead code, unused imports and zombie code blocks.
 
 ---
 
@@ -374,8 +374,7 @@ AI coding agents often add libraries for trivial tasks or abstractions for a few
 | Rule ID | Severity | Inspection Rule | Detection Target |
 | :--- | :--- | :--- | :--- |
 | **`LAZY-001`** | `HIGH` | **Dependency Bloat** | Redundant npm/pip packages (`is-odd`, `uuid`, `mkdirp`, `rimraf`, `pathlib2`, `mock`) when native APIs or stdlib suffice. |
-| **`LAZY-002`** | `MEDIUM` | **Premature Abstraction** | Single-use interfaces, trivial pass-through wrapper functions, and over-engineered class hierarchies. |
-| **`LAZY-003`** | `MEDIUM` | **Wheel Reinvention** | Re-implementing common utilities (`clamp`, `slugify`, `is_empty`, `flatten`, `deep_clone`) when stdlib or 1-liners suffice. |
+| — | — | **Over-Engineering & Reinvented Helpers** | Premature abstractions, pass-through wrappers, and reinvented standard helpers are checked by the LLM review in every language. |
 | **`NET-LOC`** | ℹ️ **Info** | **Change Size** | Reports net lines added or removed. It is informational only: deleting code earns no score bonus. |
 
 ---

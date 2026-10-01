@@ -55,66 +55,6 @@ def test_check_orphan_file_in_repo(tmp_path):
     assert "Orphan file" in viol.message
 
 
-def test_scan_commented_code_detection():
-    engine = HygieneEngine()
-
-    # 1. Normal prose comments -> No violation
-    prose = [
-        "// This function handles the checkout process",
-        "// We validate the token and then submit order",
-        "// Returns true if checkout succeeded",
-    ]
-    assert len(engine.scan_commented_code_lines(prose, "Checkout.tsx")) == 0
-
-    # 2. Commented-out code block (3 lines) -> Violation
-    commented_code = [
-        "// const oldTax = calculateTax(amount);",
-        "// const total = amount + oldTax;",
-        "// return submitOrder(total);",
-    ]
-    violations = engine.scan_commented_code_lines(commented_code, "Checkout.tsx")
-    assert len(violations) == 1
-    assert violations[0].rule_id == "DEAD-002"
-    assert "Commented-out code block (3 lines)" in violations[0].message
-
-
-def test_scan_python_unused_symbols():
-    engine = HygieneEngine()
-
-    code = """
-def public_api():
-    return _active_helper()
-
-def _active_helper():
-    return "active"
-
-def _dead_helper(x, y):
-    # This helper is defined but never called
-    return x * y + 42
-"""
-    violations = engine.scan_python_unused_symbols(code, "services/calc.py")
-    assert len(violations) == 1
-    assert violations[0].rule_id == "DEAD-003"
-    assert "_dead_helper" in violations[0].message
-
-def test_scan_python_unused_imports():
-    engine = HygieneEngine()
-
-    code = """
-import os
-import math
-from sys import argv, exit
-
-def run():
-    print(os.getcwd())
-    print(argv)
-"""
-    violations = engine.scan_python_unused_symbols(code, "services/cli.py")
-    unused_symbols = [v.message for v in violations if "Unused imported symbol" in v.message]
-    assert any("math" in msg for msg in unused_symbols)
-    assert any("exit" in msg for msg in unused_symbols)
-    assert not any("os" in msg for msg in unused_symbols)
-    assert not any("argv" in msg for msg in unused_symbols)
 
 def test_scan_diff_level(tmp_path):
     repo = tmp_path / "repo"
@@ -142,7 +82,6 @@ new file mode 100644
 
     violations = engine.scan_diff_level(raw_diff, diff_summary)
     assert any(v.rule_id == "DEAD-001" for v in violations)
-    assert any(v.rule_id == "DEAD-002" for v in violations)
 
 
 def test_scan_focus_level(tmp_path):
@@ -162,11 +101,9 @@ def _unused_subroutine():
     engine = HygieneEngine(repo_path=repo)
     violations = engine.scan_focus_level(["dead.py"])
 
-    # Expect orphan check (DEAD-001), commented code (DEAD-002), and unused subroutine (DEAD-003)
+    # Expect orphan check (DEAD-001)
     rule_ids = {v.rule_id for v in violations}
     assert "DEAD-001" in rule_ids
-    assert "DEAD-002" in rule_ids
-    assert "DEAD-003" in rule_ids
 
 
 def test_documentation_is_never_an_orphan(tmp_path):

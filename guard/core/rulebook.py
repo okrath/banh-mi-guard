@@ -1,6 +1,6 @@
 """
 The deterministic rulebook every guard post runs on the diff: secrets, SQL built from strings, HTML
-sinks, global listeners, blocking I/O and deep property access.
+sinks, infra and UX rules.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from pydantic import BaseModel
 from guard.core.code_text import (
     CODE,
     CSS,
-    JS,
     MARKUP,
     PY,
     YAML,
@@ -62,47 +61,18 @@ class OCRRulebookRunner:
     SUPPRESS_REGEX = re.compile(r"guard-allow\s+([A-Z]+-\d+)\s*:\s*(\S.*)")
     # for the line rules: the marker in a comment (`# ...`, `// ...`, `/* ...`, `<!-- ...`), never in a string
     SUPPRESS_COMMENT = re.compile(r"(?:#|//|/\*|<!--)\s*guard-allow\s+([A-Z]+-\d+)\s*:\s*(\S.*)")
-    # Pillar: Memory Safety - Dangling Listener without remover in component
-    DANGLING_LISTENER = re.compile(
-        r"""addEventListener\s*\(["'](resize|scroll|mousemove|keydown)["']"""
-    )
-    # Pillar: Stability - Deep property dereference without optional chaining
-    NULL_DEREF = re.compile(
-        r"""(?i)(data|res|response|user|item)\.([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)"""
-    )
-    # Pillar: Memory Safety - An interval that keeps running (and holding what it closes over)
-    DANGLING_INTERVAL = re.compile(r"\bsetInterval\s*\(")
-    # Pillar: Performance - Blocking synchronous I/O on async event loop
-    BLOCKING_SYNC_IO = re.compile(
-        r"""\b(readFileSync|writeFileSync|execSync|spawnSync)\b"""
-    )
 
     def scan_diff(self, raw_diff: Optional[str]) -> List[RuleViolation]:
         diff_text = raw_diff or ""
         violations: List[RuleViolation] = []
         current_file = "unknown"
         line_num = 0
-        # per file, from its added and context lines: whether it clears an interval anywhere
-        cleared, name, last_user, open_comments = set(), None, {}, {}
+        last_user, name = {}, None
         for line in diff_text.splitlines():
             if line.startswith("+++ b/"):
                 name = line[6:].strip()
-            elif name and line.startswith("@@"):
-                open_comments.pop(name.replace("\\", "/").lower(), None)  # lines between hunks are unseen
             elif name and line[:1] in ("+", " "):
-                code = line[1:]
-                visible = _carry_comment(open_comments, name.replace("\\", "/").lower(), code)
-                if len(line) > MAX_RULE_LINE:
-                    continue
-                spans: list = []
-                p_lower = name.replace("\\", "/").lower()
-                cut = _comment_start(visible or "", _hash_comments(p_lower), spans, _block_comments(p_lower))
-                body = (visible or "")[:cut] if cut >= 0 else (visible or "")
-                for a, b in spans:
-                    body = body[:a] + " " * (b - a) + body[b:]
-                if visible and re.search(r"\bclearInterval\s*\(", _mask_strings(body)):
-                    cleared.add(name)  # a real call, not the word in a string or a comment
-                user = re.match(r"(?i)^USER\s+(\S+)", code.strip())
+                user = re.match(r"(?i)^USER\s+(\S+)", line[1:].strip())
                 if user:
                     last_user[name.replace("\\", "/").lower()] = user.group(1).split(":")[0].lower()
         # Dockerfiles that end as another user may switch to root for a build step
@@ -137,7 +107,6 @@ class OCRRulebookRunner:
                 cf_lower = current_file.replace("\\", "/").lower()
                 is_doc_file = any(cf_lower.endswith(ext) for ext in [".md", ".markdown", ".txt", ".rst"])
                 is_test_file = _is_test_path(cf_lower)
-                is_js_ts = any(cf_lower.endswith(ext) for ext in [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"])
                 # the code of the line outside a comment an earlier line left open (None: all comment)
                 visible = _carry_comment(self._open_comment, cf_lower, added_code)
                 visible = visible.strip() if visible is not None else None
@@ -155,7 +124,7 @@ class OCRRulebookRunner:
                             snippet=added_code[:80],
                         ))
 
-                # Rules 2-6 only apply to actual application source code (not doc markdown files)
+                # Rules only apply to actual application source code (not doc markdown files)
                 if is_doc_file:
                     continue
 
@@ -197,48 +166,7 @@ class OCRRulebookRunner:
                             snippet=added_code[:80],
                         ))
 
-                # Rule 4: Memory leak / Dangling Event Listener (Memory Safety)
-                if self.DANGLING_LISTENER.search(added_code) and "removeEventListener" not in diff_text and not is_test_file:
-                    violations.append(RuleViolation(
-                        rule_id="PERF-001",
-                        severity="HIGH",
-                        file_path=current_file,
-                        line_number=line_num,
-                        message="Global window/document event listener added without cleanup remover.",
-                        snippet=added_code[:80],
-                    ))
-
-                # Rule 4b: an interval started with no clearInterval anywhere in the change (Memory Safety)
-                spans = []
-                cut = _comment_start(visible or "", _hash_comments(cf_lower), spans, _block_comments(cf_lower))
-                interval_code = (visible or "")[:cut] if cut >= 0 else (visible or "")
-                for a, b in spans:
-                    interval_code = interval_code[:a] + " " * (b - a) + interval_code[b:]
-                interval_code = _mask_strings(interval_code)
-                if cf_lower.endswith(JS) and self.DANGLING_INTERVAL.search(interval_code) and current_file not in cleared \
-                        and not is_test_file and not _is_docs_path(cf_lower) and len(added_code) <= MAX_RULE_LINE:
-                    violations.append(RuleViolation(
-                        rule_id="PERF-003",
-                        severity="MEDIUM",
-                        file_path=current_file,
-                        line_number=line_num,
-                        message="setInterval started with no clearInterval in the same file: it keeps running, and "
-                                "keeps what it uses alive, after its component or page is gone.",
-                        snippet=added_code[:80],
-                    ))
-
-                # Rule 5: Blocking Synchronous I/O on Event Loop (Performance - Only in JS/TS environments)
-                if is_js_ts and self.BLOCKING_SYNC_IO.search(added_code) and not is_test_file:
-                    violations.append(RuleViolation(
-                        rule_id="PERF-002",
-                        severity="MEDIUM",
-                        file_path=current_file,
-                        line_number=line_num,
-                        message="Blocking synchronous I/O detected on thread. Prefer async/await non-blocking operations.",
-                        snippet=added_code[:80],
-                    ))
-
-                # Rules 7+: the line rules of the quality matrix (security, infra, mobile); a line is
+                # Line rules of the quality matrix (security, infra, mobile); a line is
                 # judged before it adds to what the file defines (`FROM node AS node` is still an image)
                 if not is_test_file and visible is not None:
                     violations.extend(self._line_rules(cf_lower, current_file, line_num, visible))
@@ -246,19 +174,7 @@ class OCRRulebookRunner:
                         violations.extend(self._multiline_img(cf_lower, current_file, line_num, visible))
                 self._file_context(cf_lower, added_code)
 
-                # Rule 6: Deep property dereference without optional chaining (Stability)
-                if self.NULL_DEREF.search(added_code) and "?." not in added_code and not is_test_file:
-                    violations.append(RuleViolation(
-                        rule_id="STAB-001",
-                        severity="MEDIUM",
-                        file_path=current_file,
-                        line_number=line_num,
-                        message="Deep object access without optional chaining (?.) may cause Null Pointer / TypeError.",
-                        snippet=added_code[:80],
-                    ))
-
         return violations
-
 
     def _multiline_img(self, path_lower: str, path: str, line_num: int, code: str) -> List[RuleViolation]:
         """UX-002 for an <img tag spread over several added lines (JSX): judged once its `>` arrives."""

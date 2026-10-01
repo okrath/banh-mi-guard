@@ -70,48 +70,6 @@ diff --git a/requirements.txt b/requirements.txt
     assert any("mock" in v.message for v in violations)
 
 
-def test_scan_wheel_reinventions():
-    engine = SimplicityEngine()
-
-    raw_diff = """
-diff --git a/src/math_utils.py b/src/math_utils.py
---- a/src/math_utils.py
-+++ b/src/math_utils.py
-@@ -1,0 +1,4 @@
-+def clamp(val, min_val, max_val):
-+    if val < min_val: return min_val
-+    if val > max_val: return max_val
-+    return val
-"""
-    violations = engine.scan_wheel_reinventions(raw_diff)
-    assert len(violations) == 1
-    assert violations[0].rule_id == "LAZY-003"
-    assert "clamp()" in violations[0].message
-
-
-def test_scan_python_overengineering():
-    engine = SimplicityEngine()
-
-    code = """
-from abc import ABC, abstractmethod
-
-class IDataProcessor(ABC):
-    @abstractmethod
-    def process(self, x):
-        pass
-
-def fetch_user_data(user_id):
-    return get_remote_user(user_id)
-"""
-    violations = engine.scan_python_overengineering(code, "services/processor.py")
-    assert len(violations) == 2
-    messages = [v.message for v in violations]
-
-    # Check 1: Premature abstraction (single-method abstract class)
-    assert any("IDataProcessor" in m for m in messages)
-    # Check 2: Trivial pass-through wrapper
-    assert any("fetch_user_data" in m for m in messages)
-
 
 def test_scan_diff_and_focus_levels(tmp_path):
     repo = tmp_path / "frugal_repo"
@@ -139,5 +97,4 @@ diff --git a/package.json b/package.json
 
     # Focus-level check
     focus_viols = engine.scan_focus_level(["calc.py"])
-    assert len(focus_viols) == 1
-    assert focus_viols[0].rule_id == "LAZY-002"
+    assert len(focus_viols) == 0

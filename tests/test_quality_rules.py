@@ -75,16 +75,6 @@ def test_an_image_whose_props_are_spread_may_carry_its_alt():
     assert not [f for f in found("web/Card.tsx", "<img {...imageProps} />") if f[0] == "UX-002"]
 
 
-def interval(*lines: str) -> list:
-    diff = "+++ b/web/clock.ts\n@@ -0,0 +1,3 @@\n" + "".join(f"+{line}\n" for line in lines)
-    return [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"]
-
-
-def test_an_interval_needs_its_clear_in_the_same_change():
-    assert interval("const id = setInterval(tick, 1000)") == ["PERF-003"]
-    assert interval("const id = setInterval(tick, 1000)", "return () => clearInterval(id)") == []
-    assert interval("// setInterval(tick) is not used here") == []
-
 
 def test_the_review_cases_stay_quiet():
     assert not found("web/App.tsx", "<img src={a} onError={() => setBroken(true)} alt=\"Avatar\" />")
@@ -145,11 +135,6 @@ def test_more_forms_are_found():
     assert ("SEC-006", "HIGH") in found("Dockerfile", "ENV NODE_TLS_REJECT_UNAUTHORIZED=0")
 
 
-def test_an_interval_cleared_in_another_file_or_on_a_removed_line_does_not_count():
-    diff = ("+++ b/web/a.ts\n@@ -1,2 +1,1 @@\n-clearInterval(id)\n+const id = setInterval(tick, 1000)\n"
-            "+++ b/web/b.ts\n@@ -0,0 +1,1 @@\n+clearInterval(other)\n")
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
-
 
 def test_a_very_long_line_is_skipped_quickly():
     import time
@@ -178,8 +163,6 @@ def test_smaller_review_cases():
     assert ("INFRA-002", "MEDIUM") in found("Dockerfile", "FROM node AS node")
     assert not found("app/cli.py", "parser.add_argument('--verify', default=False); run(verify=False)")
     assert ("SEC-006", "HIGH") in found("app/http.py", "requests.get(url, verify=False)")
-    diff = "+++ b/web/a.ts\n@@ -0,0 +1,2 @@\n+const t = setInterval(tick, 10)\n+// clearInterval(t) later\n"
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
 
 
 def test_safeloader_counts_only_inside_the_calls_own_arguments():
@@ -202,12 +185,6 @@ def test_docs_pages_and_strings_are_not_code():
     assert ("SEC-004", "HIGH") in found("app/cfg.py", "cfg = yaml.unsafe_load(stream)")
 
 
-def test_a_clear_interval_in_a_string_or_comment_does_not_count():
-    diff = ('+++ b/web/a.ts\n@@ -0,0 +1,3 @@\n+const id = setInterval(tick, 1000)\n'
-            '+const note = "clearInterval(id)"\n+log(x) // clearInterval(id) later\n')
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
-
-
 
 def test_an_edited_dockerfile_reports_only_what_the_diff_can_show():
     edited = "+++ b/Dockerfile\n@@ -8,1 +8,2 @@\n FROM node:20-slim AS app\n+FROM build AS runtime\n+USER root\n"
@@ -226,11 +203,6 @@ def test_each_image_tag_needs_its_own_alt():
     assert ("UX-002", "MEDIUM") in found("web/a.html", '<img src="a.png"><img src="b.png" alt="B">')
     assert not found("web/a.html", '<img src="a.png" alt="A"><img src="b.png" alt="B">')
 
-
-def test_intervals_in_docs_and_comments_are_not_code():
-    for diff in ("+++ b/docs/guide.js\n@@ -0,0 +1,1 @@\n+setInterval(tick, 10)\n",
-                 "+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+run() // setInterval(tick) is gone\n"):
-        assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == []
 
 
 def test_code_after_a_closed_block_comment_is_read():
@@ -289,12 +261,6 @@ def test_comments_opened_or_closed_on_context_lines():
     assert [v.rule_id for v in OCRRulebookRunner().scan_diff(closed) if v.rule_id == "SEC-005"] == ["SEC-005"]
 
 
-def test_interval_rules_skip_comments_and_strings():
-    commented = "+++ b/web/a.ts\n@@ -0,0 +1,4 @@\n+/*\n+clearInterval(id)\n+*/\n+const id = setInterval(tick, 1000)\n"
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(commented) if v.rule_id == "PERF-003"] == ["PERF-003"]
-    quoted = '+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+logger.debug("setInterval(")\n'
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(quoted) if v.rule_id == "PERF-003"] == []
-
 
 def test_guard_allow_in_a_closed_block_comment():
     assert found("web/a.js", "/* guard-allow SEC-005: fixed expression */ eval(constant)") == [("SEC-005", "LOW")]
@@ -313,10 +279,6 @@ def test_a_comment_closed_on_its_line_leaves_the_next_line_code():
     assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "SEC-005"] == ["SEC-005"]
 
 
-def test_an_interval_inside_a_template_interpolation_is_code():
-    diff = "+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+const s = `${setInterval(tick, 1000)}`\n"
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
-
 
 def test_a_hunk_gap_ends_an_open_comment():
     diff = "+++ b/web/a.js\n@@ -1,1 +1,2 @@\n+/* starts here\n@@ -40,1 +41,2 @@\n+eval(userInput)\n"
@@ -328,20 +290,11 @@ def test_a_comparison_inside_jsx_does_not_end_the_image_tag():
     assert [v for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == []
 
 
-def test_only_template_interpolations_outside_nested_strings_are_code():
-    for line in ('const s = "${setInterval(tick, 1000)}"', 'const s = `${"setInterval(x)"}`'):
-        diff = f"+++ b/web/a.ts\n@@ -0,0 +1,1 @@\n+{line}\n"
-        assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == []
-
 
 def test_a_greater_than_inside_a_quoted_attribute_does_not_end_the_image_tag():
     diff = '+++ b/web/A.jsx\n@@ -0,0 +1,4 @@\n+<img\n+  title="x > y"\n+  alt="A"\n+/>\n'
     assert [v for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "UX-002"] == []
 
-
-def test_a_clear_interval_in_a_closed_block_comment_does_not_count():
-    diff = "+++ b/web/a.ts\n@@ -0,0 +1,2 @@\n+/* clearInterval(id) */\n+const id = setInterval(tick, 1000)\n"
-    assert [v.rule_id for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id == "PERF-003"] == ["PERF-003"]
 
 
 def test_yaml_glob_does_not_open_block_comment():

@@ -38,17 +38,14 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| Global `resize`/`scroll`/`mousemove`/`keydown` listener added with no `removeEventListener` in the diff | Rule | `PERF-001` (HIGH) |
-| `setInterval` added with no `clearInterval(` call (outside strings and comments) in the lines of the same file the diff shows (JS/TS, Vue, Svelte) | Rule | `PERF-003` (MEDIUM) |
+| Resources opened without a guaranteed close (files, sockets, DB connections, child processes); listeners, timers and subscriptions never removed on teardown; caches and collections that only grow; closures that hold large objects (any language) | LLM review | — |
 | A new Kubernetes workload without `resources.limits` | LLM review (`--focus memory`) | — |
-| Unclosed streams, sockets, DB connections; retained closures; DOM leaks | LLM review (`--focus memory`) | — |
 
 ## 3. ⚡ Performance & Latency
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| Blocking sync I/O (`readFileSync`, `writeFileSync`, `execSync`, `spawnSync`) in JS/TS | Rule | `PERF-002` (MEDIUM) |
-| N+1 queries, excessive re-renders, thread lockups | LLM review (`--focus performance`) | — |
+| Blocking calls inside async or event-loop code; N+1 queries, excessive re-renders, thread lockups (any language) | LLM review | — |
 
 ## 4. 🧱 Integrity, Scope & Contracts
 
@@ -60,7 +57,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | File covered only by scope added in a `--force` restart | Rule | `SCOPE-004` (HIGH) |
 | Project rules (behavior that must not break) | Project invariant | your IDs |
 | Invariants file removed or relaxed; malformed invariants file | Rule | `INV-WEAKENED`, `INV-FILE` |
-| Deep property access without optional chaining (`a.b.c.d`) | Rule | `STAB-001` (MEDIUM) |
+| Values that can be null/None/undefined/nil used without a check (any language) | LLM review | — |
 | Image without a pinned tag or digest, or `:latest` (YAML `image:`, Dockerfile `FROM`; in an edited Dockerfile a stage defined outside the diff looks like an image: mark that line with `guard-allow`) | Rule | `INFRA-002` (MEDIUM) |
 | API schema compatibility, atomic multi-table writes | LLM review; backend template invariants (UNVERIFIED) | — |
 | The project still builds / tests pass | Build command (`pnpm run build`, `pytest`, `go test ./...`, ...) | build check (blocks on failure) |
@@ -80,9 +77,8 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Concern | How | ID |
 | :--- | :--- | :--- |
 | New files that nothing references, draft names (`*.tmp`, `*backup*`, `temp_*`) | Rule | `DEAD-001` |
-| 3+ consecutive lines of commented-out code | Rule | `DEAD-002` |
-| Unused private helpers and imports (AST, with `--focus dead-code`) | Rule | `DEAD-003` |
 | A removed string key (`case 'edit':`), export or CSS class that is still referenced somewhere in the repository | Rule | `DEAD-REF` (HIGH) |
+| Commented-out code, unused imports and private functions (any language) | LLM review | — |
 
 ## 7. 🛋️ Simplicity (KISS & YAGNI)
 
@@ -91,8 +87,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Concern | How | ID |
 | :--- | :--- | :--- |
 | Redundant packages (`is-odd`, `uuid`, `mkdirp`, `rimraf`, `pathlib2`, `mock`) when stdlib or the runtime suffices | Rule | `LAZY-001` |
-| Single-use interfaces, pass-through wrappers, deep class hierarchies | Rule | `LAZY-002` |
-| Re-implemented utilities (`clamp`, `slugify`, `is_empty`, `flatten`, `deep_clone`) | Rule | `LAZY-003` |
+| Over-engineering (pass-through wrappers, one-method classes, reinvented standard helpers in any language) | LLM review | — |
 | Net lines added or removed | Informational only (deleting code earns no score bonus) | `NET-LOC` |
 
 ---
@@ -104,11 +99,11 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 
 | Domain | 🛡️ Security | 🧠 Memory | ⚡ Performance | 🧱 Integrity | ♿ UX | 🧹 Hygiene | 🛋️ Simplicity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| Frontend | `SEC-001` `SEC-003` `SEC-005` `SEC-006` `SEC-007` `SEC-008` | `PERF-001` `PERF-003` | `PERF-002` | `STAB-001` | `UX-001` `UX-002` | `DEAD-*` | `LAZY-*` |
-| Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | `PERF-003` (Node) | `PERF-002` (Node) | build check, invariants, `STAB-001` | LLM | `DEAD-*` | `LAZY-*` |
-| Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-*` |
+| Frontend | `SEC-001` `SEC-003` `SEC-005` `SEC-006` `SEC-007` `SEC-008` | LLM | LLM | LLM | `UX-001` `UX-002` | `DEAD-001` `DEAD-REF` | `LAZY-001` |
+| Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | LLM | LLM | build check, invariants | LLM | `DEAD-001` `DEAD-REF` | `LAZY-001` |
+| Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-001` |
 | Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | LLM | LLM | `INFRA-002` | LLM | `DEAD-001` | LLM |
-| Mobile | `SEC-001` `SEC-006` `MOB-001` `MOB-002` | `PERF-003` (React Native) | LLM | LLM | LLM | `DEAD-001` `DEAD-002` | LLM |
+| Mobile | `SEC-001` `SEC-006` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` | LLM |
 
 ---
 
