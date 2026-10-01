@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from guard.core.session import DomainContract, LockedInvariant
+from guard.core.session import LockedInvariant
 from guard.domains.base import BaseDomainAnalyzer
 
 
@@ -45,46 +45,6 @@ class BackendDomainAnalyzer(BaseDomainAnalyzer):
         if (repo_path / "package.json").exists():
             return "npm test"
         return None
-
-    def extract_baseline_contracts(self, repo_path: Path, files: List[str]) -> List[DomainContract]:
-        contracts: List[DomainContract] = []
-        be_files = [f for f in files if any(f.endswith(ext) for ext in [".go", ".py", ".rs", ".ts", ".js", ".sql"])]
-
-        for rel_path in be_files[:5]:
-            p = repo_path / rel_path
-            if not p.is_file():
-                continue
-            try:
-                code = p.read_text(encoding="utf-8", errors="ignore")[:4000]
-
-                # Check for API Routes/Endpoints
-                routes = re.findall(r"""@?(app|router)\.(get|post|put|delete|patch)\(["']([^"']+)["']""", code, re.IGNORECASE)
-                for _, method, path in routes:
-                    contracts.append(DomainContract(
-                        category="API_ENDPOINT",
-                        name=f"{method.upper()}_{path}",
-                        description=f"Preserve endpoint signature for {method.upper()} {path} in {rel_path}",
-                    ))
-
-                # Check for Auth / Middleware guards
-                if re.search(r"\b(Depends|AuthGuard|authenticate|jwt|bearer|authorize)\b", code):
-                    contracts.append(DomainContract(
-                        category="SECURITY_AUTH",
-                        name=f"{Path(rel_path).stem}_auth_protection",
-                        description=f"Preserve authentication & authorization guard in {rel_path}",
-                    ))
-
-                # Check for DB transactions
-                if re.search(r"\b(transaction|commit|rollback|session\.begin)\b", code):
-                    contracts.append(DomainContract(
-                        category="DATA_INTEGRITY",
-                        name=f"{Path(rel_path).stem}_transaction_rollback",
-                        description=f"Ensure atomic database transactions with rollback in {rel_path}",
-                    ))
-            except Exception:
-                pass
-
-        return contracts
 
     def generate_recommended_invariants(self, prompt: str, files: List[str]) -> List[LockedInvariant]:
         return [

@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -18,6 +19,20 @@ from guard.reporters.markdown import commit_instruction, gate_label, ocr_finding
 console = Console()
 
 
+def _format_terminal_domain(pre: PreTaskRecord) -> str:
+    task_str = pre.domain.value.upper()
+    repo_dom = pre.repo_domain or pre.domain
+    repo_str = repo_dom.value.upper()
+    source_str = f" ({pre.domain_source})" if pre.domain_source else " (source unknown)"
+    if repo_str != task_str:
+        base = f"{task_str} (task) in a {repo_str} repository{source_str}"
+    else:
+        base = f"{task_str}{source_str}"
+    if getattr(pre, "domain_reason", ""):
+        return f"{base}: {pre.domain_reason}"
+    return base
+
+
 def render_pre_task_terminal(pre: PreTaskRecord):
     # Header panel
     header_text = Text()
@@ -25,7 +40,7 @@ def render_pre_task_terminal(pre: PreTaskRecord):
     header_text.append(f"Prompt: ", style="bold white")
     header_text.append(f"{pre.prompt}\n", style="italic yellow")
     header_text.append(f"Domain: ", style="bold white")
-    header_text.append(f"{pre.domain.value.upper()}  ", style="bold green")
+    header_text.append(f"{_format_terminal_domain(pre)}  ", style="bold green")
     console.print(Panel(header_text, border_style="cyan"))
 
     # Contracts Table
@@ -36,9 +51,20 @@ def render_pre_task_terminal(pre: PreTaskRecord):
         table.add_column("Constraint Description", style="dim")
 
         for c in pre.existing_contracts:
-            table.add_row(c.category, c.name, c.description)
+            table.add_row(escape(c.category), escape(c.name), escape(c.description))
         console.print(table)
-
+        if pre.contracts_source:
+            console.print(f"[dim]Source: {escape(pre.contracts_source)}[/dim]")
+        else:
+            console.print("[dim]Source: source unknown (session recorded before guard tracked it)[/dim]")
+    elif not pre.contracts_source:
+        console.print("[dim]📌 Existing Domain Contracts: contracts: source unknown (session recorded before guard tracked it)[/dim]")
+    elif pre.contracts_source.startswith("not extracted"):
+        console.print(f"[dim]📌 Existing Domain Contracts: contracts: {escape(pre.contracts_source)}[/dim]")
+    elif pre.contracts_source.startswith("LLM"):
+        console.print(f"[dim]📌 Existing Domain Contracts: none found ({escape(pre.contracts_source)})[/dim]")
+    else:
+        console.print(f"[dim]📌 Existing Domain Contracts: contracts: not extracted ({escape(pre.contracts_source)})[/dim]")
     # Invariants Panel
     if pre.locked_invariants:
         inv_table = Table(title="🔒 Locked Invariants (Must NOT be broken)", show_header=True, header_style="bold yellow")

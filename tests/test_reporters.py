@@ -181,3 +181,188 @@ def test_empty_ocr_text_renders_as_a_visible_placeholder():
     from guard.reporters.markdown import inert
     assert inert("") == "*(empty)*" and inert("  \n ") == "*(empty)*"
     assert inert("a\nb") == "`a b`"
+
+
+def test_markdown_pre_task_domain_and_contract_sources():
+    # LLM domain with different repo domain, and contracts
+    pre = PreTaskRecord(
+        prompt="Setup infra",
+        domain=DomainType.INFRA,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        contracts_source="LLM",
+        existing_contracts=[
+            DomainContract(category="INFRA_PORT", name="port_80", description="[Dockerfile:80] Port binding"),
+        ],
+    )
+    md = generate_pre_task_markdown(pre)
+    assert "INFRA (task) in a BACKEND repository (`LLM`)" in md
+    assert "`[INFRA_PORT]` `port_80`: `[Dockerfile:80] Port binding`" in md
+    # Heuristic fallback without contracts
+    pre2 = PreTaskRecord(
+        prompt="Fix bug",
+        domain=DomainType.BACKEND,
+        repo_domain=DomainType.BACKEND,
+        domain_source="heuristic: LLM not configured",
+        contracts_source="not extracted (LLM not configured)",
+        existing_contracts=[],
+    )
+    md2 = generate_pre_task_markdown(pre2)
+    assert "BACKEND (`heuristic: LLM not configured`)" in md2
+    assert "contracts: `not extracted (LLM not configured)`" in md2
+
+
+def test_markdown_llm_capped_source_with_no_contracts_says_none_found():
+    pre = PreTaskRecord(
+        prompt="Build UI",
+        domain=DomainType.FRONTEND,
+        repo_domain=DomainType.FRONTEND,
+        domain_source="LLM",
+        contracts_source="LLM (input capped: tree cut to 300 of 500 lines)",
+        existing_contracts=[],
+    )
+    md = generate_pre_task_markdown(pre)
+    assert "none found (`LLM (input capped: tree cut to 300 of 500 lines)`)" in md
+    assert "not extracted" not in md
+
+
+def test_markdown_non_empty_contract_list_shows_source():
+    pre = PreTaskRecord(
+        prompt="Setup infra",
+        domain=DomainType.INFRA,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        contracts_source="LLM (input capped: big.py cut to 8000 of 12000 characters)",
+        existing_contracts=[
+            DomainContract(category="INFRA_PORT", name="port_80", description="[Dockerfile:80] Port binding"),
+        ],
+    )
+    md = generate_pre_task_markdown(pre)
+    assert "Source: `LLM (input capped: big.py cut to 8000 of 12000 characters)`" in md
+    assert "`[INFRA_PORT]` `port_80`: `[Dockerfile:80] Port binding`" in md
+
+def test_markdown_domain_reason_reaches_pre_note():
+    pre = PreTaskRecord(
+        prompt="Setup infra",
+        domain=DomainType.INFRA,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        domain_reason="Scoped Dockerfile configures infrastructure ports.",
+        contracts_source="LLM",
+        existing_contracts=[],
+    )
+    md = generate_pre_task_markdown(pre)
+    assert "INFRA (task) in a BACKEND repository (`LLM`): `Scoped Dockerfile configures infrastructure ports.`" in md
+
+def test_terminal_escape_rich_markup_in_pre_task(capsys):
+    pre = PreTaskRecord(
+        prompt="Test terminal escaping",
+        domain=DomainType.BACKEND,
+        repo_domain=DomainType.FULLSTACK,
+        domain_source="LLM [/bold]",
+        domain_reason="Reason with [red]unclosed tag and [/bold]",
+        contracts_source="LLM (source with [/bold] markup)",
+        existing_contracts=[
+            DomainContract(category="[CATEGORY]", name="[contract_name]", description="[/desc] with [bold] tag"),
+        ],
+    )
+    # Renders without raising rich.errors.MarkupError
+    render_pre_task_terminal(pre)
+    captured = capsys.readouterr()
+    assert "LLM (source with [/bold] markup)" in captured.out
+
+    # Also test empty contracts branches with markup in contracts_source
+    for cs in [
+        "not extracted ([/bold])",
+        "LLM ([/bold])",
+        "fallback ([/bold])",
+    ]:
+        pre_empty = PreTaskRecord(
+            prompt="Test empty",
+            domain=DomainType.BACKEND,
+            contracts_source=cs,
+            existing_contracts=[],
+        )
+        render_pre_task_terminal(pre_empty)
+
+
+def test_markdown_and_terminal_empty_sources_show_source_unknown(capsys):
+    # Old session with empty contracts_source and empty domain_source
+    pre = PreTaskRecord(
+        prompt="Old session task",
+        domain=DomainType.BACKEND,
+        repo_domain=DomainType.BACKEND,
+        domain_source="",
+        contracts_source="",
+        existing_contracts=[],
+    )
+    md = generate_pre_task_markdown(pre)
+    assert "Technical Domain:** BACKEND (source unknown)" in md
+    assert "contracts: source unknown (session recorded before guard tracked it)" in md
+
+    render_pre_task_terminal(pre)
+    out = capsys.readouterr().out
+    assert "BACKEND (source unknown)" in out
+    assert "contracts: source unknown (session recorded before guard tracked it)" in " ".join(out.split())
+
+    # Mismatched domain with empty domain_source
+    pre_mismatch = PreTaskRecord(
+        prompt="Old session task mismatch",
+        domain=DomainType.FRONTEND,
+        repo_domain=DomainType.BACKEND,
+        domain_source="",
+        contracts_source="",
+        existing_contracts=[],
+    )
+    md_mismatch = generate_pre_task_markdown(pre_mismatch)
+    assert "FRONTEND (task) in a BACKEND repository (source unknown)" in md_mismatch
+
+    render_pre_task_terminal(pre_mismatch)
+    out_mismatch = capsys.readouterr().out
+    assert "FRONTEND (task) in a BACKEND repository (source unknown)" in " ".join(out_mismatch.split())
+
+
+def test_markdown_inert_contract_text_heading_link_newline():
+    # Test finding 3: a description containing `# heading`, `[link](x)` and a newline renders inside backticks on one line
+    desc_with_markdown = "# heading\n[link](x)\nmore prose"
+    pre = PreTaskRecord(
+        prompt="Task with messy LLM output",
+        domain=DomainType.BACKEND,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        domain_reason="# heading in reason\n[link](y)\nsecond line",
+        contracts_source="LLM",
+        existing_contracts=[
+            DomainContract(
+                category="CAT`WITH`BACKTICKS",
+                name="name`with`backticks",
+                description=desc_with_markdown,
+            ),
+        ],
+    )
+    md = generate_pre_task_markdown(pre)
+    # Description renders inside backticks on one line
+    assert "`# heading [link](x) more prose`" in md
+    assert "# heading\n" not in md
+    # Name and category have backticks removed and rendered as inline code
+    assert "`[CATWITHBACKTICKS]` `namewithbackticks`: `# heading [link](x) more prose`" in md
+    # domain_reason also rendered inside backticks on one line
+    assert "BACKEND (`LLM`): `# heading in reason [link](y) second line`" in md
+
+
+def test_terminal_no_double_escape_reason_bracket(capsys):
+    # Test finding 6: a reason containing `[x]` shows `[x]`, not `\[x]`
+    pre = PreTaskRecord(
+        prompt="Task with brackets",
+        domain=DomainType.BACKEND,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        domain_reason="Reason containing [x] in text",
+        contracts_source="LLM",
+        existing_contracts=[],
+    )
+    render_pre_task_terminal(pre)
+    out = capsys.readouterr().out
+    assert "[x]" in out
+    assert r"\[x]" not in out
+

@@ -38,6 +38,7 @@ from guard.core.repo_setup import ensure_repo_setup
 from guard.core.session import BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.domains.detector import detect_build_command, detect_domain, extract_contracts_and_invariants
+from guard.domains.pre_analysis import analyze_task
 from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
 
@@ -186,15 +187,41 @@ def execute_pre_task(
         late_scope = []
         restarts = []
 
-    # 1. Domain comes from the repository itself
-    domain = detect_domain(target_repo)
+    # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
+    if superseded:
+        impact = superseded.pre.impact
+    else:
+        impact = expected_impact(target_repo, candidate_files, []) if candidate_files else None
 
-    # 3. Domain Contracts & Invariants Extraction
+    # 1. Domain & Baseline Contracts Analysis (One combined LLM call with fallback)
+    # A restart keeps the first pre's analysis: the task may have edited the scoped files since
+    if superseded:
+        task_domain = superseded.pre.domain
+        repo_domain = getattr(superseded.pre, "repo_domain", None) or task_domain
+        domain_source = getattr(superseded.pre, "domain_source", "")
+        domain_reason = getattr(superseded.pre, "domain_reason", "")
+        contracts = list(getattr(superseded.pre, "existing_contracts", []))
+        contracts_source = getattr(superseded.pre, "contracts_source", "")
+    else:
+        pre_analysis = analyze_task(
+            repo=target_repo,
+            prompt=prompt,
+            scope=candidate_files,
+            impact=impact,
+            config=config,
+        )
+        task_domain = pre_analysis.task_domain
+        repo_domain = pre_analysis.repo_domain
+        domain_source = pre_analysis.domain_source
+        domain_reason = pre_analysis.reason
+        contracts = pre_analysis.contracts
+        contracts_source = pre_analysis.contracts_source
+    # 3. Domain Contracts & Invariants Extraction (template invariants follow task_domain)
     try:
-        contracts, invariants = extract_contracts_and_invariants(
+        _, invariants = extract_contracts_and_invariants(
             repo_path=target_repo,
             prompt=prompt,
-            domain=domain,
+            domain=task_domain,
             files=candidate_files,
         )
     except InvariantsFileError as e:
@@ -214,11 +241,9 @@ def execute_pre_task(
         # meantime would let the task choose the rules it is judged by
         baseline_status = dict(superseded.pre.baseline_invariant_status)
         invariants = list(superseded.pre.locked_invariants)
-    # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
-    if superseded:
-        impact = superseded.pre.impact
-    else:
-        impact = expected_impact(target_repo, candidate_files, [inv.model_dump() for inv in invariants]) if candidate_files else None
+    elif candidate_files and impact is not None and any(inv.checks for inv in invariants):
+        # the first scan had no invariants to map onto the scoped files; only checked ones add anything
+        impact = expected_impact(target_repo, candidate_files, [inv.model_dump() for inv in invariants])
 
     # 4. Save Session
     # What the agent hook recorded before this pre: the user's own prompt, files changed early
@@ -241,8 +266,12 @@ def execute_pre_task(
         expected_files=candidate_files,
         contracts=contracts,
         invariants=invariants,
-        non_regression_strategy=f"Isolate changes to domain {domain.value.upper()}. Maintain 100% existing baseline contracts.",
-        domain=domain,
+        non_regression_strategy=f"Isolate changes to domain {task_domain.value.upper()}. Maintain 100% existing baseline contracts.",
+        domain=task_domain,
+        repo_domain=repo_domain,
+        domain_source=domain_source,
+        domain_reason=domain_reason,
+        contracts_source=contracts_source,
         baseline_dirty=baseline_dirty,
         baseline_invariant_status=baseline_status,
         base_ref=base_ref,

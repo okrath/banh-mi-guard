@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from guard.core.session import DomainContract, LockedInvariant
+from guard.core.session import LockedInvariant
 from guard.domains.base import BaseDomainAnalyzer
 
 
@@ -54,53 +54,6 @@ class FrontendDomainAnalyzer(BaseDomainAnalyzer):
         except Exception:
             pass
         return f"{pm} test"
-
-    def extract_baseline_contracts(self, repo_path: Path, files: List[str]) -> List[DomainContract]:
-        contracts: List[DomainContract] = []
-        ui_files = [f for f in files if any(f.endswith(ext) for ext in [".tsx", ".jsx", ".vue", ".svelte", ".html", ".css"])]
-
-        for rel_path in ui_files[:5]:
-            p = repo_path / rel_path
-            if not p.is_file():
-                continue
-            try:
-                code = p.read_text(encoding="utf-8", errors="ignore")[:4000]
-
-                # Check for loading states
-                if re.search(r"\b(isLoading|loading|spinner|skeleton)\b", code):
-                    contracts.append(DomainContract(
-                        category="UI_STATE",
-                        name=f"{Path(rel_path).stem}_loading_state",
-                        description=f"Preserve loading/skeleton visual feedback in {rel_path}",
-                    ))
-
-                # Check for disabled button states
-                if re.search(r"disabled\s*=\s*\{|disabled\s*:", code):
-                    contracts.append(DomainContract(
-                        category="UI_STATE",
-                        name=f"{Path(rel_path).stem}_disabled_behavior",
-                        description=f"Preserve button disabled state during form submission in {rel_path}",
-                    ))
-
-                # Check for keyboard escape / modal dismissal
-                if re.search(r"""(keydown|Escape|onClose|dismiss|backdrop)""", code):
-                    contracts.append(DomainContract(
-                        category="UX_INTERACTION",
-                        name=f"{Path(rel_path).stem}_dismiss_interaction",
-                        description=f"Preserve modal backdrop click & Escape key dismissal in {rel_path}",
-                    ))
-
-                # Check for responsive mobile classes
-                if re.search(r"\b(sm:|md:|lg:|xl:|@media|mobile)\b", code):
-                    contracts.append(DomainContract(
-                        category="UX_RESPONSIVE",
-                        name=f"{Path(rel_path).stem}_responsive_layout",
-                        description=f"Maintain responsive mobile/desktop viewport layout in {rel_path}",
-                    ))
-            except Exception:
-                pass
-
-        return contracts
 
     def generate_recommended_invariants(self, prompt: str, files: List[str]) -> List[LockedInvariant]:
         return [

@@ -61,6 +61,11 @@ def inert(text: str) -> str:
     return f"`{flat}`" if flat else "*(empty)*"
 
 
+def _clean_inert(text: str) -> str:
+    """Remove backticks and replace newlines with spaces so LLM output remains inert inline code."""
+    return str(text).replace("`", "").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
 def ocr_findings(post: PostTaskRecord) -> list:
     return [v for v in post.rule_violations if v.rule_id.startswith("OCR-")]
 
@@ -88,6 +93,20 @@ def impact_lines(impact: ImpactRange) -> list:
     return lines
 
 
+def _format_domain_description(pre: PreTaskRecord) -> str:
+    task_str = pre.domain.value.upper()
+    repo_dom = pre.repo_domain or pre.domain
+    repo_str = repo_dom.value.upper()
+    source_str = f" (`{_clean_inert(pre.domain_source)}`)" if pre.domain_source else " (source unknown)"
+    if repo_str != task_str:
+        base = f"{task_str} (task) in a {repo_str} repository{source_str}"
+    else:
+        base = f"{task_str}{source_str}"
+    if getattr(pre, "domain_reason", ""):
+        return f"{base}: `{_clean_inert(pre.domain_reason)}`"
+    return base
+
+
 def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     """
     Generate standard Pre-Task Impact Note.
@@ -95,16 +114,25 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     md = []
     md.append("### 🔍 PRE-TASK IMPACT NOTE:\n")
     md.append(f"* **Task Request:** {pre.prompt}")
-    md.append(f"* **Technical Domain:** {pre.domain.value.upper()} (detected from repository)")
+    md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
     
     # Baseline
     md.append("\n* **Current Baseline Contracts:**")
     if pre.existing_contracts:
+        if pre.contracts_source:
+            md.append(f"  - Source: `{_clean_inert(pre.contracts_source)}`")
+        else:
+            md.append("  - Source: source unknown (session recorded before guard tracked it)")
         for c in pre.existing_contracts:
-            md.append(f"  - `[{c.category}]` **{c.name}**: {c.description}")
+            md.append(f"  - `[{_clean_inert(c.category)}]` `{_clean_inert(c.name)}`: `{_clean_inert(c.description)}`")
+    elif not pre.contracts_source:
+        md.append("  - contracts: source unknown (session recorded before guard tracked it)")
+    elif pre.contracts_source.startswith("not extracted"):
+        md.append(f"  - contracts: `{_clean_inert(pre.contracts_source)}`")
+    elif pre.contracts_source.startswith("LLM"):
+        md.append(f"  - none found (`{_clean_inert(pre.contracts_source)}`)")
     else:
-        md.append("  - No contract hints in the scanned files (up to 5 scoped files; keywords depend on the detected domain, e.g. routes, auth and transactions for a backend, UI states for a frontend, ports, volumes and secrets for infra, permissions and offline storage for mobile).")
-
+        md.append(f"  - contracts: not extracted (`{_clean_inert(pre.contracts_source)}`)")
     # Expected Impact Range
     md.append("\n* **Expected Impact Range (Target Files):**")
     if pre.expected_files:

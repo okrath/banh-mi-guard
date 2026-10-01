@@ -100,3 +100,29 @@ def test_session_parent_walk_up(tmp_path):
     assert discovered.pre.prompt == "Workspace task across sub-repos"
 
     ws_mgr.clear()
+
+
+def test_session_records_repo_domain_and_sources(temp_repo):
+    mgr = SessionManager(temp_repo)
+    session = mgr.start_pre_session(
+        prompt="Configure docker for backend",
+        domain=DomainType.INFRA,
+        repo_domain=DomainType.BACKEND,
+        domain_source="LLM",
+        domain_reason="Scoped Dockerfile configures container infra.",
+        contracts_source="LLM",
+        expected_files=["Dockerfile"],
+        contracts=[],
+        invariants=[],
+    )
+    assert session.pre.domain == DomainType.INFRA
+    assert session.pre.repo_domain == DomainType.BACKEND
+    assert session.pre.domain_source == "LLM"
+    assert session.pre.domain_reason == "Scoped Dockerfile configures container infra."
+    assert session.pre.contracts_source == "LLM"
+    reloaded = mgr.load_session()
+    assert reloaded.pre.domain == DomainType.INFRA
+    assert reloaded.pre.repo_domain == DomainType.BACKEND
+    assert reloaded.pre.domain_source == "LLM"
+    assert reloaded.pre.domain_reason == "Scoped Dockerfile configures container infra."
+    assert reloaded.pre.contracts_source == "LLM"
