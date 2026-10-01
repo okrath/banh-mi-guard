@@ -223,7 +223,7 @@
     </div>
     <p>
       <strong>Dual-Gate Impact Analysis & Regression Guard for AI-Assisted Development.</strong><br>
-      A zero-token, high-velocity safety harness wrapping AI coding agents (Claude Code, Cursor, Windsurf, Aider, omp) to prevent regressions, security leaks, memory leaks, and breaking changes.
+      A safety harness around AI coding agents (Claude Code, Cursor, Windsurf, Aider, omp): scope and diff checks, static rules and project invariants at no token cost, then an LLM review, before a change is accepted.
     </p>
 
     <section id="overview">
@@ -248,7 +248,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. PRE-TASK PHASE: `guard pre "&lt;prompt&gt;"`                   │
 │ • Scope declaration &amp; repository domain detection           │
-│ • Domain Contract Extractor (FE / BE / Infra / MB)          │
+│ • Contract hints (keyword scan of up to 5 scoped files)     │
 │ • Lock Invariant Rules (Must NOT be broken)                 │
 │ ➔ Emits: "### 🔍 PRE-TASK IMPACT NOTE"                      │
 └─────────────────────────────────────────────────────────────┘
@@ -258,7 +258,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
 │ • Diff Inspector (0-cost): Diff audit &amp; blast radius check  │
-│ • Static Rulebook: Detect Secrets, SQLi, Memory Leaks, NPE  │
+│ • Static rules: secrets, injection, listeners, infra, UX    │
 │ • Alibaba OCR (LLM, --full): Reviews the task's changes     │
 │ • Project Health Check: Automated compile &amp; test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
@@ -270,7 +270,7 @@
 │ 3. FINAL SAFETY GATE: YOUR CONFIGURED LLM                   │
 │ (Claude / GPT / DeepSeek / Ollama / OpenAI-compatible)      │
 │ • Reviews the report, verified evidence & batched diff      │
-│ • Technical Audit (Architecture, Memory Leaks, Scope)       │
+│ • Technical Audit (architecture, memory, nulls, scope)      │
 │ • Cross-Platform UX/UI &amp; Ergonomics Assessment              │
 │ • Verdict: [APPROVED] or [REVISE] with Actionable Remediation│
 └─────────────────────────────────────────────────────────────┘</code></pre>
@@ -357,7 +357,7 @@ guard review --focus simplicity
 
 # Scrutinize dead code, zombie blocks & orphan files:
 guard review --focus dead-code
-# Scrutinize memory leaks (listeners, unclosed handles):
+# Ask the LLM review to look at memory handling (listeners, unclosed handles):
 guard review --focus memory
 
 # Scrutinize security vulnerabilities (SQLi, XSS, secrets):

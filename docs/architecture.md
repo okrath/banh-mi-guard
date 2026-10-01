@@ -2,7 +2,7 @@
 
 > 📦 **GitHub Repository:** [github.com/okrath/banh-mi-guard](https://github.com/okrath/banh-mi-guard) &bull; 👤 **Author:** [@okrath](https://github.com/okrath) &bull; 📖 **Live Documentation:** [okrath.github.io/banh-mi-guard](https://okrath.github.io/banh-mi-guard/)
 
-`banh-mi-guard` implements a **Dual-Gate Agentic Architecture** (the Sandwich Pattern) designed to eliminate silent regressions, security violations, and memory leaks when using AI Coding Agents.
+`banh-mi-guard` implements a **Dual-Gate Agentic Architecture** (the Sandwich Pattern) that checks changes made with AI coding agents for regressions, scope violations and the security patterns its rules know.
 
 ---
 
@@ -18,7 +18,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
 | **Alibaba Open Code Review (OCR)** | An LLM review agent that reads the repository (tool calls) | Minutes, no time limit | OCR's own LLM (not guard's) | Optional full review (`guard post --full`, or every post with `guard config ocr always`). A high or critical finding, or OCR not running, blocks. Unchanged files reuse their cached findings. |
 | **Agent Hooks** | The agent's own hook system calling `guard agent-event` | <1s per event | **0 tokens ($0.00)** | Enforces the flow where the agent can refuse: an edit before `guard pre` or outside the scope, a stop with unapproved edits, a commit without an approval. Adapters are data (events, payload fields, answers); the gate logic is guard's alone. |
 | **Hygiene Engine** | AST & Reference Reachability Scanner | <50ms (Diff) / <2s (Full) | **0 tokens ($0.00)** | Two-tier dead code detection: catches orphan/draft files (DEAD-001), commented-out code blocks (DEAD-002), and AST unreferenced symbols/imports (DEAD-003). |
-| **Simplicity Engine** | KISS/YAGNI & Dependency Bloat Scanner | <30ms (Diff) / <2s (Full) | **0 tokens ($0.00)** | Enforces the Ponytail Necessity Ladder: catches redundant packages (LAZY-001), premature abstractions (LAZY-002) and wheel reinventions (LAZY-003). Net LOC is reported, never scored. |
+| **Simplicity Engine** | KISS/YAGNI & Dependency Bloat Scanner | <30ms (Diff) / <2s (Full) | **0 tokens ($0.00)** | Checks the necessity ladder: catches redundant packages (LAZY-001), premature abstractions (LAZY-002) and wheel reinventions (LAZY-003). Net LOC is reported, never scored. |
 | **Project Invariants** | Regex checks from `guard.invariants.json` | <100ms | **0 tokens ($0.00)** | Project rules evaluated on the current files at pre (baseline) and post. Rules without checks are `UNVERIFIED`; removing or relaxing a rule raises `INV-WEAKENED`. |
 | **Removal Reference Check** | Whole-repository search | <1s | **0 tokens ($0.00)** | Removed string keys, exports and CSS classes that are still referenced raise `DEAD-REF`; the summary is passed to the LLM as verified evidence. |
 | **Your Configured LLM** | An API (Claude, GPT, DeepSeek, Ollama) or your own agent CLI (`claude`, `codex`) | No time limit (it ends when the LLM answers or fails) | User standard pricing, or your subscription | **Final Safety Gatekeeper**, consulted when no hard block applies. Large diffs are reviewed in parts (one REVISE rejects the whole diff); deleted files are sent as a one-line note. It may propose new invariants, which guard writes to the local `.guard/invariants.json` only after they pass on the current code. If the LLM does not answer, the report says "Heuristic Gate" and records why. |
@@ -34,7 +34,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. PRE-TASK PHASE: `guard pre "<prompt>"`                   │
 │ • Scope declaration & repository domain detection           │
-│ • Domain Contract Extractor (FE / BE / Infra / MB)          │
+│ • Contract hints (keyword scan of up to 5 scoped files)     │
 │ • Lock Invariant Rules (Must NOT be broken)                 │
 │ ➔ Emits: "### 🔍 PRE-TASK IMPACT NOTE"                      │
 └─────────────────────────────────────────────────────────────┘
@@ -44,7 +44,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
 │ • OCR Inspector (0-cost): Diff audit & blast radius check   │
-│ • Static Rulebook: Detect Secrets, SQLi, Memory Leaks, NPE  │
+│ • Static rules: secrets, injection, listeners, infra, UX    │
 │ • Hygiene Engine: Orphan files, commented code, dead symbols│
 │ • Project Health Check: Automated compile & test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
@@ -56,7 +56,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
 │ 3. FINAL SAFETY GATE: YOUR CONFIGURED LLM                   │
 │ (Claude / GPT / DeepSeek / Ollama / OpenAI-compatible)      │
 │ • Reviews the report, verified evidence & batched diff      │
-│ • Technical Audit (Architecture, Memory Leaks, Scope)       │
+│ • Technical Audit (architecture, memory, nulls, scope)      │
 │ • Cross-Platform UX/UI & Ergonomics Assessment              │
 │ • Verdict: [APPROVED] or [REVISE] with Actionable Remediation│
 └─────────────────────────────────────────────────────────────┘
