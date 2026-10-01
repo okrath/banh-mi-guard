@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from guard.core.session import DomainContract, LockedInvariant
+from guard.core.session import LockedInvariant
 from guard.domains.base import BaseDomainAnalyzer
 
 
@@ -40,46 +40,6 @@ class InfraDomainAnalyzer(BaseDomainAnalyzer):
         if (repo_path / "Dockerfile").exists():
             return "docker build -t guard-temp-check . -f Dockerfile"
         return None
-
-    def extract_baseline_contracts(self, repo_path: Path, files: List[str]) -> List[DomainContract]:
-        contracts: List[DomainContract] = []
-        infra_files = [f for f in files if any(f.endswith(ext) or "/" in f for ext in [".tf", ".yml", ".yaml", "Dockerfile", ".conf"])]
-
-        for rel_path in infra_files[:5]:
-            p = repo_path / rel_path
-            if not p.is_file():
-                continue
-            try:
-                code = p.read_text(encoding="utf-8", errors="ignore")[:4000]
-
-                # Check for exposed ports
-                ports = re.findall(r"""\b(EXPOSE|ports:|targetPort:)\s*(\d+)""", code)
-                for prefix, port in ports:
-                    contracts.append(DomainContract(
-                        category="INFRA_PORT",
-                        name=f"Port_{port}_binding",
-                        description=f"Preserve standard port binding {port} in {rel_path}",
-                    ))
-
-                # Check for volume persistence
-                if re.search(r"\b(volumes:|mountPath:|volumeMounts)\b", code):
-                    contracts.append(DomainContract(
-                        category="DATA_PERSISTENCE",
-                        name=f"{Path(rel_path).stem}_volume_mount",
-                        description=f"Preserve persistent storage volume mounts in {rel_path}",
-                    ))
-
-                # Check for environment / secret references
-                if re.search(r"\b(secretKeyRef|valueFrom|env_file|secrets:)\b", code):
-                    contracts.append(DomainContract(
-                        category="SECRET_HYGIENE",
-                        name=f"{Path(rel_path).stem}_secret_binding",
-                        description=f"Preserve external secret resolution without hardcoding values in {rel_path}",
-                    ))
-            except Exception:
-                pass
-
-        return contracts
 
     def generate_recommended_invariants(self, prompt: str, files: List[str]) -> List[LockedInvariant]:
         return [

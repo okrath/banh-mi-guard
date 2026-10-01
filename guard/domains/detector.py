@@ -207,7 +207,7 @@ def extract_contracts_and_invariants(
     templates, which cannot know what this repository actually needs to preserve.
     """
     analyzer = get_analyzer_by_domain(domain)
-    contracts = analyzer.extract_baseline_contracts(repo_path, files)
+    contracts: List[DomainContract] = []
     project_items = load_project_invariants(repo_path)
     if project_items:  # an empty file (e.g. just created by setup) keeps the domain templates
         invariants = [

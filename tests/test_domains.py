@@ -59,32 +59,6 @@ def test_detect_mobile_flutter_repo(tmp_path):
     assert cmd == "flutter analyze"
 
 
-def test_extract_fe_contracts(tmp_path):
-    repo = tmp_path / "fe_extract"
-    repo.mkdir()
-    component = repo / "Modal.tsx"
-    component.write_text("""
-    export function Modal({ isOpen, onClose }) {
-      const [isLoading, setIsLoading] = useState(false);
-      return (
-        <div className="backdrop sm:p-4" onClick={onClose}>
-          <button disabled={isLoading}>Submit</button>
-        </div>
-      );
-    }
-    """, encoding="utf-8")
-
-    analyzer = FrontendDomainAnalyzer()
-    contracts = analyzer.extract_baseline_contracts(repo, ["Modal.tsx"])
-
-    names = [c.name for c in contracts]
-    categories = [c.category for c in contracts]
-    assert any("loading_state" in n for n in names)
-    assert any("disabled_behavior" in n for n in names)
-    assert any("dismiss_interaction" in n for n in names)
-    assert "UX_RESPONSIVE" in categories
-
-
 def test_extract_contracts_and_invariants_bridge(tmp_path):
     repo = tmp_path / "be_extract"
     repo.mkdir()
@@ -104,7 +78,7 @@ def test_extract_contracts_and_invariants_bridge(tmp_path):
 
     assert len(invariants) >= 3
     assert any("BE-INV-01" == inv.id for inv in invariants)
-    assert any("POST_/api/v1/orders" in c.name for c in contracts)
+    assert contracts == []
 
 
 def _write(repo, rel, text):

@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Optional
 
-from guard.core.session import DomainContract, LockedInvariant
+from guard.core.session import LockedInvariant
 
 
 class BaseDomainAnalyzer(ABC):
@@ -27,11 +27,6 @@ class BaseDomainAnalyzer(ABC):
     @abstractmethod
     def get_default_build_command(self, repo_path: Path) -> Optional[str]:
         """Returns deterministic build/validation command (e.g. 'npm run build')."""
-        pass
-
-    @abstractmethod
-    def extract_baseline_contracts(self, repo_path: Path, files: List[str]) -> List[DomainContract]:
-        """Extract existing invariants/contracts from relevant files."""
         pass
 
     @abstractmethod

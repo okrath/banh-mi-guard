@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from guard.core.session import DomainContract, LockedInvariant
+from guard.core.session import LockedInvariant
 from guard.domains.base import BaseDomainAnalyzer
 
 
@@ -38,46 +38,6 @@ class MobileDomainAnalyzer(BaseDomainAnalyzer):
         if (repo_path / "package.json").exists() and (repo_path / "ios").exists():
             return "npm run lint"
         return None
-
-    def extract_baseline_contracts(self, repo_path: Path, files: List[str]) -> List[DomainContract]:
-        contracts: List[DomainContract] = []
-        mb_files = [f for f in files if any(f.endswith(ext) or "/" in f for ext in [".dart", ".swift", ".kt", "AndroidManifest.xml", "Info.plist"])]
-
-        for rel_path in mb_files[:5]:
-            p = repo_path / rel_path
-            if not p.is_file():
-                continue
-            try:
-                code = p.read_text(encoding="utf-8", errors="ignore")[:4000]
-
-                # Check for runtime permissions
-                perms = re.findall(r"""(uses-permission|permission|NSCameraUsageDescription|NSLocationWhenInUseUsageDescription)""", code)
-                if perms:
-                    contracts.append(DomainContract(
-                        category="NATIVE_PERMISSION",
-                        name=f"{Path(rel_path).stem}_permissions",
-                        description=f"Preserve explicit user permission requests before accessing hardware in {rel_path}",
-                    ))
-
-                # Check for SafeArea / Notch padding
-                if re.search(r"\b(SafeArea|safeAreaInsets|useSafeAreaInsets)\b", code):
-                    contracts.append(DomainContract(
-                        category="UI_SAFE_AREA",
-                        name=f"{Path(rel_path).stem}_safe_area",
-                        description=f"Preserve SafeArea wrapping for notch & home indicator in {rel_path}",
-                    ))
-
-                # Check for Offline / Local caching
-                if re.search(r"\b(shared_preferences|AsyncStorage|Hive|Isar|Room|CoreData|sqflite)\b", code):
-                    contracts.append(DomainContract(
-                        category="OFFLINE_STORAGE",
-                        name=f"{Path(rel_path).stem}_offline_cache",
-                        description=f"Preserve offline cache fallback when network disconnects in {rel_path}",
-                    ))
-            except Exception:
-                pass
-
-        return contracts
 
     def generate_recommended_invariants(self, prompt: str, files: List[str]) -> List[LockedInvariant]:
         return [

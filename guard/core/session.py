@@ -51,6 +51,10 @@ class PreTaskRecord(BaseModel):
     prompt: str
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     domain: DomainType
+    repo_domain: Optional[DomainType] = None
+    domain_source: str = ""
+    domain_reason: str = ""
+    contracts_source: str = ""
     expected_files: List[str] = Field(default_factory=list)
     existing_contracts: List[DomainContract] = Field(default_factory=list)
     locked_invariants: List[LockedInvariant] = Field(default_factory=list)
@@ -220,6 +224,10 @@ class SessionManager:
         invariants: List[LockedInvariant],
         non_regression_strategy: str = "",
         domain: Optional[DomainType] = None,
+        repo_domain: Optional[DomainType] = None,
+        domain_source: str = "",
+        domain_reason: str = "",
+        contracts_source: str = "",
         baseline_dirty: Optional[Dict[str, str]] = None,
         baseline_invariant_status: Optional[Dict[str, str]] = None,
         base_ref: Optional[str] = None,
@@ -241,6 +249,10 @@ class SessionManager:
         pre_rec = PreTaskRecord(
             prompt=prompt,
             domain=domain or DomainType.BACKEND,
+            repo_domain=repo_domain,
+            domain_source=domain_source,
+            domain_reason=domain_reason,
+            contracts_source=contracts_source,
             baseline_dirty=baseline_dirty or {},
             baseline_invariant_status=baseline_invariant_status or {},
             base_ref=base_ref,
