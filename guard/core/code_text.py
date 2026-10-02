@@ -12,7 +12,26 @@ PY = (".py",)
 
 JS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
 
-CODE = PY + JS + (".go", ".rb", ".php", ".java", ".kt", ".cs", ".rs", ".swift", ".dart")
+GO = (".go",)
+
+RB = (".rb",)
+ERB = (".erb",)
+
+PHP = (".php",)
+
+JAVA = (".java",)
+
+KT = (".kt",)
+
+CS = (".cs",)
+
+RS = (".rs",)
+
+SWIFT = (".swift",)
+
+DART = (".dart",)
+
+CODE = PY + JS + GO + RB + PHP + JAVA + KT + CS + RS + SWIFT + DART
 
 YAML = (".yaml", ".yml")
 
@@ -85,6 +104,8 @@ def _hash_comments(path_lower: str) -> bool:
 
 def _block_comments(path_lower: str) -> tuple:
     """Block comment pairs (opening, closing) allowed in the file type."""
+    if path_lower.endswith(RB):
+        return ()
     if _hash_comments(path_lower):
         return ()
     if path_lower.endswith((".html", ".htm", ".xml", ".svg")):
@@ -100,6 +121,17 @@ def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[
     The line without the part inside a block comment an earlier line left open (None when all of it
     is), noting in `open_comments` whether this line leaves one open for the next.
     """
+    if path_lower.endswith(RB):
+        in_rb_block = open_comments.pop(path_lower, None)
+        if in_rb_block:
+            if code.startswith("=end") and (len(code) == 4 or code[4].isspace()):
+                return None
+            open_comments[path_lower] = "=end"
+            return None
+        if code.startswith("=begin") and (len(code) == 6 or code[6].isspace()):
+            open_comments[path_lower] = "=end"
+            return None
+        return code
     blocks = _block_comments(path_lower)
     closing = open_comments.pop(path_lower, None)
     if closing:
@@ -113,6 +145,119 @@ def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[
         if cut >= 0 and code.startswith(opening, cut):
             open_comments[path_lower] = closer
     return code
+
+
+_HEREDOC = re.compile(r"<<[-~]?(['\"`]?)([A-Za-z_]\w*)\1")
+
+def _carry_string(open_strings: dict, path_lower: str, code: str, open_comments: Optional[dict] = None) -> int:
+    """
+    Tracks multi-line string or heredoc state across lines for PHP and Ruby.
+    Returns the string_cutoff index: code[:string_cutoff] is string text (where SEC-005 backticks
+    must not fire). Updates open_strings with the quote or heredoc left open for the next line.
+    """
+    is_rb = path_lower.endswith(RB)
+    is_php = path_lower.endswith(PHP)
+    if not (is_rb or is_php):
+        return 0
+
+    current = open_strings.pop(path_lower, None)
+
+    if isinstance(current, tuple) and current[0] == "HEREDOC":
+        heredoc_id = current[1]
+        if code.strip() == heredoc_id:
+            return len(code)
+        open_strings[path_lower] = current
+        return len(code)
+
+    start_idx = 0
+    if current in ('"', "'"):
+        q = current
+        escaped = False
+        close_idx = -1
+        for i in range(len(code)):
+            ch = code[i]
+            if ch == q and not escaped:
+                close_idx = i
+                break
+            escaped = (ch == "\\") and not escaped
+
+        if close_idx < 0:
+            open_strings[path_lower] = q
+            return len(code)
+
+        start_idx = close_idx + 1
+
+    clean_code = " " * start_idx + code[start_idx:]
+    open_comment = open_comments.get(path_lower) if isinstance(open_comments, dict) else open_comments
+    if open_comment:
+        end = clean_code.find(open_comment, start_idx)
+        if end < 0:
+            return start_idx
+        clean_code = " " * (end + len(open_comment)) + clean_code[end + len(open_comment):]
+
+    blocks = _block_comments(path_lower)
+    is_hash = _hash_comments(path_lower)
+    spans = []
+    cut = _comment_start(clean_code, is_hash, spans, blocks)
+    if is_php:
+        spans_hash = []
+        cut_hash = _comment_start(clean_code, True, spans_hash, blocks)
+        if cut < 0 or (0 <= cut_hash < cut):
+            cut = cut_hash
+            spans = spans_hash
+
+    body = clean_code[:cut] if cut >= 0 else clean_code
+    s = list(body)
+    for a, b in spans:
+        s[a:b] = " " * (b - a)
+    clean_code = "".join(s)
+
+    k = start_idx
+    n = len(clean_code)
+    heredoc_id = None
+    while k < n:
+        if is_rb and clean_code[k:k + 2] == "<<":
+            m = _HEREDOC.match(clean_code[k:])
+            if m:
+                heredoc_id = m.group(2)
+                k += m.end()
+                continue
+
+        ch = clean_code[k]
+        if ch in ('"', "'"):
+            q = ch
+            k += 1
+            escaped = False
+            closed = False
+            while k < n:
+                if clean_code[k] == q and not escaped:
+                    closed = True
+                    k += 1
+                    break
+                escaped = (clean_code[k] == "\\") and not escaped
+                k += 1
+            if not closed:
+                open_strings[path_lower] = q
+                return start_idx
+            continue
+
+        if ch == "`":
+            k += 1
+            escaped = False
+            while k < n:
+                if clean_code[k] == "`" and not escaped:
+                    k += 1
+                    break
+                escaped = (clean_code[k] == "\\") and not escaped
+                k += 1
+            continue
+
+        k += 1
+
+    if heredoc_id:
+        open_strings[path_lower] = ("HEREDOC", heredoc_id)
+
+    return start_idx
 
 def _tag_end(tag: str) -> int:
     """Where a tag closes: its first `>` outside `{...}` and quotes that is not part of `=>`; -1 when it goes on."""
