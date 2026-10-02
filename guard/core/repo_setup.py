@@ -39,6 +39,52 @@ if command -v guard >/dev/null 2>&1; then
 fi
 {HOOK_BLOCK_END}
 """
+# What guard <= 0.10 (laya-ocr-guard) wrote: recognised wherever a guard file is, so an upgrade
+# cleans it up instead of treating it as the user's own
+LEGACY_MARKER = "LAYA-OCR-GUARD"
+LEGACY_COMMENT = "Laya-OCR-Guard"
+LEGACY_DIRECTIVE_START = DIRECTIVE_START.replace("BANH-MI-GUARD", LEGACY_MARKER)
+LEGACY_DIRECTIVE_END = DIRECTIVE_END.replace("BANH-MI-GUARD", LEGACY_MARKER)
+LEGACY_HOOK_BLOCK_START = HOOK_BLOCK_START.replace("BANH-MI-GUARD", LEGACY_MARKER)
+LEGACY_HOOK_BLOCK_END = HOOK_BLOCK_END.replace("BANH-MI-GUARD", LEGACY_MARKER)
+LEGACY_MANUAL_HOOK_LINE = MANUAL_HOOK_LINE.replace("BANH-MI-GUARD", LEGACY_MARKER)
+# The first lines of the files guard 0.1.0 generated whole (hooks, the agent wrapper)
+LEGACY_WHOLE_FILES = ("# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---", "# --- LAYA-OCR-GUARD COMMIT MSG HOOK ---",
+                      "# --- LAYA-OCR-GUARD AGENT HARNESS ---")
+GUARD_MARKERS = ("BANH-MI-GUARD", LEGACY_MARKER, LEGACY_COMMENT)
+
+
+def mentions_guard(text: str) -> bool:
+    """A file guard wrote or refers to, by any guard version."""
+    return any(m in text for m in GUARD_MARKERS)
+
+
+def is_legacy_whole_file(text: str) -> bool:
+    """A file guard <= 0.10 generated whole: its marker is in the first two lines (shebang, marker)."""
+    return any(line.strip() in LEGACY_WHOLE_FILES for line in text.splitlines()[:2])
+
+
+def has_legacy(text: str) -> bool:
+    """Text guard <= 0.10 wrote: a whole file, its hook block, its manual line or its directive markers
+    (a plain mention is not enough: the current global hooks name the old marker to skip it)."""
+    return is_legacy_whole_file(text) or any(m in text for m in (
+        LEGACY_HOOK_BLOCK_START, LEGACY_MANUAL_HOOK_LINE, LEGACY_DIRECTIVE_START))
+
+
+def strip_legacy_parts(text: str) -> str:
+    """A user's hook without the guard block and manual line guard <= 0.10 put into it."""
+    text = re.sub(re.escape(LEGACY_HOOK_BLOCK_START) + r".*?" + re.escape(LEGACY_HOOK_BLOCK_END) + r"\n?",
+                  "", text, flags=re.DOTALL)
+    return "".join(line for line in text.splitlines(keepends=True) if line.strip() != LEGACY_MANUAL_HOOK_LINE)
+
+
+def replace_legacy_parts(text: str) -> str:
+    """The guard block and the manual line of guard <= 0.10 inside a user's hook, in their current form."""
+    text = re.sub(re.escape(LEGACY_HOOK_BLOCK_START) + r".*?" + re.escape(LEGACY_HOOK_BLOCK_END) + r"\n?",
+                  lambda _m: HOOK_BLOCK, text, flags=re.DOTALL)
+    return text.replace(LEGACY_MANUAL_HOOK_LINE, MANUAL_HOOK_LINE)
+
+
 AGENT_DOC_NAMES = ("CLAUDE.md", "AGENT.md", "AGENTS.md", "GEMINI.md")
 GLOBAL_AGENT_DOCS = (
     Path(".claude") / "CLAUDE.md",
@@ -133,23 +179,116 @@ def _ensure_hook_block(hook: Path) -> Optional[str]:
     if not hook.exists():
         _write_exec(hook, GIT_PRE_COMMIT_HOOK)
         return f"created guard pre-commit hook {hook}"
-    text = hook.read_text(encoding="utf-8", errors="ignore")
+    original = text = hook.read_text(encoding="utf-8", errors="ignore")
+    if is_legacy_whole_file(text):
+        copy = _backup_legacy(hook, text)
+        _write_exec(hook, GIT_PRE_COMMIT_HOOK)
+        return f"replaced the old laya-ocr-guard hook {hook} (copy in {copy})"
+    if LEGACY_MARKER in text:
+        text = replace_legacy_parts(text)  # guard <= 0.10's own block or line, in its current form
     if HOOK_BLOCK_START in text and HOOK_BLOCK_END in text:
         new = re.sub(re.escape(HOOK_BLOCK_START) + r".*?" + re.escape(HOOK_BLOCK_END) + r"\n?",
                      lambda _m: HOOK_BLOCK, text, flags=re.DOTALL)
     elif "BANH-MI-GUARD AUTO-GENERATED HOOK" in text:
         new = GIT_PRE_COMMIT_HOOK  # a whole file guard generated earlier
     elif "BANH-MI-GUARD" in text:
-        return None  # guard is referenced in some other form; leave the author's file alone
+        if text == original:
+            return None  # guard is referenced in some other form; leave the author's file alone
+        new = text  # only guard's own old manual line changed
     else:
         # Insert right after the shebang so a trailing `exit 0` in the existing hook cannot skip it
         lines = text.splitlines(keepends=True)
         at = 1 if lines and lines[0].startswith("#!") else 0
         new = "".join(lines[:at]) + HOOK_BLOCK + "".join(lines[at:])
-    if new == text:
+    if new == original:
         return None
     _write_exec(hook, new)
     return f"updated guard block in {hook}"
+
+
+def legacy_backup_path(path: Path) -> Path:
+    """`<name>.laya.bak`, or `<name>.laya.2.bak`, ... when it is taken: a copy is never overwritten."""
+    backup, n = path.with_name(f"{path.name}.laya.bak"), 2
+    while backup.exists():
+        backup, n = path.with_name(f"{path.name}.laya.{n}.bak"), n + 1
+    return backup
+
+
+def _backup_legacy(path: Path, text: str) -> str:
+    """Never chained by the hooks: only a copy for the user, made before the file is replaced or removed.
+    Returns the copy's file name."""
+    backup = legacy_backup_path(path)
+    backup.write_text(text, encoding="utf-8", newline="\n")
+    return backup.name
+
+
+def legacy_directive_to_current(text: str) -> str:
+    """A guard <= 0.10 directive block, both markers present, with the current markers."""
+    if LEGACY_DIRECTIVE_START in text and LEGACY_DIRECTIVE_END in text.split(LEGACY_DIRECTIVE_START, 1)[1]:
+        return text.replace(LEGACY_DIRECTIVE_START, DIRECTIVE_START, 1).replace(LEGACY_DIRECTIVE_END, DIRECTIVE_END, 1)
+    return text
+
+
+def strip_guard_parts(text: str) -> str:
+    """A user's hook without every guard block and manual line in it, current or from guard <= 0.10."""
+    text = re.sub(re.escape(HOOK_BLOCK_START) + r".*?" + re.escape(HOOK_BLOCK_END) + r"\n?", "", strip_legacy_parts(text),
+                  flags=re.DOTALL)
+    return "".join(line for line in text.splitlines(keepends=True) if line.strip() != MANUAL_HOOK_LINE)
+
+
+def clean_legacy(repo: Path) -> List[str]:
+    """
+    What guard <= 0.10 left in this repository's Git directory and in .guard/: its whole-file hooks
+    (removed when the global hooks serve the repository, replaced otherwise, a .laya.bak copy kept),
+    its block in the user's own hook, the 0.1.0 agent wrapper, and its info/exclude comment.
+    """
+    from guard.hooks.templates import GIT_PRE_COMMIT_HOOK, GIT_PREPARE_COMMIT_MSG_HOOK
+    messages: List[str] = []
+    common = _git(repo, "rev-parse", "--git-common-dir")
+    local = ((Path(common) if Path(common).is_absolute() else repo / common) / "hooks") if common else None
+    served_globally = _same(effective_hooks_dir(repo) or Path(), guard_home() / "hooks")
+    for name, template in (("pre-commit", GIT_PRE_COMMIT_HOOK), ("prepare-commit-msg", GIT_PREPARE_COMMIT_MSG_HOOK)):
+        hook = local / name if local else None
+        if hook is None or not hook.is_file():
+            continue
+        text = hook.read_text(encoding="utf-8", errors="ignore")
+        if is_legacy_whole_file(text):
+            copy = _backup_legacy(hook, text)
+            if served_globally:
+                hook.unlink()
+                messages.append(f"removed the old laya-ocr-guard hook {hook} (copy in {copy})")
+            else:
+                _write_exec(hook, template)
+                messages.append(f"replaced the old laya-ocr-guard hook {hook} (copy in {copy})")
+        elif served_globally and strip_legacy_parts(text) != text:
+            # the global hook runs guard itself and chains this hook: guard's old lines go, and no current
+            # guard block is added (a guard marker would make the global hook skip the user's commands)
+            _write_exec(hook, strip_legacy_parts(text))
+            messages.append(f"removed the old laya-ocr-guard lines from {hook}")
+        elif LEGACY_MARKER in text and replace_legacy_parts(text) != text:
+            _write_exec(hook, replace_legacy_parts(text))
+            messages.append(f"updated the old laya-ocr-guard block in {hook}")
+    for name in ("pre-commit", "prepare-commit-msg"):
+        # the global hooks run <hook>.guard.bak: an old installer may have parked guard <= 0.10's hook there
+        chained = local / f"{name}.guard.bak" if local else None
+        if chained is None or not chained.is_file():
+            continue
+        text = chained.read_text(encoding="utf-8", errors="ignore")
+        if is_legacy_whole_file(text):
+            copy = _backup_legacy(local / name, text)
+            chained.unlink()
+            messages.append(f"removed the old laya-ocr-guard hook {chained} (copy in {copy})")
+        elif strip_legacy_parts(text) != text:
+            _write_exec(chained, strip_legacy_parts(text))
+            messages.append(f"removed the old laya-ocr-guard lines from {chained}")
+    wrapper = repo / ".guard" / "bin" / "guard-exec"
+    if wrapper.is_file() and LEGACY_MARKER in wrapper.read_text(encoding="utf-8", errors="ignore"):
+        wrapper.unlink()
+        messages.append(f"removed the old laya-ocr-guard agent wrapper {wrapper}")
+    from guard.core.git_exclude import reword_excluded_comments
+    if reword_excluded_comments(repo, LEGACY_COMMENT, "Banh-Mi-Guard"):
+        messages.append(f"reworded the old laya-ocr-guard comment in {repo}'s info/exclude")
+    return messages
 
 
 def refresh_directive_block(doc: Path) -> Optional[str]:
@@ -159,8 +298,9 @@ def refresh_directive_block(doc: Path) -> Optional[str]:
     if not doc.is_file():
         return None
     text = doc.read_text(encoding="utf-8", errors="ignore")
+    text = legacy_directive_to_current(text)  # a guard <= 0.10 block is refreshed like a current one
     if DIRECTIVE_START not in text or DIRECTIVE_END not in text:
-        if "BANH-MI-GUARD" in text:
+        if mentions_guard(text):
             return (
                 f"WARN {doc}: guard directives without START/END markers were not refreshed. Wrap the guard "
                 f"section in `{DIRECTIVE_START}` ... `{DIRECTIVE_END}` (guard then keeps it current), or delete "
@@ -170,7 +310,7 @@ def refresh_directive_block(doc: Path) -> Optional[str]:
     block = f"{DIRECTIVE_START}\n{AGENT_DIRECTIVES_TEMPLATE.strip()}\n{DIRECTIVE_END}"
     new = re.sub(re.escape(DIRECTIVE_START) + r".*?" + re.escape(DIRECTIVE_END),
                  lambda _m: block, text, count=1, flags=re.DOTALL)
-    if new == text:
+    if new == doc.read_text(encoding="utf-8", errors="ignore"):
         return None
     doc.write_text(new, encoding="utf-8", newline="\n")
     return f"refreshed guard directives in {doc}"
@@ -182,7 +322,7 @@ def refresh_repo(repo: Path) -> List[str]:
     .git (untracked). Hooks kept in the repository tree and agent docs are never edited; the
     setup check reports them instead.
     """
-    messages: List[str] = []
+    messages: List[str] = clean_legacy(repo)
     hooks = effective_hooks_dir(repo)
     if hooks and not _same(hooks, guard_home() / "hooks") and _inside_git_dir(hooks, repo):
         msg = _ensure_hook_block(hooks / "pre-commit")
@@ -282,7 +422,7 @@ def add_directive_block(doc: Path) -> str:
         text = doc.read_text(encoding="utf-8", errors="ignore")
         if DIRECTIVE_START in text and DIRECTIVE_END in text:
             return refresh_directive_block(doc) or f"guard directives already current in {doc}"
-        if "BANH-MI-GUARD" in text:
+        if mentions_guard(text):
             return refresh_directive_block(doc) or f"WARN {doc}: unmarked guard directives"
         backup = doc.with_name(f"{doc.name}.guard.bak")
         if not backup.exists():
@@ -300,6 +440,7 @@ def remove_directive_block(doc: Path) -> Optional[str]:
     if not doc.is_file():
         return None
     text = doc.read_text(encoding="utf-8", errors="ignore")
+    text = legacy_directive_to_current(text)
     if DIRECTIVE_START not in text or DIRECTIVE_END not in text:
         return None
     new = re.sub(r"\n*" + re.escape(DIRECTIVE_START) + r".*?" + re.escape(DIRECTIVE_END) + r"\n?",

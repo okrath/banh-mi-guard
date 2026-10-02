@@ -4,15 +4,17 @@ Hook Script Templates for Git and AI Coding Agents.
 
 # Shared prelude: a global core.hooksPath hides each repository's own hooks, so run them first.
 # --git-common-dir (not --git-dir) so linked worktrees find the main repository's hooks.
-# A repo-local guard hook is skipped (it would run guard twice) but its .guard.bak original is run.
+# A repo-local guard hook is skipped (it would run guard twice) but its .guard.bak original is run;
+# so is one written by guard <= 0.10 (LAYA-OCR-GUARD: an old banner, a second post, a commit trailer).
 _CHAIN_LOCAL_HOOKS = """SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 HOOK_NAME="$(basename "$0")"
 LOCAL_DIR="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/hooks" 2>/dev/null && pwd -P)"
 if [ -n "$LOCAL_DIR" ] && [ "$LOCAL_DIR" != "$SELF_DIR" ] && [ -x "$LOCAL_DIR/$HOOK_NAME" ] \\
-   && ! grep -q "BANH-MI-GUARD" "$LOCAL_DIR/$HOOK_NAME"; then
+   && ! grep -qE "BANH-MI-GUARD|LAYA-OCR-GUARD" "$LOCAL_DIR/$HOOK_NAME"; then
   "$LOCAL_DIR/$HOOK_NAME" "$@" || exit $?
 fi
-if [ -n "$LOCAL_DIR" ] && [ -x "$LOCAL_DIR/$HOOK_NAME.guard.bak" ]; then
+if [ -n "$LOCAL_DIR" ] && [ -x "$LOCAL_DIR/$HOOK_NAME.guard.bak" ] \\
+   && ! grep -q "LAYA-OCR-GUARD AUTO-GENERATED HOOK\\|LAYA-OCR-GUARD COMMIT MSG HOOK" "$LOCAL_DIR/$HOOK_NAME.guard.bak"; then
   "$LOCAL_DIR/$HOOK_NAME.guard.bak" "$@" || exit $?
 fi
 """

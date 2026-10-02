@@ -19,5 +19,5 @@ htmlcov/
 env/
 venv/
 
-# Laya-OCR-Guard sessions
+# guard's local sessions and state
 .guard/

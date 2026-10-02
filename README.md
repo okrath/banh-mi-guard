@@ -250,6 +250,7 @@ Guard tells you what is still missing after an upgrade:
 | Alibaba OCR not on PATH (needed only by `guard post --full`) | `npm install -g @alibaba-group/open-code-review`, then `guard config sync` |
 | Commit messages: not chosen yet | `guard config commit auto` (or `guard config commit ask`) |
 | Old Laya model files left by guard <= 0.10 | delete `~/.guard/models` |
+| Old laya-ocr-guard files (hooks, agent wrapper, exclude comment, directive blocks, the old package) | `guard hook refresh`; for repository files and the package, the change doctor shows |
 
 Markers that let guard refresh a pasted directive section:
 ```markdown
@@ -260,11 +261,10 @@ Markers that let guard refresh a pasted directive section:
 
 **After an upgrade, what guard owns is refreshed for you.** `guard update self` starts the newly installed guard to run `guard hook refresh`, which rewrites the global hooks, guard hooks inside `.git` of recorded repositories and the marked directive block in your global agent docs. If guard was upgraded another way (for example `pipx upgrade`), the first guard command of the new version does the same once. Repository files (agent docs, hooks kept in the tree) are only reported, with the change to make.
 
-**Coming from `laya-ocr-guard` (0.10 or older).** 0.11 renamed the project to `banh-mi-guard` and its markers from `LAYA-OCR-GUARD` to `BANH-MI-GUARD`; old markers are not recognized. To move over:
-1. `pip uninstall laya-ocr-guard` (or `pipx uninstall laya-ocr-guard`), then install `banh-mi-guard` as shown in [Installation](#cross-platform-installation-windows-linux-macos).
-2. Run `guard install` (or `guard install --workspace <dir>`): it rewrites the global hooks and adds the new directive block.
-3. Remove old `LAYA-OCR-GUARD` directive sections from agent docs and old guard hooks from `.git/hooks/pre-commit` of repositories where you installed them per repository.
-4. Delete `~/.guard/models` (the removed Laya model, about 555 MB).
+**Coming from `laya-ocr-guard` (0.10 or older).** The first guard command of the new version cleans up what the old versions left wherever guard may write: their hooks inside `.git` (a copy is kept as `<hook>.laya.bak`, and the global hooks never run them), the `LAYA-OCR-GUARD` block in your global agent docs, the old agent wrapper in `.guard/bin` and the old comment in `.git/info/exclude`; `guard hook refresh` does it again on demand. `guard doctor` lists what is left, with the fix. Three things only you can do:
+1. `pip uninstall laya-ocr-guard` (or `pipx uninstall laya-ocr-guard`): the old package owns the same `guard` command.
+2. Replace `LAYA-OCR-GUARD` directive sections in repository agent docs, and old guard lines in hooks kept in the repository tree; guard never edits repository files.
+3. Delete `~/.guard/models` (the removed Laya model, about 555 MB).
 
 ---
 
