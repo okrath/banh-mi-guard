@@ -178,7 +178,7 @@ def test_guard_accept_is_the_users_and_approves_only_what_was_reviewed(tmp_path,
         import pytest
         # a local patch: monkeypatch.undo() would also undo conftest's HOME / GUARD_HOME isolation
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(cli.typer, "prompt", lambda *a, **k: answer)
+            mp.setattr(review_cmds.Prompt, "ask", lambda *a, **k: answer)
             mp.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
             mp.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
             try:

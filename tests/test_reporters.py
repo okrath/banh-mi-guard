@@ -388,3 +388,104 @@ def test_post_report_shows_the_domain_and_contracts_fixed_at_pre():
     assert "BACKEND (`heuristic (no LLM configured)`)" in md
     assert "  - contracts: `not extracted (no LLM configured)`" in md
     assert "Technical Domain" not in generate_post_task_markdown(PostTaskRecord())
+
+
+def _accept_session():
+    from guard.core.session import GuardSession
+    post = PostTaskRecord(muse_verdict="REVISE", muse_score=5.5, review_mode="llm_deep", ocr_complete=True,
+                          build_check=BuildCheckResult(command="pytest", passed=True, exit_code=0, duration_s=1.0),
+                          timestamp="2026-10-02T04:50:33.473396+00:00")
+    pre = PreTaskRecord(prompt="Scope the SEC-008 exemption to the receiver " * 12, domain=DomainType.BACKEND)
+    ledger = [
+        {"id": "low00001", "severity": "low", "kind": "style", "location": "b.py:1", "status": "open",
+         "blocking": False, "description": "rename x"},
+        {"id": "hig00001", "severity": "high", "kind": "security", "location": "guard/core/detectors/storage/rules.py:344",
+         "status": "open", "blocking": True, "description": "plaintext write [bold red]missed[/bold red]"},
+        {"id": "med00001", "severity": "medium", "kind": "correctness", "location": "a.py:9", "status": "deferred",
+         "blocking": True, "description": "ternary form", "note": "heuristic limit; later version"},
+        {"id": "cri00001", "severity": "critical", "kind": "security", "location": "a.py:2", "status": "open",
+         "blocking": True, "description": "sql built from input"},
+    ]
+    return GuardSession(session_id="guard-1790907479", repo_path=".", pre=pre, post=post,
+                        findings_ledger=ledger, llm_revise_rounds=3, revise_budget=3), ledger
+
+
+def _render(width: int, encoding: str = "utf-8", changed=None) -> str:
+    import io
+
+    from rich.console import Console
+
+    from guard.reporters import terminal as t
+    session, ledger = _accept_session()
+    out = Console(file=io.TextIOWrapper(io.BytesIO(), encoding=encoding), width=width, record=True, legacy_windows=False,
+                  color_system=None)
+    changed = changed or []
+    t.render_accept_header(session, out)
+    t.render_accept_gates(session.post, changed, out)
+    t.render_accept_findings(ledger, out)
+    t.render_accept_choices(t.accept_blocker(session.post, changed), session.revise_budget, out)
+    return out.export_text()
+
+
+def test_accept_screen_header_groups_and_order():
+    text = _render(120)
+    assert "guard-1790907479" in text and "3 of 3 review rounds used" in text
+    assert "REVISE 5.5/10 (LLM Gate)" in text and "2026-10-02 04:50:33 UTC" in text
+    assert "…" in text  # the long task is cut to three lines
+    assert "Build: ✅ passed" in text and "OCR: ✅ passed" in text and "Invariants: - not run" in text
+    blocking, followups = text.index("Blocking (would stop the commit): 2"), text.index("Follow-ups (advisory): 2")
+    assert blocking < text.index("cri00001") < text.index("hig00001") < followups
+    assert followups < text.index("med00001") < text.index("low00001")  # deferred is a follow-up, by severity
+    assert "heuristic limit; later version" in text
+    assert "(a) approve the files exactly as last reviewed" in text and "budget 3 -> 6" in text
+
+
+def test_accept_screen_stacks_findings_below_100_columns_and_greys_out_a():
+    text = _render(80, changed=["src/a.py"])
+    assert "• [cri00001] CRITICAL security · open" in text
+    assert "guard/core/detectors/storage/rules.py:344" in text  # the full path: folded ones could look alike
+    assert "plaintext write [bold red]missed[/bold red]" in text  # LLM text is shown literally
+    assert "Files changed since the review: 1 (src/a.py)" in text
+    assert "(a) approve - not possible: 1 file(s) changed since the review" in text
+    assert max(len(line) for line in text.splitlines()) <= 80
+
+
+def test_accept_screen_falls_back_to_text_on_a_cp1252_console_and_with_no_color(monkeypatch):
+    text = _render(120, encoding="cp1252")
+    assert "Build: [ok] passed" in text and "✅" not in text and "🧑" not in text
+    monkeypatch.setenv("NO_COLOR", "1")
+    text = _render(120)
+    assert "Build: [ok] passed" in text and "✅" not in text
+
+
+def test_accept_screen_renders_on_a_latin1_console_with_ascii_glyphs():
+    text = _render(80, encoding="latin-1")  # would raise UnicodeEncodeError on any glyph left unhandled
+    assert "* [cri00001] CRITICAL security · open" in text and "..." in text and "•" not in text  # · is in Latin-1
+
+
+def test_accept_result_names_status_report_and_next_step_for_every_choice():
+    import io
+
+    from rich.console import Console
+
+    from guard.reporters import terminal as t
+    session, _ = _accept_session()
+    for choice, expected in (("a", "Next: commit now."), ("c", "Next: fix the findings, then run guard post."),
+                             ("q", "Next: run guard accept again when you have decided.")):
+        out = Console(file=io.StringIO(), width=100, record=True, legacy_windows=False, color_system=None)
+        t.render_accept_result(choice, session, out)
+        text = out.export_text()
+        assert expected in text and ".guard/POST_TASK_REPORT.md" in text and "Status:" in text
+
+
+def test_accept_screen_never_shows_unverified_invariants_as_passed():
+    from guard.reporters import terminal as t
+    session, _ = _accept_session()
+    session.post.invariant_result = InvariantResult(all_passed=True, ui_regression_risk=False, latency_ms=0.0, checks=[
+        InvariantCheck(id="A", description="a", passed=True, confidence=1.0, status="passed"),
+        InvariantCheck(id="B", description="b", passed=True, confidence=0.0, status="unverified")])
+    assert t.accept_gate_status(session.post)["Invariants"] == "unverified"
+    assert t.accept_blocker(session.post, []) == ""  # only a failed gate stops `a`, as before
+    session.post.invariant_result.checks[1].status = "failed"
+    assert t.accept_gate_status(session.post)["Invariants"] == "failed"
+    assert "Invariants did not pass" in t.accept_blocker(session.post, [])

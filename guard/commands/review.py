@@ -7,11 +7,23 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.markup import escape
+from rich.prompt import Prompt
 
 from guard.cli import _fingerprint, _followups, _write_post_report, app, console
 from guard.core.ocr_engine import GitDiffInspector
 from guard.core.repo_setup import git_root
 from guard.core.session import SessionManager, SessionStatus
+from guard.reporters.terminal import (
+    EXTRA_ROUNDS,
+    accept_blocker,
+    render_accept_choices,
+    render_accept_findings,
+    render_accept_gates,
+    render_accept_header,
+    render_accept_result,
+    symbol,
+)
 
 
 @app.command("finding")
@@ -59,28 +71,32 @@ def accept_cmd(
         return
     post = session.post
     reviewed = post.reviewed_fingerprints
-    # Every reviewed file is as it was reviewed, and nothing unreviewed has changed since
-    changed = [f for f, h in reviewed.items() if _fingerprint(target / f) != h]
-    changed += [f for f in GitDiffInspector(target).get_working_files() if f not in reviewed]
-    # Accepting covers the LLM's findings only: the LLM reviews only after build, invariants and scope
-    # passed, and they must still show passed in the round being accepted
-    gates_failed = (post.review_mode != "llm_deep" or (post.build_check is not None and not post.build_check.passed)
-                    or bool(post.out_of_scope_files)
-                    or any(v.rule_id.startswith("OCR-") and v.severity in ("HIGH", "CRITICAL") for v in post.rule_violations)
-                    or (post.invariant_result is not None and any(c.status == "failed" for c in post.invariant_result.checks)))
+    def changed_since_review() -> list:
+        # Every reviewed file is as it was reviewed, and nothing unreviewed has changed since
+        return ([f for f, h in reviewed.items() if _fingerprint(target / f) != h]
+                + [f for f in GitDiffInspector(target).get_working_files() if f not in reviewed])
+
+    changed = changed_since_review()
     # Everything the task still carries: every follow-up, what is still open, and any raised again last round
     carried = _followups(session.findings_ledger)
     remaining = [e for e in session.findings_ledger if e in carried or e.get("status") == "open"
                  or e.get("round") == session.llm_rounds]
-    for e in remaining:
-        console.print(f"  • [{e.get('id')}] {e.get('status')} {e.get('severity')} {e.get('kind')} {e.get('location')}: {e.get('description')}", markup=False)
-    choice = typer.prompt("Accept these as follow-ups and approve (a), allow three more rounds (c), or quit (q)?", default="q").strip().lower()
-    if choice == "a" and (changed or gates_failed):
+    # Accepting covers the LLM's findings only: the LLM reviews only after build, invariants and scope
+    # passed, and they must still show passed in the round being accepted
+    blocker = accept_blocker(post, changed)
+    render_accept_header(session, console)
+    render_accept_gates(post, changed, console)
+    render_accept_findings(remaining, console)
+    render_accept_choices(blocker, session.revise_budget, console)
+    choice = Prompt.ask("Your choice", choices=["c", "q"] if blocker else ["a", "c", "q"], default="q",
+                        console=console).strip().lower()
+    # checked again: a file may have changed while the prompt waited
+    changed = changed_since_review()
+    blocker = accept_blocker(post, changed)
+    if choice == "a" and blocker:
+        console.print(f"[bold red]{escape(symbol(console, '❌', '[x]'))} Not approved: {escape(blocker)}.[/bold red]")
         if changed:
-            console.print("[bold red]❌ Changed since the last review:[/bold red] ", end="")
-            console.print(", ".join(changed[:10]), markup=False)
-        else:
-            console.print("[bold red]❌ The last round did not pass build, invariants and scope; only the LLM's findings can be accepted.[/bold red]")
+            console.print("Changed since the review: " + ", ".join(changed[:10]), markup=False)
         console.print("Restore the reviewed files, or allow more rounds (c) and run guard post.")
         raise typer.Exit(code=1)
     if choice == "a":
@@ -90,15 +106,12 @@ def accept_cmd(
         session.post.followups, session.post.needs_user = remaining, False
         mgr._save(session)
         _write_post_report(target, session.post, session.pre)
-        console.print("[bold green]✅ Approved by you; the remaining findings are kept as follow-ups.[/bold green]")
     elif choice == "c":
-        session.revise_budget += 3
+        session.revise_budget += EXTRA_ROUNDS
         session.status, session.post.needs_user = SessionStatus.NEEDS_FIX, False
         mgr._save(session)
         _write_post_report(target, session.post, session.pre)
-        console.print(f"[bold green]✅ Three more review rounds allowed (budget {session.revise_budget}).[/bold green]")
-    else:
-        console.print("[dim]Nothing changed.[/dim]")
+    render_accept_result(choice, session, console)
 
 
 @app.command("untracked")
