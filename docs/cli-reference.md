@@ -269,5 +269,57 @@ Where a stop cannot be refused, the Git pre-commit hook still blocks an unapprov
 
 Removed in 0.11. The Laya neural triage only produced informational guesses and never influenced a gate decision; the repository domain is detected from the repository itself. `guard laya ...` prints this notice, and old model files in `~/.guard/models` can be deleted.
 
+
+---
+
+## 14. `guard accept`
+
+For the user, in an interactive terminal: decide a task that used its review rounds (`needs_user`). An agent cannot run it.
+
+```bash
+guard accept
+```
+
+The screen names the task, the session, the rounds used, the last verdict with the gate that ran, and the time of the last post. Under it come the deterministic gates of that round (build, invariants, scope, OCR: passed, failed or not run) and the files changed since the review. The remaining findings follow in two groups, blocking first, then the advisory follow-ups, each sorted by severity. At 100 columns or more they are a table; below that, stacked blocks. The prompt accepts only the choices that are possible and defaults to `q`:
+
+- `a` approves the files exactly as last reviewed and keeps the findings as follow-ups. It is shown as not possible, with the reason, when a file changed since the review or a deterministic gate did not pass.
+- `c` allows three more review rounds; run `guard post` next.
+- `q` changes nothing.
+
+A sample at 80 columns:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 🧑 GUARD ACCEPT: a task is waiting for your decision                         │
+│ Task: Scope the SEC-008 exemption to the receiver of the storage call        │
+│ Session: guard-1790907479                                                    │
+│ Rounds: 3 of 3 review rounds used                                            │
+│ Last verdict: REVISE 5.5/10 (LLM Gate)                                       │
+│ Last post: 2026-10-02 04:50:33 UTC                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+Build: ✅ passed   Invariants: - not run   Scope: ✅ passed   OCR: ✅ passed
+Files changed since the review: 0
+
+Blocking (would stop the commit): 1
+• [15e3ecbb] HIGH security · open
+  guard/core/rules.py:294
+    A ternary that reads an encrypted store can exempt a plaintext write.
+
+Follow-ups (advisory): 1
+• [c84561df] MEDIUM correctness · deferred
+  guard/core/rules.py:432
+    Several Swift branches on one line.
+    note: heuristic limit; later version
+┌─────────────────────────────── Your decision ────────────────────────────────┐
+│ (a) approve the files exactly as last reviewed; the findings above stay as   │
+│ follow-ups                                                                   │
+│ (c) allow three more review rounds (budget 3 -> 6), then run guard post      │
+│ (q) quit, nothing changes                                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+Your choice [a/c/q] (q):
+```
+
+With `NO_COLOR` set the screen is plain text, and it shows `[ok]`, `[x]` and `[?]` instead of emoji. So does a legacy Windows console, or one whose encoding cannot hold emoji (cp1252).
+
 ---
 *Created and maintained by [@okrath](https://github.com/okrath) &mdash; Source code available at [github.com/okrath/banh-mi-guard](https://github.com/okrath/banh-mi-guard).*
