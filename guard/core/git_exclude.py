@@ -189,3 +189,13 @@ def remove_excluded(repo: Path, lines_to_drop: Iterable[str]) -> bool:
         keep = [line for line in lines if line.decode("utf-8", "surrogateescape").strip() not in drop]
         return None if len(keep) == len(lines) else b"".join(keep)
     return _edit(repo, change)
+
+
+def reword_excluded_comments(repo: Path, old: str, new: str) -> bool:
+    """Replace `old` with `new` in comment lines (`# ...`); the patterns stay. True when one changed."""
+    def change(raw: bytes, newline: bytes) -> Optional[bytes]:
+        lines = raw.splitlines(keepends=True)
+        out = [line.replace(old.encode("utf-8"), new.encode("utf-8"))
+               if line.lstrip().startswith(b"#") else line for line in lines]
+        return None if out == lines else b"".join(out)
+    return _edit(repo, change)

@@ -151,3 +151,47 @@ def test_install_shows_what_is_left_to_choose(fake_machine, tmp_path, monkeypatc
     assert "Commit messages" not in CliRunner().invoke(app, ["install"]).output
     doctor = CliRunner().invoke(app, ["doctor", "--no-updates"])
     assert "Commit messages" in doctor.output and "mode `auto`" in doctor.output
+
+
+def test_doctor_lists_every_laya_leftover_with_its_fix_and_none_after_refresh(fake_machine, tmp_path):
+    from guard.core.repo_setup import LEGACY_DIRECTIVE_END, LEGACY_DIRECTIVE_START, refresh_after_upgrade, refresh_repo
+    from guard.core.setup_health import legacy_items
+    repo = make_repo(tmp_path / "app")
+    hooks = repo / ".git" / "hooks"
+    (hooks / "pre-commit").write_text("#!/usr/bin/env sh\n# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---\nguard post\n",
+                                      encoding="utf-8", newline="\n")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("# Laya-OCR-Guard local exclude\n.guard/\n", encoding="utf-8")
+    (fake_machine / ".claude" / "CLAUDE.md").write_text(f"{LEGACY_DIRECTIVE_START}\nold\n{LEGACY_DIRECTIVE_END}\n", encoding="utf-8")
+    (repo / "AGENTS.md").write_text(f"{LEGACY_DIRECTIVE_START}\nold\n{LEGACY_DIRECTIVE_END}\n", encoding="utf-8")
+    found = dict(legacy_items(repo))
+    assert len(found) == 4
+    assert all(fix == "guard hook refresh" for d, fix in found.items() if "AGENTS.md" not in d)
+    assert found[f"old guard directive in {repo / 'AGENTS.md'}"] == \
+        "replace the LAYA-OCR-GUARD section with `guard hook install --mode agent`"  # a repository file: reported only
+    assert any(e["item"] == "Old laya-ocr-guard files" for e in setup_health(repo))
+
+    refresh_after_upgrade(force=True)
+    refresh_repo(repo)
+    assert [d for d, _ in legacy_items(repo)] == [f"old guard directive in {repo / 'AGENTS.md'}"]
+    assert "LAYA" in (repo / "AGENTS.md").read_text(encoding="utf-8")  # never edited
+
+
+def test_doctor_names_the_old_package_and_its_uninstall_command(fake_machine, tmp_path):
+    from guard.core.setup_health import legacy_items
+
+    class Dist:
+        _path = Path("/home/u/.local/pipx/venvs/laya-ocr-guard/lib/site-packages/laya_ocr_guard.dist-info")
+
+    with patch("importlib.metadata.distribution", lambda name: Dist() if name == "laya-ocr-guard" else None):
+        items = dict(legacy_items(tmp_path))
+    assert items["the old laya-ocr-guard package is still installed (it owns the same `guard` command)"] == \
+        "pipx uninstall laya-ocr-guard"
+
+
+def test_doctor_reports_an_old_hook_parked_as_guard_bak(fake_machine, tmp_path):
+    from guard.core.setup_health import legacy_items
+    repo = make_repo(tmp_path / "app")
+    (repo / ".git" / "hooks" / "pre-commit.guard.bak").write_text(
+        "#!/usr/bin/env sh\n# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---\nguard post\n", encoding="utf-8")
+    assert any("pre-commit.guard.bak" in d for d, _ in legacy_items(repo))

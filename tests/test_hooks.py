@@ -324,3 +324,74 @@ def test_global_git_hooks(monkeypatch, tmp_path):
     un_success, un_msgs = HookInstaller.uninstall_global_git_hooks()
     assert un_success is True
     assert "core.hooksPath" not in git_globals
+
+
+def test_hook_install_keeps_a_laya_hook_as_a_copy_it_never_chains(mock_git_repo):
+    hooks = mock_git_repo / ".git" / "hooks"
+    old = "#!/usr/bin/env sh\n# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---\nguard post\n"
+    (hooks / "pre-commit").write_text(old, encoding="utf-8")
+    success, _ = HookInstaller(mock_git_repo).install(mode="all")
+    assert success
+    assert (hooks / "pre-commit.laya.bak").read_text(encoding="utf-8") == old
+    assert not (hooks / "pre-commit.guard.bak").exists()  # a .guard.bak would run on every commit
+    assert "BANH-MI-GUARD" in (hooks / "pre-commit").read_text(encoding="utf-8")
+
+
+LAYA_LINE = "if command -v guard >/dev/null 2>&1; then guard post --hook || exit 1; fi  # LAYA-OCR-GUARD"
+
+
+def test_hook_install_chains_a_users_hook_without_its_old_guard_line(mock_git_repo):
+    hooks = mock_git_repo / ".git" / "hooks"
+    (hooks / "pre-commit").write_text(f"#!/bin/sh\nnpm run lint\n{LAYA_LINE}\n", encoding="utf-8")
+    assert HookInstaller(mock_git_repo).install(mode="all")[0]
+    chained = (hooks / "pre-commit.guard.bak").read_text(encoding="utf-8")
+    assert "npm run lint" in chained and "LAYA" not in chained  # the old line would run guard a second time
+
+
+def test_uninstall_keeps_a_users_hook_and_drops_only_the_old_guard_line(mock_git_repo):
+    hook = mock_git_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nnpm test\n{LAYA_LINE}\n", encoding="utf-8")
+    HookInstaller(mock_git_repo).uninstall(mode="git")
+    assert hook.read_text(encoding="utf-8") == "#!/bin/sh\nnpm test\n"
+
+
+def test_hook_install_never_overwrites_an_earlier_laya_copy(mock_git_repo):
+    hooks = mock_git_repo / ".git" / "hooks"
+    (hooks / "pre-commit.laya.bak").write_text("first copy\n", encoding="utf-8")
+    (hooks / "pre-commit").write_text("#!/usr/bin/env sh\n# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---\n", encoding="utf-8")
+    assert HookInstaller(mock_git_repo).install(mode="all")[0]
+    assert (hooks / "pre-commit.laya.bak").read_text(encoding="utf-8") == "first copy\n"
+    assert "LAYA-OCR-GUARD AUTO-GENERATED" in (hooks / "pre-commit.laya.2.bak").read_text(encoding="utf-8")
+
+
+def test_uninstall_keeps_a_users_hook_with_both_old_and_current_guard_lines(mock_git_repo):
+    from guard.core.repo_setup import HOOK_BLOCK
+    hook = mock_git_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\n{HOOK_BLOCK}npm test\n{LAYA_LINE}\n", encoding="utf-8")
+    HookInstaller(mock_git_repo).uninstall(mode="git")
+    assert hook.read_text(encoding="utf-8") == "#!/bin/sh\nnpm test\n"
+
+
+def test_uninstall_never_deletes_a_users_hook_that_only_names_the_old_guard(mock_git_repo):
+    hook = mock_git_repo / ".git" / "hooks" / "pre-commit"
+    text = "#!/bin/sh\n# migrated from LAYA-OCR-GUARD by hand\nnpm test\n"
+    hook.write_text(text, encoding="utf-8")
+    HookInstaller(mock_git_repo).uninstall(mode="git")
+    assert hook.read_text(encoding="utf-8") == text
+
+
+def test_uninstall_removes_only_an_old_directive_block_from_an_agent_doc(mock_git_repo):
+    from guard.core.repo_setup import LEGACY_DIRECTIVE_END, LEGACY_DIRECTIVE_START
+    doc = mock_git_repo / "CLAUDE.md"
+    doc.write_text(f"# My rules\n\n{LEGACY_DIRECTIVE_START}\nold\n{LEGACY_DIRECTIVE_END}\n", encoding="utf-8")
+    HookInstaller(mock_git_repo).uninstall(mode="all")
+    assert doc.read_text(encoding="utf-8") == "# My rules\n"
+
+
+def test_uninstall_keeps_a_copy_of_an_old_whole_file_hook(mock_git_repo):
+    hooks = mock_git_repo / ".git" / "hooks"
+    old = "#!/usr/bin/env sh\n# --- LAYA-OCR-GUARD AUTO-GENERATED HOOK ---\nguard post\n"
+    (hooks / "pre-commit").write_text(old, encoding="utf-8")
+    HookInstaller(mock_git_repo).uninstall(mode="git")
+    assert not (hooks / "pre-commit").exists()
+    assert (hooks / "pre-commit.laya.bak").read_text(encoding="utf-8") == old

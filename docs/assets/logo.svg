@@ -58,8 +58,8 @@
   <path d="M24 94 C24 64 54 44 100 44 C146 44 176 64 176 94 C155 88 128 84 100 84 C72 84 45 88 24 94 Z" 
         fill="url(#crust-top)"/>
 
-  <!-- Top Baguette Scoring Cuts: The Three Pillars (Laya, OCR, LLM) -->
-  <!-- Cut 1: Laya Reflex (Electric Cyan) -->
+  <!-- Top Baguette Scoring Cuts: The Three Pillars (rules, OCR, LLM) -->
+  <!-- Cut 1: Rulebook Reflex (Electric Cyan) -->
   <path d="M58 54 C66 52 74 64 78 74 C72 74 64 64 58 54 Z" fill="#FEF3C7"/>
   <path d="M60 56 L76 72" stroke="#38BDF8" stroke-width="2.5" stroke-linecap="round"/>
 

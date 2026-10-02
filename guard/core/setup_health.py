@@ -10,11 +10,12 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from guard.core.repo_setup import (
-    AGENT_DOC_NAMES, DIRECTIVE_END, DIRECTIVE_START, MANUAL_HOOK_LINE, _detected_adapters, _directive_block,
-    _inside_git_dir, _same, effective_hooks_dir, git_root, global_agent_docs, guard_home,
+    AGENT_DOC_NAMES, DIRECTIVE_END, DIRECTIVE_START, GLOBAL_AGENT_DOCS, LEGACY_COMMENT, MANUAL_HOOK_LINE,
+    _detected_adapters, _directive_block, _git, _inside_git_dir, _same, effective_hooks_dir, git_root, global_agent_docs,
+    guard_home, has_legacy,
 )
 
 
@@ -285,4 +286,61 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         if size_mb >= 1:
             add("warn", "Old Laya model", f"{models} ({size_mb:.0f} MB) is no longer used since guard 0.11",
                 f"delete the folder to free the space: {models}")
+    for detail, fix in legacy_items(cwd):
+        add("warn", "Old laya-ocr-guard files", detail, fix)
     return out
+
+
+def _legacy_text(path: Path) -> bool:
+    try:
+        return path.is_file() and has_legacy(path.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        return False
+
+
+def legacy_items(cwd: Path) -> List[Tuple[str, str]]:
+    """
+    What guard <= 0.10 (laya-ocr-guard) left that still runs or still carries its name, with the fix:
+    `guard hook refresh` for what guard may clean, the change to make for a repository file.
+    """
+    items: List[Tuple[str, str]] = []
+    refresh = "guard hook refresh"
+    repo = git_root(cwd)
+    if repo is not None:
+        common = _git(repo, "rev-parse", "--git-common-dir")
+        local = ((Path(common) if Path(common).is_absolute() else repo / common) / "hooks") if common else None
+        hooks = effective_hooks_dir(repo)
+        for name in ("pre-commit", "prepare-commit-msg"):
+            if local and _legacy_text(local / name):
+                items.append((f"{local / name} was written by guard <= 0.10", refresh))
+            if local and _legacy_text(local / f"{name}.guard.bak"):  # chained by the global hooks
+                items.append((f"{local / (name + '.guard.bak')} holds guard <= 0.10 lines", refresh))
+            tracked = hooks / name if hooks and not _inside_git_dir(hooks, repo) and not _same(hooks, guard_home() / "hooks") else None
+            if tracked and _legacy_text(tracked):  # a repository file: guard never edits it
+                items.append((f"{tracked} (repository file) still calls guard the old way",
+                              f"replace its LAYA-OCR-GUARD lines with: {MANUAL_HOOK_LINE}"))
+        if _legacy_text(repo / ".guard" / "bin" / "guard-exec"):
+            items.append((f"{repo / '.guard' / 'bin' / 'guard-exec'} is the 0.1.0 agent wrapper", refresh))
+        from guard.core.git_exclude import exclude_file
+        exclude = exclude_file(repo)
+        if exclude and exclude.is_file() and LEGACY_COMMENT in exclude.read_text(encoding="utf-8", errors="ignore"):
+            items.append((f"{exclude} has the old Laya-OCR-Guard comment", refresh))
+    for doc in (Path.home() / rel for rel in GLOBAL_AGENT_DOCS):
+        if _legacy_text(doc):
+            items.append((f"{doc} has the old LAYA-OCR-GUARD directive block", refresh))
+    for doc in _local_agent_docs(cwd):
+        if _legacy_text(doc):  # a repository file: guard never edits it
+            items.append((f"old guard directive in {doc}",
+                          "replace the LAYA-OCR-GUARD section with `guard hook install --mode agent`"))
+    try:
+        from importlib.metadata import PackageNotFoundError, distribution
+        dist = distribution("laya-ocr-guard")
+        where = str(getattr(dist, "_path", "") or "")
+        tool = "pipx" if "pipx" in where.lower() else "pip"
+        items.append(("the old laya-ocr-guard package is still installed (it owns the same `guard` command)",
+                      f"{tool} uninstall laya-ocr-guard"))
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass  # metadata that cannot be read is not a reason to fail the check
+    return items

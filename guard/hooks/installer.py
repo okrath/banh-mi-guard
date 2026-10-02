@@ -15,7 +15,11 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from guard.core.repo_setup import DIRECTIVE_END, DIRECTIVE_START
+from guard.core.repo_setup import (
+    DIRECTIVE_END, DIRECTIVE_START, is_legacy_whole_file, legacy_backup_path, legacy_directive_to_current,
+    mentions_guard, strip_guard_parts,
+    strip_legacy_parts,
+)
 from guard.hooks.templates import (
     AGENT_DIRECTIVES_TEMPLATE,
     AGENT_WRAPPER_SCRIPT,
@@ -205,10 +209,10 @@ class HookInstaller:
         prep_msg = self.git_hooks_dir / "prepare-commit-msg"
         agent_exec = self.guard_bin_dir / "guard-exec"
 
-        claude_active = self.claude_md_path.exists() and "BANH-MI-GUARD" in self.claude_md_path.read_text(encoding="utf-8", errors="ignore")
-        agent_active = self.agent_md_path.exists() and "BANH-MI-GUARD" in self.agent_md_path.read_text(encoding="utf-8", errors="ignore")
-        pre_commit_installed = pre_commit.exists() and "BANH-MI-GUARD" in pre_commit.read_text(encoding="utf-8", errors="ignore")
-        prep_msg_installed = prep_msg.exists() and "BANH-MI-GUARD" in prep_msg.read_text(encoding="utf-8", errors="ignore")
+        claude_active = self.claude_md_path.exists() and mentions_guard(self.claude_md_path.read_text(encoding="utf-8", errors="ignore"))
+        agent_active = self.agent_md_path.exists() and mentions_guard(self.agent_md_path.read_text(encoding="utf-8", errors="ignore"))
+        pre_commit_installed = pre_commit.exists() and mentions_guard(pre_commit.read_text(encoding="utf-8", errors="ignore"))
+        prep_msg_installed = prep_msg.exists() and mentions_guard(prep_msg.read_text(encoding="utf-8", errors="ignore"))
 
         from guard.core.git_exclude import exclude_file
 
@@ -324,7 +328,17 @@ class HookInstaller:
 
                 if hook_file.exists():
                     content = hook_file.read_text(encoding="utf-8", errors="ignore")
-                    if "BANH-MI-GUARD" in content:
+                    whole = is_legacy_whole_file(content) or "BANH-MI-GUARD AUTO-GENERATED HOOK" in content \
+                        or "BANH-MI-GUARD COMMIT MSG HOOK" in content
+                    if not whole and strip_guard_parts(content) != content:
+                        # the user's own hook with guard's lines in it (any version): only those lines go
+                        hook_file.write_text(strip_guard_parts(content), encoding="utf-8", newline="\n")
+                        messages.append(f"Removed guard's lines from {hook_file}")
+                    elif not whole and mentions_guard(content):
+                        messages.append(f"Left {hook_file} as it is: it names guard in a form guard did not write")
+                    elif whole:
+                        if is_legacy_whole_file(content):  # guard <= 0.10's file: a copy is kept, as on refresh
+                            legacy_backup_path(hook_file).write_text(content, encoding="utf-8", newline="\n")
                         hook_file.unlink()
                         messages.append(f"Removed Guard hook: {hook_file}")
 
@@ -358,7 +372,8 @@ class HookInstaller:
                         bak_path_legacy.unlink(missing_ok=True)
                     messages.append(f"Restored previous {doc_path.name} from backup")
                 elif doc_path.exists():
-                    content = doc_path.read_text(encoding="utf-8", errors="ignore")
+                    # a guard <= 0.10 block (both markers) is removed the same way as a current one
+                    content = legacy_directive_to_current(doc_path.read_text(encoding="utf-8", errors="ignore"))
                     if start_marker in content and end_marker in content:
                         before = content.split(start_marker)[0].rstrip()
                         after = content.split(end_marker)[1].lstrip()
@@ -378,7 +393,11 @@ class HookInstaller:
         # Backup existing hook if not created by Guard
         if target_path.exists():
             existing_content = target_path.read_text(encoding="utf-8", errors="ignore")
-            if "BANH-MI-GUARD" not in existing_content:
+            if is_legacy_whole_file(existing_content):  # guard <= 0.10's own file: kept as a copy, never chained
+                target_path.replace(legacy_backup_path(target_path))  # an earlier copy is never overwritten
+            elif "BANH-MI-GUARD" not in existing_content:
+                # the user's hook is chained as .guard.bak: without guard <= 0.10's lines, which would run guard again
+                target_path.write_text(strip_legacy_parts(existing_content), encoding="utf-8", newline="\n")
                 backup_path = target_path.with_suffix(".guard.bak")
                 target_path.rename(backup_path)
 
@@ -398,8 +417,8 @@ class HookInstaller:
         )
         if target_path.exists():
             existing_content = target_path.read_text(encoding="utf-8", errors="ignore")
-            if "BANH-MI-GUARD" in existing_content:
-                return  # Already injected, never duplicate
+            if mentions_guard(existing_content):
+                return  # Already injected, never duplicate (an old LAYA block is refreshed by guard hook refresh)
 
             # Backup original user directives before modifying
             backup_path = target_path.with_name(f"{target_path.name}.guard.bak")
