@@ -366,3 +366,25 @@ def test_terminal_no_double_escape_reason_bracket(capsys):
     assert "[x]" in out
     assert r"\[x]" not in out
 
+
+
+def test_post_report_shows_the_domain_and_contracts_fixed_at_pre():
+    pre = PreTaskRecord(
+        prompt="Add a refund endpoint",
+        domain=DomainType.BACKEND,
+        domain_source="LLM",
+        existing_contracts=[DomainContract(category="API", name="POST /orders", description="Returns 201")],
+        contracts_source="LLM",
+    )
+    md = generate_post_task_markdown(PostTaskRecord(), pre)
+    assert "* **Technical Domain:** BACKEND (`LLM`)" in md
+    assert "  - Source: `LLM`" in md
+    assert "`POST /orders`: `Returns 201`" in md
+    assert md.index("Technical Domain") < md.index("Actual Impact Range")
+
+    none = PreTaskRecord(prompt="x", domain=DomainType.BACKEND, domain_source="heuristic (no LLM configured)",
+                         contracts_source="not extracted (no LLM configured)")
+    md = generate_post_task_markdown(PostTaskRecord(), none)
+    assert "BACKEND (`heuristic (no LLM configured)`)" in md
+    assert "  - contracts: `not extracted (no LLM configured)`" in md
+    assert "Technical Domain" not in generate_post_task_markdown(PostTaskRecord())
