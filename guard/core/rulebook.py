@@ -13,12 +13,15 @@ from pydantic import BaseModel
 from guard.core.code_text import (
     CODE,
     CSS,
+    ERB,
     MARKUP,
     PY,
+    RB,
     YAML,
     _block_comments,
     _call_arguments,
     _carry_comment,
+    _carry_string,
     _comment_start,
     _hash_comments,
     _is_dockerfile,
@@ -36,6 +39,9 @@ from guard.core.rules import (
     SUPPRESS_COMMENT,
     _unsafe_html_sinks,
     _unsafe_yaml_load,
+    shell_backtick_at,
+    _ruby_xss,
+    _sql_injection,
 )  # noqa: F401
 
 
@@ -49,14 +55,15 @@ class OCRRulebookRunner:
     SECRET_REGEX = re.compile(
         r"""(?i)(api[_-]?key|secret|token|password|auth[_-]?token|private[_-]?key)\s*[:=]\s*["']([A-Za-z0-9_\-\.]{12,})["']"""
     )
-    # Pillar: Security - SQL Injection string concatenation
-    SQLI_REGEX = re.compile(
-        r"""(?i)(select\b.+?\bfrom\b|insert\s+into\b|update\b.+?\bset\b|delete\s+from\b).+?["']\s*\+\s*[a-zA-Z_]"""
-    )
+    _sql_injection = staticmethod(_sql_injection)
+
     # Pillar: Security - Cross-Site Scripting (XSS)
     XSS_REGEX = re.compile(
-        r"""(?i)(dangerouslySetInnerHTML\s*=|(?:inner|outer)HTML\s*\+?=(?!=)|\bv-html\s*=)"""
+        r"""(?i)(?:dangerously""" r"""SetInnerHTML\s*=|(?<![\w$])(?:inner|outer)HTML\s*\+?=(?!=)|\bv-""" r"""html\s*=|"""
+        r"""\bmark_""" r"""safe\(|\|\s*sa""" r"""fe\b|\btemplate\.HT""" r"""ML\(|\bHtml\.R""" r"""aw\(|"""
+        r"""\bbypassSecurity""" r"""TrustHtml\(|\bec""" r"""ho\b(?!.*?\b(?:htmlspecialchars|htmlentities)\b).*?\$(?:_GET|_POST|_REQUEST)\b)"""
     )
+    _PY_MARKUP = re.compile(r"\bMar" r"kup\(")
     # Explicit, reviewable suppression: `// guard-allow SEC-003: <reason>` on the same line
     SUPPRESS_REGEX = re.compile(r"guard-allow\s+([A-Z]+-\d+)\s*:\s*(\S.*)")
     # for the line rules: the marker in a comment (`# ...`, `// ...`, `/* ...`, `<!-- ...`), never in a string
@@ -80,16 +87,21 @@ class OCRRulebookRunner:
         self._stages = set()
         self._open_comment = {}  # file -> the `*/` or `-->` that closes a comment left open on a diff line
         self._open_img = {}  # file -> (line, text so far) of an <img tag not closed on its first line
+        self._open_string = {}
 
         for line in diff_text.splitlines():
             if line.startswith("+++ b/"):
                 current_file = line[6:].strip()
                 line_num = 0
                 self._stages = set()
+                self._open_string.pop(current_file.replace("\\", "/").lower(), None)
                 continue
             if line.startswith(" "):  # a context line: only what the rules need to know about the file
                 line_num += 1
-                _carry_comment(self._open_comment, current_file.replace("\\", "/").lower(), line[1:])
+                cf = current_file.replace("\\", "/").lower()
+                open_comm = self._open_comment.get(cf)
+                _carry_comment(self._open_comment, cf, line[1:])
+                _carry_string(self._open_string, cf, line[1:], open_comm)
                 self._file_context(current_file.lower(), line[1:].strip())
                 continue
             if line.startswith("@@"):
@@ -97,6 +109,7 @@ class OCRRulebookRunner:
                 if match:
                     line_num = int(match.group(1)) - 1
                 self._open_comment.pop(current_file.replace("\\", "/").lower(), None)
+                self._open_string.pop(current_file.replace("\\", "/").lower(), None)
                 self._open_img.pop(current_file.replace("\\", "/").lower(), None)
                 continue
 
@@ -108,8 +121,10 @@ class OCRRulebookRunner:
                 is_doc_file = any(cf_lower.endswith(ext) for ext in [".md", ".markdown", ".txt", ".rst"])
                 is_test_file = _is_test_path(cf_lower)
                 # the code of the line outside a comment an earlier line left open (None: all comment)
+                open_comm = self._open_comment.get(cf_lower)
                 visible = _carry_comment(self._open_comment, cf_lower, added_code)
                 visible = visible.strip() if visible is not None else None
+                string_cutoff = _carry_string(self._open_string, cf_lower, added_code, open_comm)
 
                 # Rule 1: Hardcoded Secrets (Security - Always scanned on ALL files)
                 if self.SECRET_REGEX.search(added_code):
@@ -129,7 +144,7 @@ class OCRRulebookRunner:
                     continue
 
                 # Rule 2: SQL Injection concatenation (Security)
-                if self.SQLI_REGEX.search(added_code) and not is_test_file:
+                if _sql_injection(added_code, cf_lower) and not is_test_file:
                     violations.append(RuleViolation(
                         rule_id="SEC-002",
                         severity="CRITICAL",
@@ -142,10 +157,18 @@ class OCRRulebookRunner:
                 # Rule 3: Cross-Site Scripting (XSS) (Security)
                 # A comment mentioning "sanitize" no longer exempts the line; only a provably safe
                 # value or an explicit `guard-allow SEC-003: reason` marker does (reported as LOW).
-                if self.XSS_REGEX.search(added_code) and not is_test_file and (
-                    re.search(r"dangerouslySetInnerHTML|\bv-html", added_code, re.IGNORECASE)
-                    or _unsafe_html_sinks(added_code) > 0
-                ):
+                has_xss = False
+                if not is_test_file:
+                    if self.XSS_REGEX.search(added_code) and (
+                        not re.search(r"(?<![\w$])(?:inner|outer)HTML\s*\+?=(?!=)", added_code, re.IGNORECASE)
+                        or _unsafe_html_sinks(added_code) > 0
+                    ):
+                        has_xss = True
+                    elif cf_lower.endswith(PY) and self._PY_MARKUP.search(added_code):
+                        has_xss = True
+                    elif cf_lower.endswith(RB + ERB) and _ruby_xss(added_code, is_erb=cf_lower.endswith(ERB)):
+                        has_xss = True
+                if has_xss:
                     suppress = self.SUPPRESS_REGEX.search(added_code)
                     if suppress and suppress.group(1) == "SEC-003":
                         violations.append(RuleViolation(
@@ -162,14 +185,13 @@ class OCRRulebookRunner:
                             severity="HIGH",
                             file_path=current_file,
                             line_number=line_num,
-                            message="Raw HTML injection detected (dangerouslySetInnerHTML / innerHTML / v-html). Use textContent, DOMPurify.sanitize(), or mark `// guard-allow SEC-003: <reason>`.",
+                            message="Raw HTML injection detected: in browser JS use textContent or DOMPurify, in server templates (Go template.HTML, Ruby raw/html_safe, PHP echo) escape with framework escaping (html/template auto-escaping, ERB <%= %>, htmlspecialchars).",
                             snippet=added_code[:80],
                         ))
-
                 # Line rules of the quality matrix (security, infra, mobile); a line is
                 # judged before it adds to what the file defines (`FROM node AS node` is still an image)
                 if not is_test_file and visible is not None:
-                    violations.extend(self._line_rules(cf_lower, current_file, line_num, visible))
+                    violations.extend(self._line_rules(cf_lower, current_file, line_num, visible, string_cutoff))
                     if cf_lower.endswith(MARKUP):
                         violations.extend(self._multiline_img(cf_lower, current_file, line_num, visible))
                 self._file_context(cf_lower, added_code)
@@ -202,7 +224,7 @@ class OCRRulebookRunner:
             if stage:
                 self._stages.add(stage.group(1).lower())
 
-    def _line_rules(self, path_lower: str, path: str, line_num: int, code: str) -> List[RuleViolation]:
+    def _line_rules(self, path_lower: str, path: str, line_num: int, code: str, string_cutoff: int = 0) -> List[RuleViolation]:
         found: List[RuleViolation] = []
         if code.startswith(("#", "//")) or (code.startswith("*") and not path_lower.endswith(CSS)) \
                 or len(code) > MAX_RULE_LINE or _is_docs_path(path_lower):
@@ -228,6 +250,7 @@ class OCRRulebookRunner:
             # would rather report a sentence that mentions eval( than miss a call
             if not any((m.start() == 0 or body[m.start() - 1] != "`")
                        and (rule_id != "UX-002" or _tag_end(body[m.start():]) >= 0)
+                       and (rule_id != "SEC-005" or body[m.start()] != "`" or shell_backtick_at(body, m.start(), string_cutoff))
                        for m in pattern.finditer(body)):
                 continue
             base = re.match(r"(?i)^FROM\s+(?:--platform=\S+\s+)?(\S+)", body) if _is_dockerfile(path_lower) else None
@@ -236,7 +259,7 @@ class OCRRulebookRunner:
                     continue  # an earlier stage of this Dockerfile, not an image
             if rule_id == "INFRA-003" and path_lower in self._ends_as_user:
                 continue  # a later USER in the diff switches back
-            if rule_id == "SEC-004" and not _unsafe_yaml_load(body) and not re.search(
+            if rule_id == "SEC-004" and path_lower.endswith(PY) and not _unsafe_yaml_load(body) and not re.search(
                     r"\byaml\.unsafe_load(?:_all)?\(|\b(?:pickle|cPickle|dill|marshal)\.loads?\(", body):
                 continue  # every yaml.load call on the line names a SafeLoader
             allowed = suppress and suppress.group(1) == rule_id

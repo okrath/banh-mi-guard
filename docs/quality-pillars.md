@@ -19,13 +19,13 @@ When a repository has no project invariants, guard adds a few generic **template
 | Concern | How | ID |
 | :--- | :--- | :--- |
 | Hardcoded API keys, tokens, passwords in added lines | Rule | `SEC-001` (CRITICAL) |
-| SQL built by string concatenation | Rule | `SEC-002` (CRITICAL) |
-| Unsanitized HTML sinks: `innerHTML`/`outerHTML` `=` and `+=`, `dangerouslySetInnerHTML`, `v-html`. A comment mentioning "sanitize" does not exempt a line; only an empty literal, a single `DOMPurify.sanitize(...)` value or `// guard-allow SEC-003: <reason>` (listed as LOW) does | Rule | `SEC-003` (HIGH) |
-| Unsafe deserialization: `yaml.load` / `yaml.load_all` whose own arguments name no `SafeLoader`, `yaml.unsafe_load(_all)`, `pickle`/`marshal` loads (Python) | Rule | `SEC-004` (HIGH) |
-| A string run as a shell command or code: `shell=True`, `os.system`/`os.popen`, `eval`/`exec` (Python); `eval`, `new Function` (JS/TS) | Rule | `SEC-005` (HIGH) |
+| SQL built by string concatenation or interpolation (`+`, `.`, f-strings, `%`, `.format`, `${...}`, `fmt.Sprintf`, `String.format`, `string.Format`, `#{...}`, `"$var"`, `format!`, `"\(x)"` in Python, JS/TS, Go, Ruby, PHP, Java, Kotlin, C#, Rust, Swift, Dart) | Rule | `SEC-002` (CRITICAL) |
+| Raw HTML sinks: `innerHTML`/`outerHTML` `=` and `+=`, `dangerouslySetInnerHTML`, `v-html` (JS/TS); `mark_safe`, `Markup`, `|safe` (Python); `template.HTML` (Go); `html_safe`, `raw` (Ruby); `Html.Raw` (C#); `bypassSecurityTrustHtml` (Angular); echoed `$_GET`/`$_POST`/`$_REQUEST` (PHP). A comment mentioning "sanitize" does not exempt a line; only an empty literal, a single `DOMPurify.sanitize(...)` value or `// guard-allow SEC-003: <reason>` (listed as LOW) does | Rule | `SEC-003` (HIGH) |
+| Unsafe deserialization: `yaml.load` / `yaml.load_all` without `SafeLoader`, `yaml.unsafe_load(_all)`, `pickle`/`marshal` (Python); `ObjectInputStream.readObject`, Jackson default typing (Java, Kotlin); `unserialize` (PHP); `Marshal.load`, `YAML.load` (Ruby); `BinaryFormatter`, `NetDataContractSerializer`, `LosFormatter` (C#) | Rule | `SEC-004` (HIGH) |
+| A string run as a shell command or code: `shell=True`, `os.system`/`os.popen`, `eval`/`exec` (Python); `eval`, `new Function` (JS/TS); `exec.Command` with a shell (Go); `Runtime.exec`/`ProcessBuilder` with a shell (Java, Kotlin); `system`/`exec`/`shell_exec`/`passthru`/`popen`/`proc_open`/`eval`/backticks (PHP); `system`/`exec`/%x/backticks/`eval` (Ruby); `Process.Start` with a shell (C#); `Command::new("sh").arg("-c")` (Rust); `Process()` with `/bin/sh` (Swift) | Rule | `SEC-005` (HIGH) |
 | TLS certificate checking turned off: `verify=False`, `rejectUnauthorized: false`, `InsecureSkipVerify: true`, `NODE_TLS_REJECT_UNAUTHORIZED=0` | Rule | `SEC-006` (HIGH) |
 | CORS open to every origin (`Access-Control-Allow-Origin: *`, `allow_origins=["*"]`, `origin: '*'`) | Rule | `SEC-007` (MEDIUM) |
-| A credential stored in `localStorage` (token, jwt, secret, password, API key, session keys; by `setItem`, property or index) | Rule | `SEC-008` (MEDIUM) |
+| A credential stored in client storage: `localStorage`/`sessionStorage` (JS/TS), `AsyncStorage.setItem` (React Native), `SharedPreferences` `putString` (Java, Kotlin), `UserDefaults.set` (Swift), `SharedPreferences` `setString` (Dart) | Rule | `SEC-008` (MEDIUM) |
 | Container with host-level privileges (`privileged`, `allowPrivilegeEscalation`, `hostNetwork`, `hostPID`, `hostIPC`: `true` in YAML) | Rule | `INFRA-001` (HIGH) |
 | Container running as root (`USER root` / `USER 0` with no later `USER` of another user in the diff) | Rule | `INFRA-003` (MEDIUM) |
 | Android app shipped debuggable or allowing plain-HTTP traffic (`android:debuggable`, `usesCleartextTraffic`; not in `debug/` manifests) | Rule | `MOB-001` (HIGH) |
@@ -100,10 +100,10 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 | Domain | 🛡️ Security | 🧠 Memory | ⚡ Performance | 🧱 Integrity | ♿ UX | 🧹 Hygiene | 🛋️ Simplicity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | Frontend | `SEC-001` `SEC-003` `SEC-005` `SEC-006` `SEC-007` `SEC-008` | LLM | LLM | LLM | `UX-001` `UX-002` | `DEAD-001` `DEAD-REF` | `LAZY-001` |
-| Backend | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | LLM | LLM | build check, invariants | LLM | `DEAD-001` `DEAD-REF` | `LAZY-001` |
+| Backend | `SEC-001` `SEC-002` `SEC-003` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | LLM | LLM | build check, invariants | LLM | `DEAD-001` `DEAD-REF` | `LAZY-001` |
 | Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-001` |
 | Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | LLM | LLM | `INFRA-002` | LLM | `DEAD-001` | LLM |
-| Mobile | `SEC-001` `SEC-006` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` | LLM |
+| Mobile | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-008` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` | LLM |
 
 ---
 
