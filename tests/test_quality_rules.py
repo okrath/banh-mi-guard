@@ -568,7 +568,30 @@ def test_review_finding_8_sec_008_encrypted_storage():
     assert not [f for f in found("src/Store.swift", 'SecureStore.set(token, forKey: "auth_token")') if f[0] == "SEC-008"]
     assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'editor.putString("auth_token", token);')
     assert ("SEC-008", "MEDIUM") in found("src/Store.swift", 'UserDefaults.standard.set(token, forKey: "auth_token")')
-
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'prefs.edit().putString("token", t).apply() // not EncryptedSharedPreferences')
+    assert ("SEC-008", "MEDIUM") in found("src/Store.swift", 'UserDefaults.standard.set(token, forKey: "token") // TODO Keychain')
+    assert not [f for f in found("app/Prefs.java", 'encryptedPrefs.edit().putString("token", t).apply()') if f[0] == "SEC-008"]
+    assert not [f for f in found("app/Prefs.java", 'EncryptedSharedPreferences.create(...).edit().putString("token", t)') if f[0] == "SEC-008"]
+    assert not [f for f in found("src/Store.swift", 'KeychainWrapper.standard.set(token, forKey: "token")') if f[0] == "SEC-008"]
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.kt", 'prefs?.edit()?.putString("token", t)?.apply()')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.kt", 'prefs!!.edit().putString("token", t)')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", '    .putString("token", t)')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'PreferenceManager.getDefaultSharedPreferences(requireContext()).edit().putString("token", t)')
+    assert not [f for f in found("app/Prefs.java", 'this.securePrefs.edit().putString("token", t)') if f[0] == "SEC-008"]
+    assert ("SEC-008", "MEDIUM") in found("src/Store.swift", 'defaults?.set(token, forKey: "token")')
+    assert ("SEC-008", "MEDIUM") in found("src/Store.swift", 'UserDefaults(suiteName: "group")?.set(token, forKey: "token")')
+    assert ("SEC-008", "MEDIUM") in found("src/Store.swift", '    .set(token, forKey: "token")')
+    assert not [f for f in found("src/Store.swift", 'self.keychain.set(token, forKey: "token")') if f[0] == "SEC-008"]
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'if (!prefs.edit().putString("token", t)) {')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", '((MyApp) getApplication()).prefs.edit().putString("token", t);')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'log(securePrefs); prefs.edit().putString("token", t);')
+    assert not [f for f in found("app/Prefs.kt", 'encryptedPrefs.edit { putString("token", t) }') if f[0] == "SEC-008"]
+    assert not [f for f in found("app/Prefs.kt", 'encryptedPrefs.edit().apply { putString("token", t) }') if f[0] == "SEC-008"]
+    assert not [f for f in found("src/Store.swift", 'let a = UserDefaults.standard.bool(forKey: "x"); KeychainWrapper.standard.set(token, forKey: "token")') if f[0] == "SEC-008"]
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", 'save(securePrefs, prefs.edit().putString("token", t));')
+    assert ("SEC-008", "MEDIUM") in found("app/Prefs.java", '/* securePrefs */ prefs.edit().putString("token", t);')
+    assert not [f for f in found("app/Prefs.kt", 'encryptedPrefs.edit { putString("a", a); putString("token", t) }') if f[0] == "SEC-008"]
+    assert not [f for f in found("app/Prefs.kt", 'with(encryptedPrefs.edit()) { putString("token", t) }') if f[0] == "SEC-008"]
 
 def test_review_finding_sec_002_insert_update_literals():
     assert ("SEC-002", "CRITICAL") in found("src/db.py", 'q = "INSERT INTO " + table + " VALUES (?)"')

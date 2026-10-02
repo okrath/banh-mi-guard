@@ -271,6 +271,84 @@ def _ruby_xss(code: str, is_erb: bool = False) -> bool:
             return True
     return False
 
+def _backward_chain(s: str, end: int) -> str:
+    """Walk backward across identifiers, dots, whitespace, and balanced () pairs."""
+    i = end - 1
+    while i >= 0 and s[i].isspace():
+        i -= 1
+    while i >= 0:
+        if s[i] == ")":
+            depth = 1
+            i -= 1
+            while i >= 0 and depth > 0:
+                if s[i] == ")":
+                    depth += 1
+                elif s[i] == "(":
+                    depth -= 1
+                i -= 1
+        elif s[i].isalnum() or s[i] in "_?.!":
+            i -= 1
+        elif s[i].isspace():
+            j = i
+            while j >= 0 and s[j].isspace():
+                j -= 1
+            if j >= 0 and (s[j].isalnum() or s[j] in "_?.!)"):
+                i = j
+            else:
+                break
+        else:
+            break
+    return s[i + 1:end].strip()
+
+
+class _Sec008Matcher:
+    """Receiver-aware SEC-008 write matcher for Java/Kotlin and Swift."""
+    def __init__(self, write_pattern: re.Pattern, method_call: str, exempt_names: tuple[str, ...], allow_block: bool = False):
+        self._pattern = write_pattern
+        self._method = method_call.lower()
+        self._exempt_re = re.compile(
+            r"^(?:(?:this|self)\.|with\s*\(\s*(?:(?:this|self)\.)?)?(?:"
+            + "|".join(re.escape(n) for n in exempt_names)
+            + r")\b",
+            re.IGNORECASE,
+        )
+        self._allow_block = allow_block
+
+    def finditer(self, body: str):
+        for m in self._pattern.finditer(body):
+            sub = body[m.start():m.end()]
+            pos = sub.lower().find(self._method)
+            if pos < 0:
+                yield m
+                continue
+            call_idx = m.start() + pos
+            dot_idx = call_idx - 1
+            while dot_idx >= 0 and body[dot_idx].isspace():
+                dot_idx -= 1
+            if dot_idx >= 0 and body[dot_idx] in ".?":
+                dot_pos = dot_idx
+                if body[dot_pos] == "." and dot_pos > 0 and body[dot_pos - 1] == "?":
+                    dot_pos -= 1
+                chain = _backward_chain(body, dot_pos)
+                if self._exempt_re.match(chain):
+                    continue
+            elif self._allow_block:
+                depth = 0
+                brace_idx = -1
+                for i in range(call_idx - 1, -1, -1):
+                    if body[i] == "}":
+                        depth += 1
+                    elif body[i] == "{":
+                        if depth > 0:
+                            depth -= 1
+                        else:
+                            brace_idx = i
+                            break
+                if brace_idx != -1:
+                    chain = _backward_chain(body, brace_idx)
+                    if self._exempt_re.match(chain):
+                        continue
+            yield m
 
 SUPPRESS_COMMENT = re.compile(r"(?:#|//|/\*|<!--)\s*guard-allow\s+([A-Z]+-\d+)\s*:\s*(\S.*)")
 
@@ -342,10 +420,21 @@ LINE_RULES = [
                 r"[\"'`]?[^\"'`\]=]*(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
      "A credential goes into client storage (localStorage/sessionStorage/AsyncStorage): prefer an HttpOnly cookie."),
     ("SEC-008", "MEDIUM", lambda f: f.endswith(JAVA + KT),
-     re.compile(r"(?i)^(?!.*\b(?:EncryptedSharedPreferences|encryptedPrefs|securePrefs)\b).*\bputString\(\s*[\"'][^\"']*(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
+     _Sec008Matcher(
+         re.compile(r"(?i)\bputString\(\s*[\"'][^\"']*(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
+         "putString(",
+         ("EncryptedSharedPreferences", "encryptedPrefs", "securePrefs"),
+         allow_block=True,
+     ),
      "A credential is saved in SharedPreferences in plaintext: store sensitive tokens in EncryptedSharedPreferences or KeyStore."),
     ("SEC-008", "MEDIUM", lambda f: f.endswith(SWIFT),
-     re.compile(r"(?i)^(?!.*\b(?:Keychain|KeychainWrapper|SecureStore)\b).*(?:\bUserDefaults\b.*?\.set\(|\.set\([^)]*forKey:\s*[\"'][^\"']*)(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
+     _Sec008Matcher(
+         re.compile(r"(?i)(?:\bUserDefaults\b[^;]*?\.set\(|\.set\([^;)]*forKey:\s*[\"'][^\"']*)"
+                    r"(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
+         "set(",
+         ("Keychain", "KeychainWrapper", "SecureStore"),
+         allow_block=False,
+     ),
      "A credential is saved in UserDefaults in plaintext: store credentials in the iOS Keychain."),
     ("SEC-008", "MEDIUM", lambda f: f.endswith(DART),
      re.compile(r"(?i)\bsetString\(\s*[\"'][^\"']*(?:token|jwt|secret|passw(?:or)?d|api[_-]?key|\bsession(?:[_-]?(?:id|key))?\b)"),
