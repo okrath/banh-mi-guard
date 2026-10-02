@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from guard.core.session import PostTaskRecord, PreTaskRecord
+from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
 
 console = Console()
@@ -42,6 +42,9 @@ def render_pre_task_terminal(pre: PreTaskRecord):
     header_text.append("🛡️ BANH-MI-GUARD: PRE-TASK IMPACT NOTE\n", style="bold cyan")
     header_text.append(f"Prompt: ", style="bold white")
     header_text.append(f"{pre.prompt}\n", style="italic yellow")
+    if isinstance(pre.owner, dict) and pre.owner.get("session"):
+        header_text.append("Owner: ", style="bold white")
+        header_text.append(f"{describe_owner(pre.owner)}\n")
     header_text.append(f"Domain: ", style="bold white")
     header_text.append(f"{_format_terminal_domain(pre)}  ", style="bold green")
     console.print(Panel(header_text, border_style="cyan"))

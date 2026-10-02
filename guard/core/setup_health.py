@@ -160,6 +160,9 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
                 f"guard agent add {name}")
             continue
 
+        if not adapter.get("session_id"):  # its events cannot be told apart by agent session
+            add("warn", "Agent sessions", f"{adapter['title']}: no session id, parallel sessions in one working tree "
+                "are not separated", "git worktree add ../<folder> -b <branch>   (one worktree per parallel session)")
         try:  # the last `guard agent test`: whether the agent really called guard
             last = json.loads(test_record_path(name).read_text(encoding="utf-8"))
         except (OSError, ValueError):

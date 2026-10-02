@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from guard.agent.bash import HEAD_KEY, changed_between, content_hash, is_git_commit, is_read_only, worktree_fingerprint
 from guard.core.ocr_engine import GitDiffInspector
-from guard.core.session import SessionManager, SessionStatus
+from guard.core.session import SessionManager, SessionStatus, describe_owner
 
 EVENTS = ("prompt", "before-edit", "after-bash", "stop", "before-commit")
 EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
@@ -40,6 +41,10 @@ class AgentEvent(BaseModel):
     command: Optional[str] = None
     call_id: Optional[str] = None
     loop: bool = False  # the harness says this is a repeated stop (its loop guard)
+    # The harness's own session (conversation) id, and the adapter that sent the event: two agent
+    # sessions in one working tree are told apart by it. Without an id, events are shared as before
+    agent_session: Optional[str] = None
+    agent: str = ""
 
 
 class Decision(BaseModel):
@@ -68,6 +73,7 @@ DEFAULT_FIELDS: Dict[str, List[str]] = {
     "command": ["tool_input.command", "command"],
     "call_id": ["tool_use_id", "call_id", "tool_call_id"],
     "loop": ["stop_hook_active", "loop"],
+    "agent_session": ["session_id", "conversation_id", "sessionId", "thread_id"],
 }
 
 
@@ -103,6 +109,7 @@ def normalise(event: str, payload: Any, fields: Optional[Dict[str, List[str]]] =
         command=first("command") if isinstance(first("command"), str) else None,
         call_id=str(first("call_id")) if first("call_id") else None,
         loop=_is_loop(first("loop")),
+        agent_session=str(first("agent_session"))[:200] if first("agent_session") else None,
     )
 
 
@@ -160,6 +167,78 @@ def update_state(repo: Path, change) -> Any:
     finally:
         os.close(fd)
         lock.unlink(missing_ok=True)
+
+
+SESSION_TTL_S = 86400  # an agent session's state is dropped a day after its last event
+CLAIM_TTL_S = 60  # a `guard pre` takes the claim of the agent command that started it, if this recent
+
+
+def session_state(state: Dict[str, Any], agent_session: Optional[str]) -> Dict[str, Any]:
+    """
+    The part of the agent state that belongs to one agent session (its prompt, files it changed
+    before pre, its Bash fingerprints): `sessions[<id>]`, or the shared top level for an event
+    without an id. Sessions not seen for a day are dropped.
+    """
+    if not agent_session:
+        return state
+    sessions = state.setdefault("sessions", {})
+    now = time.time()
+    for stale in [k for k, v in sessions.items() if not isinstance(v, dict) or now - v.get("seen", 0) > SESSION_TTL_S]:
+        del sessions[stale]
+    own = sessions.setdefault(agent_session, {})
+    own["seen"] = now
+    return own
+
+
+def fresh_claim(state: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """
+    The agent session that ran `guard pre` within CLAIM_TTL_S: {"agent", "session"}. None when no
+    session did, and when two did (two pres started together): which pre is whose is then unknown,
+    so neither gets an owner and the shared behaviour applies.
+    """
+    claims = state.get("claims") if isinstance(state.get("claims"), dict) else {}
+    fresh = [(s, c) for s, c in claims.items() if isinstance(c, dict) and time.time() - c.get("at", 0) <= CLAIM_TTL_S]
+    if len(fresh) != 1:
+        return None
+    session, claim = fresh[0]
+    return {"agent": str(claim.get("agent") or ""), "session": str(session)}
+
+
+def _owner(session) -> Optional[Dict[str, str]]:
+    owner = getattr(session.pre, "owner", None) if session and session.pre else None
+    return owner if isinstance(owner, dict) and owner.get("session") else None
+
+
+def session_key(ev: AgentEvent) -> Optional[str]:
+    """`<agent>:<session id>`: two agents that happen to use the same id are never one session."""
+    return f"{ev.agent}:{ev.agent_session}" if ev.agent_session else None
+
+
+def _from_another_session(ev: AgentEvent, session) -> bool:
+    """The event has an id, the guard session has an owner, and they are not the same agent session."""
+    owner = _owner(session)
+    return bool(ev.agent_session and owner and owner["session"] != session_key(ev))
+
+
+def _held_reason(session) -> str:
+    owner, pre = _owner(session), session.pre
+    task = " ".join(pre.prompt.split())[:80]
+    return (f"this working tree is held by another agent's guard session ({describe_owner(owner)}, task "
+            f"\"{task}\", since {pre.timestamp[:16].replace('T', ' ')} UTC)")
+
+
+# `guard pre` as the command itself: at the start or after a shell separator, optionally behind
+# variable assignments or a path; never as an argument (`grep guard pre docs/`)
+GUARD_PRE = re.compile(r"(?:^|[;&|(\n])\s*(?:\w+=\S*\s+)*(?:\S*[/\\])?guard(?:\.exe)?\s+pre(?:\s|$)")
+
+
+def _claim(state: Dict[str, Any], agent_session: str, agent: str) -> None:
+    """Record that this agent session starts a `guard pre`; claims older than CLAIM_TTL_S go."""
+    claims = state.get("claims") if isinstance(state.get("claims"), dict) else {}
+    now = time.time()
+    claims = {s: c for s, c in claims.items() if isinstance(c, dict) and now - c.get("at", 0) <= CLAIM_TTL_S}
+    claims[agent_session] = {"agent": agent, "at": now}
+    state["claims"] = claims
 
 
 def _relative(repo: Path, file_path: str) -> Optional[str]:
@@ -223,39 +302,48 @@ def decide(ev: AgentEvent) -> Decision:
         return Decision()  # guard protects Git repositories only
     session = SessionManager(repo).load_local_session()
     tool = (ev.tool or "").lower()
+    other = _from_another_session(ev, session)  # judged on its own work, not the owner's
 
     if ev.event == "prompt":
         if ev.prompt:
-            update_state(repo, lambda s: s.update(user_prompt=ev.prompt, prompt_at=datetime.now(timezone.utc).isoformat()))
+            update_state(repo, lambda s: session_state(s, session_key(ev)).update(
+                user_prompt=ev.prompt, prompt_at=datetime.now(timezone.utc).isoformat()))
         if _active_pre(session):
             return Decision()
         return Decision(action="notify", reason=f"Guard: before editing files, {PRE_HINT}.")
 
-    if ev.event == "before-commit":  # a harness hook dedicated to commits: always gated
-        return _commit_decision(repo, session)
-    if ev.event == "before-edit" and ev.command is not None and is_git_commit(ev.command, repo):
-        return _commit_decision(repo, session)
+    if ev.event == "before-commit" or (ev.event == "before-edit" and ev.command is not None
+                                       and is_git_commit(ev.command, repo)):
+        if other:
+            return Decision(action="block", reason=(
+                f"Guard: {_held_reason(session)}; its approval is not yours to commit. Use `git worktree add` "
+                "for parallel work, or wait until it is committed."))
+        return _commit_decision(repo, session)  # a harness hook dedicated to commits: always gated
 
     if ev.event == "before-edit":
         if tool in READ_TOOLS:
             return Decision()
         shell = tool in SHELL_TOOLS or (ev.command is not None and not ev.file_paths)
         unclassified = bool(tool) and tool not in EDIT_TOOLS and not shell and not ev.file_paths
+        if shell and ev.command and ev.agent_session and GUARD_PRE.search(ev.command):
+            # the guard pre this command starts belongs to this agent session (its owner)
+            update_state(repo, lambda s: _claim(s, session_key(ev), ev.agent))
         if (shell and ev.command and not is_read_only(ev.command)) or unclassified:
             # An unknown command, or a tool guard cannot classify that names no file: it runs, and
             # what it changed is measured afterwards (the after-tool event)
             fingerprint = worktree_fingerprint(repo)
-            update_state(repo, lambda s: s.setdefault("bash", {}).__setitem__(ev.call_id or "last", fingerprint))
+            update_state(repo, lambda s: session_state(s, session_key(ev)).setdefault("bash", {}).__setitem__(
+                ev.call_id or "last", fingerprint))
             return Decision()
         if shell:
             return Decision()  # read-only command
-        return _edit_decision(repo, session, ev)
+        return _edit_decision(repo, session, ev, other)
 
     if ev.event == "after-bash":
-        return _after_bash(repo, session, ev)
+        return _after_bash(repo, session, ev, other)
 
     if ev.event == "stop":
-        return _stop_decision(repo, session, ev)
+        return _stop_decision(repo, session, ev, other)
 
     return Decision()
 
@@ -274,11 +362,14 @@ def _ignored_by_the_user(repo: Path, paths: List[str]) -> set:
     return {p for p in paths if any(covers(d, p) for d in ignored)}
 
 
-def _edit_decision(repo: Path, session, ev: AgentEvent) -> Decision:
+def _edit_decision(repo: Path, session, ev: AgentEvent, other: bool = False) -> Decision:
     targets = [r for r in (_relative(repo, p) for p in ev.file_paths) if r and not r.startswith(".guard/")]
     targets = [t for t in targets if t not in _ignored_by_the_user(repo, targets)]
     if not targets:
         return Decision()
+    if other and _active_pre(session):
+        return Decision(action="block", reason=(
+            f"Guard: {_held_reason(session)}. Use `git worktree add` for parallel work, or wait until it is committed."))
     if not _active_pre(session):
         why = "the last guard session was approved; this is new work" if session and session.status == SessionStatus.COMPLETED \
             else "there is no guard session for this task"
@@ -298,22 +389,40 @@ def _edit_decision(repo: Path, session, ev: AgentEvent) -> Decision:
     return Decision()
 
 
-def _after_bash(repo: Path, session, ev: AgentEvent) -> Decision:
-    before = update_state(repo, lambda s: (s.get("bash") or {}).pop(ev.call_id or "last", None))
+def _record_changes(repo: Path, ev: AgentEvent, key: str, changed: List[str]) -> None:
+    """Add `changed` to this agent session's list `key` (the shared top level without an id)."""
+    def add(state):
+        own = session_state(state, session_key(ev))
+        own[key] = sorted(set(own.get(key) or []) | set(changed))
+    update_state(repo, add)
+
+
+def _after_bash(repo: Path, session, ev: AgentEvent, other: bool = False) -> Decision:
+    before = update_state(repo, lambda s: (session_state(s, session_key(ev)).get("bash") or {}).pop(ev.call_id or "last", None))
     if before is None:
         return Decision()  # read-only command, or no fingerprint was taken
     after = worktree_fingerprint(repo)
     committed = before.get(HEAD_KEY) != after.get(HEAD_KEY) and bool(before.get(HEAD_KEY))
     changed = [c for c in changed_between(before, after) if not c.startswith(".guard/") and c != HEAD_KEY]
-    if committed and _commit_decision(repo, session).action == "block":  # a commit got past the before-commit check
+    if committed and (other or _commit_decision(repo, session).action == "block"):  # a commit got past the check
         return Decision(action="notify", reason=(
             f"Guard: that command made a commit ({after.get(HEAD_KEY, '')[:12]}) without an approved guard review. "
             "Tell the user; run `guard post` on the work and get it approved before anything is pushed."
         ))
     if not changed:
         return Decision()
+    if other and _active_pre(session):
+        # what the owner's agent changed meanwhile stays the owner's; the rest is this session's own work
+        scope = session.pre.expected_files
+        own = [c for c in changed if not (scope and GitDiffInspector(repo)._is_expected(c, scope))]
+        if not own:
+            return Decision()
+        _record_changes(repo, ev, "own_changes", own)
+        return Decision(action="notify", reason=(
+            f"Guard: that command changed {', '.join(own)} while {_held_reason(session)}. Undo it, or do this "
+            "work in a separate `git worktree add`."))
     if not _active_pre(session):
-        update_state(repo, lambda s: s.__setitem__("pre_edit_changes", sorted(set(s.get("pre_edit_changes") or []) | set(changed))))
+        _record_changes(repo, ev, "pre_edit_changes", changed)
         return Decision(action="notify", reason=(
             f"Guard: that command changed {', '.join(changed)} before any guard session. Stop editing and {PRE_HINT}; "
             "these files are reported as changed before pre."
@@ -415,9 +524,21 @@ def _wait_for_post(repo: Path) -> bool:
     return waited
 
 
-def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
+def _stop_decision(repo: Path, session, ev: AgentEvent, other: bool = False) -> Decision:
     if ev.loop:
         return Decision()  # the harness already blocked once; never trap the agent
+    if other:
+        # Another agent's session holds the tree: never wait for its post, never answer for its edits.
+        # Only what this session itself changed (a command that got past before-edit) stops it
+        working = set(GitDiffInspector(repo).get_working_files())
+        mine = session_state(load_state(repo), session_key(ev))
+        own = [f for f in sorted(set(mine.get("own_changes") or []) | set(mine.get("pre_edit_changes") or []))
+               if f in working]
+        if own:
+            return Decision(action="block", reason=(
+                f"Guard: you changed {', '.join(own)} while {_held_reason(session)}. Undo it, or move the work "
+                "to a separate `git worktree add`, then tell the user."))
+        return Decision()
     if _wait_for_post(repo):  # the agent waits for a running guard post: decide on its result, once
         if _post_in_progress(repo):
             # Still running when the hook must answer (a full review takes longer than a hook may wait):
@@ -425,14 +546,14 @@ def _stop_decision(repo: Path, session, ev: AgentEvent) -> Decision:
             return Decision(action="block", reason=(
                 f"Guard: a guard post is still running (more than {POST_WAIT_S // 60} min so far). Do not start "
                 "another one: wait until it finishes, then read .guard/POST_TASK_REPORT.md and act on it."))
-        decision = _stop_on_session(repo, SessionManager(repo).load_local_session())
+        decision = _stop_on_session(repo, SessionManager(repo).load_local_session(), session_key(ev))
         if decision.action == "allow":
             return Decision(action="notify", reason="Guard: the guard post you waited for has finished; read its report and act on it.")
         return decision
-    return _stop_on_session(repo, session)
+    return _stop_on_session(repo, session, session_key(ev))
 
 
-def _stop_on_session(repo: Path, session) -> Decision:
+def _stop_on_session(repo: Path, session, agent_session: Optional[str] = None) -> Decision:
     if session and session.status == SessionStatus.NEEDS_USER:
         return Decision()  # stopping is right: the user decides (guard accept) before anything else
     if _active_pre(session):
@@ -444,7 +565,7 @@ def _stop_on_session(repo: Path, session) -> Decision:
         if uncovered:
             return Decision(action="block", reason=f"Guard: {', '.join(uncovered)} changed after the last approval. Run `guard post` again.")
         return Decision()
-    pre_edit = load_state(repo).get("pre_edit_changes") or []
+    pre_edit = session_state(load_state(repo), agent_session).get("pre_edit_changes") or []
     if pre_edit:
         return Decision(action="block", reason=(
             f"Guard: {', '.join(pre_edit)} changed without a guard session. Tell the user, or {PRE_HINT} and then run `guard post`."

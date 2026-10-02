@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 from guard.core.config import load_config, load_global_config
@@ -121,6 +122,20 @@ def execute_pre_task(
             "Stop and ask the user to run [bold]guard accept[/bold] in their own terminal."
         )
         return False
+    # The agent session that started this pre (a claim taken by the agent hook seconds ago); a restart
+    # keeps the first pre's owner, and another agent session cannot take over a held working tree
+    from guard.agent.events import fresh_claim, load_state, session_state
+    from guard.core.session import describe_owner
+    claim = fresh_claim(load_state(target_repo))
+    held_by = superseded.pre.owner if superseded and isinstance(superseded.pre.owner, dict) else None
+    if held_by and claim and claim["session"] != held_by.get("session"):
+        console.print(
+            f"[bold red]❌ This working tree is held by another agent's guard session[/bold red] "
+            f"({escape(describe_owner(held_by))}, task: {escape(' '.join(superseded.pre.prompt.split())[:80])}).\n"
+            "Do parallel work in a separate [bold]git worktree add[/bold], or wait until that task is committed. "
+            "The user can release it with [bold]guard reset[/bold].")
+        return False
+    owner = held_by if superseded else claim
     if superseded and not force:
         state = {SessionStatus.AWAITING_POST: "unfinished", SessionStatus.NEEDS_USER: "waiting for the user (guard accept)"}.get(
             superseded.status, "rejected (REVISE)")
@@ -250,7 +265,10 @@ def execute_pre_task(
     from guard.agent.events import update_state
 
     def take(state):  # consumed by this pre: never reused for a later task
-        taken = {k: state.pop(k, None) for k in ("user_prompt", "prompt_at", "pre_edit_changes")}  # in-flight "bash" stays
+        if owner:  # this pre's claim is consumed; another session's claim stays for its own pre
+            (state.get("claims") or {}).pop(owner["session"], None)
+        own = session_state(state, owner["session"]) if owner else state  # the owner's prompt, not the last one typed
+        taken = {k: own.pop(k, None) for k in ("user_prompt", "prompt_at", "pre_edit_changes")}  # in-flight "bash" stays
         return taken["user_prompt"], taken["pre_edit_changes"] or []
 
     recorded_prompt, recorded_changes = update_state(target_repo, take)
@@ -262,6 +280,7 @@ def execute_pre_task(
         pre_edit_changes=pre_edit_changes,
         impact=impact,
         carry=superseded,  # a restart keeps the task's findings ledger and round count
+        owner=owner,
         prompt=prompt,
         expected_files=candidate_files,
         contracts=contracts,

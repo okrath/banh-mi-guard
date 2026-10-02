@@ -6,6 +6,7 @@ outside the scope, when it stops, and when it commits.
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from typer.testing import CliRunner
 
 from guard.agent.events import AgentEvent, _pid_alive, decide, load_state, normalise
 from guard.cli import app, execute_post_task, execute_pre_task
-from guard.core.session import SessionManager
+from guard.core.session import SessionManager, SessionStatus
 
 
 def make_repo(tmp_path: Path) -> Path:
@@ -415,3 +416,170 @@ def test_pid_alive_rejects_non_positive_and_non_int():
     assert _pid_alive(0) is False
     assert _pid_alive(-1) is False
     assert _pid_alive("12") is False
+
+
+# --- two agent sessions in one working tree -------------------------------------------------------
+
+def ev(repo, event, session, **kw):
+    return decide(AgentEvent(event=event, cwd=str(repo), agent_session=session, agent="claude-code", **kw))
+
+
+def owned_pre(repo, prompt="Fix src/chat.ts", session="sess-A"):
+    """Agent session A runs `guard pre` through its Bash tool: the hook takes the claim first."""
+    ev(repo, "before-edit", session, tool="Bash", command=f'guard pre "{prompt}" --scope src/chat.ts', call_id="pre")
+    assert execute_pre_task(prompt, repo_path=repo) is True
+    ev(repo, "after-bash", session, tool="Bash", call_id="pre")
+    return SessionManager(repo).load_local_session()
+
+
+def test_normalise_reads_the_agent_session_id():
+    assert normalise("stop", {"session_id": "abc"}).agent_session == "abc"
+    assert normalise("stop", {"conversation_id": "c1"}).agent_session == "c1"
+    assert normalise("stop", {"sessionId": "s1"}).agent_session == "s1"
+    assert normalise("stop", {}).agent_session is None
+
+
+def test_pre_takes_the_claim_and_the_owners_own_prompt(tmp_path):
+    repo = make_repo(tmp_path)
+    ev(repo, "prompt", "sess-A", prompt="A: fix the chat")
+    ev(repo, "prompt", "sess-B", prompt="B: only plan the next phase")  # typed later, in another session
+    session = owned_pre(repo)
+    assert session.pre.owner == {"agent": "claude-code", "session": "claude-code:sess-A"}
+    assert session.pre.user_prompt == "A: fix the chat"  # never the last prompt typed into any agent
+    assert "B: only plan" in json.dumps(load_state(repo)["sessions"]["claude-code:sess-B"])  # B's stays B's
+    assert "* **Owner:** `claude-code session sess-A`" in (repo / ".guard" / "PRE_TASK_NOTE.md").read_text(encoding="utf-8")
+
+
+def test_a_pre_run_by_hand_has_no_owner_and_behaves_as_today(tmp_path):
+    repo = make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    session = SessionManager(repo).load_local_session()
+    assert session.pre.owner is None
+    assert ev(repo, "before-edit", "sess-B", tool="Edit", file_paths=[str(repo / "src/other.ts")]).action == "block"
+    assert "outside the declared scope" in ev(repo, "before-edit", "sess-B", tool="Edit",
+                                             file_paths=[str(repo / "src/other.ts")]).reason
+
+
+def test_another_session_cannot_restart_the_owners_task(tmp_path):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    ev(repo, "before-edit", "sess-B", tool="Bash", command='guard pre --force "B task" --scope src/other.ts', call_id="b")
+    assert execute_pre_task("B task", repo_path=repo, scope=["src/other.ts"], force=True) is False
+    assert SessionManager(repo).load_local_session().pre.owner["session"] == "claude-code:sess-A"
+    ev(repo, "before-edit", "sess-A", tool="Bash", command='guard pre --force "Fix src/chat.ts"', call_id="a")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, force=True) is True  # the owner may
+    assert SessionManager(repo).load_local_session().pre.owner["session"] == "claude-code:sess-A"
+
+
+def test_another_sessions_edit_is_blocked_with_the_worktree_hint(tmp_path):
+    from guard.core.untracked import decide as record
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    blocked = ev(repo, "before-edit", "sess-B", tool="Edit", file_paths=[str(repo / "src/chat.ts")])
+    assert blocked.action == "block" and "git worktree add" in blocked.reason and "Fix src/chat.ts" in blocked.reason
+    assert "claude-code session sess-A" in blocked.reason
+    (repo / "plans").mkdir()
+    record(repo, "plans", "ignore")
+    assert ev(repo, "before-edit", "sess-B", tool="Write", file_paths=[str(repo / "plans/p.md")]).action == "allow"
+    assert ev(repo, "before-edit", "sess-A", tool="Edit", file_paths=[str(repo / "src/chat.ts")]).action == "allow"
+
+
+def test_another_session_never_waits_or_stops_for_the_owners_edits(tmp_path, monkeypatch):
+    import guard.agent.events as events
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")  # the owner's edit
+    monkeypatch.setattr(events, "_post_in_progress", lambda r: True)  # the owner's post is running
+    monkeypatch.setattr(events, "POST_WAIT_S", 5)  # a wait would show as a slow test, never a hang
+    started = time.monotonic()
+    assert ev(repo, "stop", "sess-B").action == "allow"  # no block
+    assert time.monotonic() - started < 2  # and no wait for the owner's post
+    monkeypatch.setattr(events, "POST_WAIT_S", 0)
+    assert ev(repo, "stop", "sess-A").action == "block"  # the owner is gated as before
+
+
+def test_another_sessions_own_command_changes_are_reported_and_stop_it(tmp_path):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    ev(repo, "before-edit", "sess-B", tool="Bash", command="node gen.js", call_id="b1")
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")  # inside the owner's scope
+    assert ev(repo, "after-bash", "sess-B", tool="Bash", call_id="b1").action == "allow"
+    ev(repo, "before-edit", "sess-B", tool="Bash", command="node gen.js", call_id="b2")
+    (repo / "src" / "other.ts").write_text("export const b = 2;\n", encoding="utf-8")  # B's own change
+    reported = ev(repo, "after-bash", "sess-B", tool="Bash", call_id="b2")
+    assert reported.action == "notify" and reported.reason.startswith("Guard: that command changed src/other.ts while")
+    stopped = ev(repo, "stop", "sess-B")
+    assert stopped.action == "block" and "src/other.ts" in stopped.reason
+    subprocess.run(["git", "checkout", "--", "src/other.ts"], cwd=repo, check=True)
+    assert ev(repo, "stop", "sess-B").action == "allow"  # undone: nothing of its own is left
+
+
+def test_another_session_cannot_commit_and_gets_no_pre_hint(tmp_path):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    commit = ev(repo, "before-commit", "sess-B")
+    assert commit.action == "block" and "not yours to commit" in commit.reason
+    assert ev(repo, "prompt", "sess-B", prompt="B: what is next?").action == "allow"  # no "run guard pre" hint
+    state = load_state(repo)
+    assert state["sessions"]["claude-code:sess-B"]["user_prompt"] == "B: what is next?" and "user_prompt" not in state
+
+
+def test_the_post_report_names_the_owner(tmp_path, fake_ocr_review):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    execute_post_task(repo_path=repo)
+    assert "* **Owner:** `claude-code session sess-A`" in (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+
+
+def test_two_pres_started_together_give_no_owner_rather_than_the_wrong_one(tmp_path):
+    repo = make_repo(tmp_path)
+    ev(repo, "before-edit", "sess-A", tool="Bash", command='guard pre "A task" --scope src/chat.ts', call_id="a")
+    ev(repo, "before-edit", "sess-B", tool="Bash", command='guard pre "B task" --scope src/other.ts', call_id="b")
+    assert execute_pre_task("A task", repo_path=repo, scope=["src/chat.ts"]) is True
+    assert SessionManager(repo).load_local_session().pre.owner is None  # ambiguous: shared behaviour, as before
+
+
+def test_a_non_owners_changes_after_the_owners_task_still_stop_it(tmp_path, fake_ocr_review):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    s = SessionManager(repo)
+    session = s.load_local_session()
+    session.status = SessionStatus.COMPLETED  # the owner's task is approved, the tree no longer held
+    s._save(session)
+    ev(repo, "before-edit", "sess-B", tool="Bash", command="node gen.js", call_id="b1")
+    (repo / "src" / "other.ts").write_text("export const b = 2;\n", encoding="utf-8")
+    ev(repo, "after-bash", "sess-B", tool="Bash", call_id="b1")
+    stopped = ev(repo, "stop", "sess-B")
+    assert stopped.action == "block" and "src/other.ts" in stopped.reason
+
+
+def test_only_a_guard_pre_command_takes_a_claim():
+    from guard.agent.events import GUARD_PRE
+    for command in ('guard pre "x" --scope a', "cd app && guard pre x", "PYTHONPATH=. guard pre x",
+                    "/usr/local/bin/guard pre x", "C:\\tools\\guard.exe pre x", "(guard pre x)"):
+        assert GUARD_PRE.search(command), command
+    for command in ("grep guard pre docs/", "echo guard pre", "git log --grep 'guard pre'", "guard post"):
+        assert not GUARD_PRE.search(command), command
+
+
+def test_a_pre_keeps_another_sessions_claim_and_old_claims_expire(tmp_path, monkeypatch):
+    import guard.agent.events as events
+    repo = make_repo(tmp_path)
+    ev(repo, "before-edit", "sess-old", tool="Bash", command="guard pre old", call_id="o")
+    monkeypatch.setattr(events.time, "time", lambda real=events.time.time: real() + 120)  # two minutes later
+    ev(repo, "before-edit", "sess-A", tool="Bash", command='guard pre "Fix src/chat.ts"', call_id="a")
+    assert sorted(load_state(repo)["claims"]) == ["claude-code:sess-A"]  # the expired one is gone
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    assert SessionManager(repo).load_local_session().pre.owner["session"] == "claude-code:sess-A"
+    ev(repo, "before-edit", "sess-B", tool="Bash", command="guard pre --force B", call_id="b")
+    assert "claude-code:sess-B" in load_state(repo)["claims"]  # B's claim reaches its own pre, which is refused
+    assert execute_pre_task("B", repo_path=repo, force=True) is False
+
+
+def test_two_agents_with_the_same_session_id_are_not_one_session(tmp_path):
+    repo = make_repo(tmp_path)
+    owned_pre(repo, session="same-id")  # claude-code's session
+    other = decide(AgentEvent(event="before-edit", cwd=str(repo), agent_session="same-id", agent="codex",
+                              tool="Edit", file_paths=[str(repo / "src/chat.ts")]))
+    assert other.action == "block" and "git worktree add" in other.reason

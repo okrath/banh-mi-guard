@@ -770,3 +770,9 @@ def test_remove_says_so_when_the_switch_record_cannot_be_deleted(monkeypatch, ca
     with pytest.raises(typer.Exit):
         agent_cmds.agent_remove_cmd(name="zcode")
     assert "Delete it yourself before adding guard again" in " ".join(capsys.readouterr().out.split())
+
+
+def test_adapters_name_where_their_session_id_comes_from():
+    from guard.agent.adapter import BUILT_IN
+    with_id = {name for name, a in BUILT_IN.items() if a.get("session_id")}
+    assert with_id == {"claude-code", "codex", "cursor", "gemini"}  # the rest keep the shared behaviour (doctor says so)
