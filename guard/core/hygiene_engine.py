@@ -15,7 +15,13 @@ import re
 from pathlib import Path
 from typing import List, Optional, Set
 
+from guard.core.code_text import CODE
 from guard.core.ocr_engine import DiffSummary, FileDiffStat, RuleViolation
+
+SEARCH_EXTENSIONS = CODE + (
+    ".json", ".yaml", ".yml", ".toml", ".xml",
+    ".gradle", ".kts", ".csproj", ".html", ".vue", ".svelte", ".erb",
+)
 
 
 # File patterns that are legitimate entry points or configs and should not be flagged as orphan
@@ -124,16 +130,19 @@ class HygieneEngine:
                     continue  # Don't check the file itself
 
                 # Only search code and config files
-                if not any(f.endswith(ext) for ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".yaml", ".yml", ".toml", ".html")):
+                if not any(f.endswith(ext) for ext in SEARCH_EXTENSIONS):
                     continue
 
                 try:
                     content = fpath.read_text(encoding="utf-8", errors="ignore")
                     if target_token in content or stem in content:
                         return True
+                    # Go imports a package by its directory: a Go file is used when a Go import path ends in it
+                    if norm_target.endswith(".go") and f.endswith(".go") and p.parent.name \
+                            and f'/{p.parent.name}"' in content:
+                        return True
                 except Exception:
                     continue
-
         return False
 
     def check_orphan_file(self, file_path: str) -> Optional[RuleViolation]:

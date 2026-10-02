@@ -843,3 +843,27 @@ def test_fix8b_review_findings():
     assert not [f for f in found("web/view.js", "const html = markup(x);") if f[0] == "SEC-003"]
     assert not [f for f in found("app/view.py", "html = markup(x)") if f[0] == "SEC-003"]
     assert ("SEC-003", "HIGH") in found("app/view.py", "html = Markup(user)")
+
+
+def test_ios_info_plist_keys_with_the_value_on_the_same_or_next_line():
+    plist = "ios/App/Info.plist"
+    assert ("MOB-001", "HIGH") in found(plist, "<key>NSAllowsArbitraryLoads</key><true/>")
+    assert ("MOB-001", "HIGH") in found(plist, "<key>NSAllowsArbitraryLoads</key>", "<true/>")
+    assert ("MOB-002", "MEDIUM") in found(plist, "<key>UIFileSharingEnabled</key>", "<true/>")
+    assert not found(plist, "<key>NSAllowsArbitraryLoads</key>", "<false/>")
+    assert not found(plist, "<key>CFBundleName</key>", "<true/>")
+
+
+def test_ios_info_plist_value_turned_true_under_an_unchanged_key():
+    diff = "+++ b/Info.plist\n@@ -1,2 +1,2 @@\n <key>UIFileSharingEnabled</key>\n-<false/>\n+<true/>\n"
+    hits = [(v.rule_id, v.line_number) for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id.startswith("MOB")]
+    assert hits == [("MOB-002", 2)]
+    unchanged = "+++ b/Info.plist\n@@ -1,2 +1,3 @@\n <key>UIFileSharingEnabled</key>\n <true/>\n+<key>A</key>\n"
+    assert not [v for v in OCRRulebookRunner().scan_diff(unchanged) if v.rule_id.startswith("MOB")]
+
+
+def test_ios_info_plist_key_renamed_over_an_unchanged_true_value():
+    diff = ("+++ b/Info.plist\n@@ -1,2 +1,2 @@\n-<key>NSAllowsLocalNetworking</key>\n"
+            "+<key>NSAllowsArbitraryLoads</key>\n <true/>\n")
+    hits = [(v.rule_id, v.line_number) for v in OCRRulebookRunner().scan_diff(diff) if v.rule_id.startswith("MOB")]
+    assert hits == [("MOB-001", 1)]

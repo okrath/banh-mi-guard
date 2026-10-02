@@ -4,7 +4,8 @@ Inspired by Larry Wall's virtue of Laziness and Dietrich Gebert's Ponytail philo
 "The best code is the code you never wrote."
 
 Detects:
-- LAZY-001 (Dependency Bloat): Unnecessary new dependencies added to package.json / pyproject.toml / requirements.
+- LAZY-001 (Dependency Bloat): Unnecessary new dependencies added to package.json / pyproject.toml / requirements /
+  go.mod / Cargo.toml / pom.xml / build.gradle(.kts) / composer.json / *.csproj.
 """
 
 from __future__ import annotations
@@ -40,6 +41,50 @@ REDUNDANT_PY_PACKAGES = {
     "pytz": "Replace with native standard library `zoneinfo` (Python 3.9+)",
     "six": "Remove obsolete Python 2/3 compatibility layer",
 }
+
+# Packages of other ecosystems that the standard library replaces; only uncontroversial ones, where the
+# package itself points to the replacement. Gemfile, pubspec.yaml and Package.swift list none yet
+REDUNDANT_GO_PACKAGES = {
+    "github.com/pkg/errors": "Replace with the standard library `errors` and `fmt.Errorf` with `%w` (Go 1.13+)",
+}
+
+REDUNDANT_CARGO_PACKAGES = {
+    "lazy_static": "Replace with the standard library `std::sync::LazyLock` (Rust 1.80+)",
+    "once_cell": "Replace with the standard library `std::sync::OnceLock` / `LazyLock` (Rust 1.70+ / 1.80+)",
+}
+
+REDUNDANT_JVM_PACKAGES = {
+    "joda-time": "Replace with the standard library `java.time` (Java 8+), as Joda-Time itself advises",
+}
+
+REDUNDANT_COMPOSER_PACKAGES = {
+    "paragonie/random_compat": "Replace with the built-in `random_bytes()` / `random_int()` (PHP 7+)",
+}
+
+REDUNDANT_NUGET_PACKAGES = {
+    "System.ValueTuple": "Remove: value tuples are built into .NET Core / .NET 5+ and .NET Framework 4.7+",
+}
+
+# (manifest test, ecosystem label, packages, quoted): the first manifest that matches the file is checked;
+# a quoted manifest (JSON) names a package only in quotes, so prose in "description" does not count
+MANIFESTS = (
+    (lambda f: f.endswith("package.json"), "npm", REDUNDANT_NPM_PACKAGES, True),
+    (lambda f: f.endswith("pyproject.toml") or "requirements" in f, "Python", REDUNDANT_PY_PACKAGES, False),
+    (lambda f: f.endswith("go.mod"), "Go", REDUNDANT_GO_PACKAGES, False),
+    (lambda f: f.endswith("cargo.toml"), "Cargo", REDUNDANT_CARGO_PACKAGES, False),
+    (lambda f: f.endswith(("pom.xml", "build.gradle", "build.gradle.kts")), "Java/Kotlin", REDUNDANT_JVM_PACKAGES, False),
+    (lambda f: f.endswith("composer.json"), "PHP", REDUNDANT_COMPOSER_PACKAGES, True),
+    (lambda f: f.endswith(".csproj"), ".NET", REDUNDANT_NUGET_PACKAGES, False),
+    (lambda f: f.endswith(("gemfile", "pubspec.yaml", "package.swift")), "", {}, False),
+)
+
+
+def _names_package(content: str, pkg: str, quoted: bool) -> bool:
+    """`pkg` as a whole package name: `argparse` is not `argparse-manpage`, `mock` is not `pytest-mock`."""
+    # `(?<=dependencies\.)`: Cargo's table form `[dependencies.once_cell]`
+    name = rf"[\"']{re.escape(pkg)}[\"']" if quoted \
+        else rf"(?:(?<=dependencies\.)|(?<![\w.\-/@])){re.escape(pkg)}(?![\w.\-/])"
+    return re.search(name, content, re.IGNORECASE) is not None
 
 
 class SimplicityEngine:
@@ -79,7 +124,8 @@ class SimplicityEngine:
 
     def scan_dependency_bloat(self, raw_diff: str) -> List[RuleViolation]:
         """
-        LAZY-001: Scan diff in manifest files (package.json, pyproject.toml, requirements.txt)
+        LAZY-001: Scan diff in manifest files (package.json, pyproject.toml, requirements*, go.mod, Cargo.toml,
+        pom.xml, build.gradle(.kts), composer.json, *.csproj, Gemfile, pubspec.yaml, Package.swift)
         to catch unnecessary new dependencies when native or stdlib suffices.
         """
         violations: List[RuleViolation] = []
@@ -93,32 +139,21 @@ class SimplicityEngine:
             if not (line.startswith("+") and not line.startswith("+++")):
                 continue
 
-            added_content = line[1:].strip().lower()
+            added_content = line[1:].strip()
             cf_lower = current_file.replace("\\", "/").lower()
-
-            # Check package.json additions
-            if cf_lower.endswith("package.json"):
-                for pkg, rec in REDUNDANT_NPM_PACKAGES.items():
-                    if f'"{pkg}"' in added_content or f"'{pkg}'" in added_content:
-                        violations.append(RuleViolation(
-                            rule_id="LAZY-001",
-                            severity="HIGH",
-                            file_path=current_file,
-                            message=f"Dependency Bloat: Added redundant npm package `{pkg}`. {rec}.",
-                            snippet=line[1:].strip()[:80],
-                        ))
-
-            # Check pyproject.toml / requirements.txt additions
-            elif cf_lower.endswith("pyproject.toml") or "requirements" in cf_lower:
-                for pkg, rec in REDUNDANT_PY_PACKAGES.items():
-                    if re.search(rf"""(?i)\b{re.escape(pkg)}\b""", added_content):
-                        violations.append(RuleViolation(
-                            rule_id="LAZY-001",
-                            severity="HIGH",
-                            file_path=current_file,
-                            message=f"Dependency Bloat: Added redundant Python package `{pkg}`. {rec}.",
-                            snippet=line[1:].strip()[:80],
-                        ))
+            manifest = next((m[1:] for m in MANIFESTS if m[0](cf_lower)), None)
+            if not manifest or (cf_lower.endswith("go.mod") and added_content.endswith("// indirect")):
+                continue  # an `// indirect` module is a dependency of a dependency, not the author's choice
+            label, packages, quoted = manifest
+            for pkg, rec in packages.items():
+                if _names_package(added_content, pkg, quoted):
+                    violations.append(RuleViolation(
+                        rule_id="LAZY-001",
+                        severity="HIGH",
+                        file_path=current_file,
+                        message=f"Dependency Bloat: Added redundant {label} package `{pkg}`. {rec}.",
+                        snippet=added_content[:80],
+                    ))
 
         return violations
 
@@ -129,10 +164,3 @@ class SimplicityEngine:
         """
         diff_text = raw_diff or ""
         return self.scan_dependency_bloat(diff_text)
-
-    def scan_focus_level(self, touched_files: List[str]) -> List[RuleViolation]:
-        """
-        Level 2: Deep focus check (Full-file scope) for `--focus simplicity` / `--focus yagni`.
-        Returns deterministic simplicity violations if any.
-        """
-        return []

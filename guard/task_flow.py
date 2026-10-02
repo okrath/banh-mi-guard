@@ -465,13 +465,8 @@ def _execute_post_task(
         hygiene_violations = hygiene.scan_diff_level(task_diff, task_summary)
     violations.extend(hygiene_violations)
 
-    simplicity = SimplicityEngine(target_repo)
-    if (focus or "").lower() in ("simplicity", "yagni", "lazy"):
-        touched = [f.path for f in diff_summary.files]
-        simplicity_violations = simplicity.scan_focus_level(touched)
-    else:
-        simplicity_violations = simplicity.scan_diff_level(task_diff, task_summary)
-    violations.extend(simplicity_violations)
+    # dependency bloat is read from the diff, with or without --focus simplicity
+    violations.extend(SimplicityEngine(target_repo).scan_diff_level(task_diff, task_summary))
 
     # Alibaba OCR (an LLM review that reads the repository) runs only for a full review (--full, never
     # in a Git hook); then OCR not running blocks like a HIGH finding. Without it the report says so.

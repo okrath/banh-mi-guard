@@ -111,3 +111,43 @@ def test_documentation_is_never_an_orphan(tmp_path):
     engine = HygieneEngine(tmp_path)
     for doc in ("plans/2026-x/phase-01.md", "docs/guide.rst", "NOTES.txt", "handbook/docs/a.mdx"):
         assert engine.check_orphan_file(doc) is None, doc
+def test_language_reference_patterns_not_orphans(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Go: new util.go referenced by import ".../util"
+    pkg_dir = repo / "pkg" / "util"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "util.go").write_text("package util\nfunc Do() {}\n", encoding="utf-8")
+    (repo / "consumer.go").write_text('package main\nimport "example.com/project/pkg/util"\n', encoding="utf-8")
+
+    # Java: new Helper.java referenced as Helper.
+    src_java = repo / "src"
+    src_java.mkdir(parents=True, exist_ok=True)
+    (src_java / "Helper.java").write_text("public class Helper {}\n", encoding="utf-8")
+    (src_java / "Main.java").write_text("class Main { void f() { Helper.run(); } }\n", encoding="utf-8")
+
+    # Rust: new parser.rs referenced by mod parser;
+    (repo / "parser.rs").write_text("pub fn parse() {}\n", encoding="utf-8")
+    (repo / "lib.rs").write_text("mod parser;\n", encoding="utf-8")
+
+    # Kotlin: unreferenced orphan.kt
+    (repo / "orphan.kt").write_text("class Orphan {}\n", encoding="utf-8")
+
+    engine = HygieneEngine(repo_path=repo)
+    assert engine.check_orphan_file("pkg/util/util.go") is None
+    assert engine.check_orphan_file("src/Helper.java") is None
+    assert engine.check_orphan_file("parser.rs") is None
+
+    kt_viol = engine.check_orphan_file("orphan.kt")
+    assert kt_viol is not None
+    assert kt_viol.rule_id == "DEAD-001"
+
+
+def test_a_quoted_directory_name_does_not_reference_a_non_go_file(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "lonely_widget.ts").write_text("export const x = 1\n", encoding="utf-8")
+    (repo / "tsconfig.json").write_text('{"include": ["src"]}\n', encoding="utf-8")
+    (repo / "main.go").write_text('import "example.com/app/src"\n', encoding="utf-8")
+    assert HygieneEngine(repo_path=repo).check_orphan_file("src/lonely_widget.ts") is not None
