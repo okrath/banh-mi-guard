@@ -618,6 +618,7 @@ def agent_event_cmd(
             raise ValueError(f"payload is a JSON {type(payload).__name__}, not an object")
         fields = adapter.get("fields") if adapter else None
         ev = normalise(event, payload, fields)
+        ev.agent = agent or ""
         if event != "stop" and not (ev.prompt or ev.tool or ev.file_paths or ev.command):
             log(f"INCOMPLETE payload without the fields this event needs (keys: {sorted(payload)[:12]})")
     except Exception as e:  # a payload guard cannot read: never break the agent because of guard
@@ -632,6 +633,7 @@ def agent_event_cmd(
     harness = harness_event(adapter, event, payload if isinstance(payload, dict) else {})
     if _test_listening():  # `guard agent test` is listening
         tool = f" tool={ev.tool}" if ev is not None and ev.tool else ""
+        tool += f" session={ev.agent_session[:8]}" if ev is not None and ev.agent_session else " session=-"
         log(f"EVENT {harness or '-'}{tool} -> {decision.action}")
     out, err, code = render((adapter or {}).get("output"), harness, decision)
     sys.stdout.write(out)

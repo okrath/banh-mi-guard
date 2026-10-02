@@ -17,6 +17,7 @@ _CLAUDE_LIKE_BLOCK = {"stdout": {"decision": "block", "reason": "{reason}"}}
 # config.toml). The decision is read from stdout JSON only: exit codes do not block.
 CODEX: Dict[str, Any] = {
     "name": "codex",
+    "session_id": "session_id (documented: codex-rs hooks, the Claude Code payload shape)",
     "title": "OpenAI Codex CLI",
     "detect": "~/.codex",
     "config": "~/.codex/hooks.json",
@@ -52,6 +53,7 @@ CODEX: Dict[str, Any] = {
 # (a number) says how often that already happened.
 CURSOR: Dict[str, Any] = {
     "name": "cursor",
+    "session_id": "conversation_id (documented: cursor.com/docs/agent/hooks, common to every hook)",
     "title": "Cursor",
     "detect": "~/.cursor",
     "config": "~/.cursor/hooks.json",
@@ -122,6 +124,7 @@ GROK: Dict[str, Any] = {
 # the stop; exit 2 with the reason on stderr blocks on every event.
 GEMINI: Dict[str, Any] = {
     "name": "gemini",
+    "session_id": "session_id (documented: Gemini CLI hooks reference)",
     "title": "Gemini CLI",
     "detect": "~/.gemini",
     "config": "~/.gemini/settings.json",

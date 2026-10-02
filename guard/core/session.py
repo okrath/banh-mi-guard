@@ -71,8 +71,17 @@ class PreTaskRecord(BaseModel):
     # command changed before this pre ran
     user_prompt: Optional[str] = None
     pre_edit_changes: List[str] = Field(default_factory=list)
+    # The agent session that ran this pre ({"agent", "session"}); None for a pre run by hand or by an
+    # agent that sends no session id. Other agent sessions are then judged on their own work only
+    owner: Optional[Dict[str, str]] = None
     # Symbols of the scoped files with their references, tests and invariants (None: a session from before it existed)
     impact: Optional[ImpactRange] = None
+
+
+def describe_owner(owner: Dict[str, str]) -> str:
+    """`claude-code session 1a2b3c4d`: the agent and a short session id, never its prompt."""
+    session = str(owner.get("session", "")).split(":", 1)[-1]  # the key is `<agent>:<id>`
+    return f"{owner.get('agent') or 'an agent'} session {session[:8]}"
 
 
 class BuildCheckResult(BaseModel):
@@ -238,6 +247,7 @@ class SessionManager:
         pre_edit_changes: Optional[List[str]] = None,
         impact: Optional[ImpactRange] = None,
         carry: Optional["GuardSession"] = None,
+        owner: Optional[Dict[str, str]] = None,
     ) -> GuardSession:
         self.guard_dir.mkdir(parents=True, exist_ok=True)
         self.ensure_gitignore()
@@ -260,6 +270,7 @@ class SessionManager:
             baseline_snapshot=baseline_snapshot,
             restarts=restarts or [],
             user_prompt=user_prompt,
+            owner=owner,
             pre_edit_changes=pre_edit_changes or [],
             impact=impact,
             expected_files=expected_files,

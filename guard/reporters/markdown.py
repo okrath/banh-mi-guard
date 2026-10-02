@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from guard.core.impact import ImpactRange, is_test
-from guard.core.session import PostTaskRecord, PreTaskRecord
+from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 
 INVARIANT_ICONS = {"passed": "✅", "failed": "❌", "unverified": "⚪", "baseline_failed": "⚠️", "retired": "🗑️"}
 
@@ -107,6 +107,12 @@ def _format_domain_description(pre: PreTaskRecord) -> str:
     return base
 
 
+def owner_lines(pre: PreTaskRecord) -> list:
+    """The agent session that owns the task (other agent sessions in this working tree are judged apart)."""
+    owner = pre.owner if isinstance(pre.owner, dict) and pre.owner.get("session") else None
+    return [f"* **Owner:** `{_clean_inert(describe_owner(owner))}`"] if owner else []
+
+
 def contract_lines(pre: PreTaskRecord) -> list:
     """The baseline contracts recorded at pre and where they came from (the LLM, or why none)."""
     md = []
@@ -135,6 +141,7 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     md = []
     md.append("### 🔍 PRE-TASK IMPACT NOTE:\n")
     md.append(f"* **Task Request:** {pre.prompt}")
+    md.extend(owner_lines(pre))
     md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
 
     # Baseline
@@ -187,6 +194,7 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         md.extend(restart_lines(pre))
         md.append("")
     if pre:  # what the review judged against, fixed at pre
+        md.extend(owner_lines(pre))
         md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
         md.append("* **Baseline Contracts:**")
         md.extend(contract_lines(pre))
