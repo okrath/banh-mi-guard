@@ -5,15 +5,18 @@ Renders visually striking CLI outputs with colorized badges, tables, and panels.
 
 from __future__ import annotations
 
+import os
+import textwrap
 from typing import Optional
 
 from rich.console import Console
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from guard.core.session import PostTaskRecord, PreTaskRecord
+from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
 
 console = Console()
@@ -39,6 +42,9 @@ def render_pre_task_terminal(pre: PreTaskRecord):
     header_text.append("🛡️ BANH-MI-GUARD: PRE-TASK IMPACT NOTE\n", style="bold cyan")
     header_text.append(f"Prompt: ", style="bold white")
     header_text.append(f"{pre.prompt}\n", style="italic yellow")
+    if isinstance(pre.owner, dict) and pre.owner.get("session"):
+        header_text.append("Owner: ", style="bold white")
+        header_text.append(f"{describe_owner(pre.owner)}\n")
     header_text.append(f"Domain: ", style="bold white")
     header_text.append(f"{_format_terminal_domain(pre)}  ", style="bold green")
     console.print(Panel(header_text, border_style="cyan"))
@@ -249,3 +255,170 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
     if post.all_passed:
         console.print("[bold cyan]📝 Commit:[/bold cyan] ", end="")
         console.print(commit_instruction(post), markup=False)
+
+
+# --- guard accept -------------------------------------------------------------------------------------
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+SEVERITY_STYLE = {"critical": "bold red", "high": "bold dark_orange", "medium": "yellow", "low": "dim"}
+WIDE_SCREEN = 100  # below this the findings are stacked blocks instead of a table
+EXTRA_ROUNDS = 3  # what `c` adds to the review budget
+
+
+def symbol(out: Console, emoji: str, text: str) -> str:
+    """The emoji where the console can show it; the text with NO_COLOR, on a legacy Windows console, or
+    when the console's encoding cannot hold it (a cp1252 console)."""
+    if os.environ.get("NO_COLOR") is not None or out.legacy_windows:
+        return text
+    try:
+        emoji.encode(out.encoding or "utf-8")
+        return emoji
+    except (UnicodeEncodeError, LookupError):
+        return text
+
+
+def _cut(text: str, lines: int, width: int, more: str) -> str:
+    """At most `lines` lines of `width`, ending in `more` when something was cut."""
+    wrapped = textwrap.wrap(" ".join(text.split()), width=max(width, 20)) or [""]
+    return "\n".join(wrapped[:lines]) + (more if len(wrapped) > lines else "")
+
+
+def accept_gate_status(post: PostTaskRecord) -> dict:
+    """"passed", "failed", "unverified" or "not run" for each deterministic gate of the last round; an
+    invariant without an applicable check is unverified, never passed."""
+    inv = post.invariant_result
+    ocr_high = any(v.rule_id.startswith("OCR-") and v.severity in ("HIGH", "CRITICAL") for v in post.rule_violations)
+    statuses = [c.status for c in inv.checks if c.status != "retired"] if inv else []  # a retired rule no longer applies
+    return {
+        "Build": "not run" if post.build_check is None else ("passed" if post.build_check.passed else "failed"),
+        "Invariants": "not run" if inv is None else "failed" if "failed" in statuses
+        else "passed" if statuses and all(s == "passed" for s in statuses) else "unverified",
+        "Scope": "failed" if post.out_of_scope_files else ("passed" if post.scope_declared else "not run"),
+        "OCR": "failed" if ocr_high else ("passed" if post.ocr_complete else "not run"),
+    }
+
+
+def accept_blocker(post: PostTaskRecord, changed: list) -> str:
+    """Why `a` cannot approve the last round, or "" when it can."""
+    if changed:
+        return f"{len(changed)} file(s) changed since the review"
+    if post.review_mode != "llm_deep":
+        return "the last round was not an LLM review; only the LLM's findings can be accepted"
+    failed = [name for name, state in accept_gate_status(post).items() if state == "failed"]
+    return f"{', '.join(failed)} did not pass in the last round" if failed else ""
+
+
+def render_accept_header(session, out: Console = console) -> None:
+    post, pre = session.post, session.pre
+    text = Text()
+    text.append(f"{symbol(out, '🧑', '[?]')} GUARD ACCEPT: a task is waiting for your decision\n", style="bold cyan")
+    text.append("Task: ", style="bold white")
+    text.append(_cut(pre.prompt if pre else "", 3, out.width - 12, symbol(out, "…", "...")) + "\n", style="italic yellow")
+    text.append("Session: ", style="bold white")
+    text.append(f"{session.session_id}\n")
+    text.append("Rounds: ", style="bold white")
+    text.append(f"{session.llm_revise_rounds} of {session.revise_budget} review rounds used\n")
+    text.append("Last verdict: ", style="bold white")
+    text.append(f"{post.muse_verdict} {post.muse_score:.1f}/10",
+                style="bold green" if post.muse_verdict == "APPROVED" else "bold red")
+    text.append(f" ({gate_label(post)})\n")
+    text.append("Last post: ", style="bold white")
+    text.append(post.timestamp.replace("T", " ")[:19] + " UTC")
+    out.print(Panel(text, border_style="cyan"))
+
+
+def render_accept_gates(post: PostTaskRecord, changed: list, out: Console = console) -> None:
+    marks = {"passed": (symbol(out, "✅", "[ok]") + " passed", "green"),
+             "failed": (symbol(out, "❌", "[x]") + " failed", "bold red"),
+             "unverified": ("? unverified (check by hand)", "yellow"),
+             "not run": ("- not run", "dim")}
+    row = Text()
+    for name, state in accept_gate_status(post).items():
+        label, style = marks[state]
+        row.append(f"{name}: ", style="bold white")
+        row.append(label, style=style)
+        row.append("   ")
+    out.print(row)
+    line = Text(f"Files changed since the review: {len(changed)}", style="bold red" if changed else "dim")
+    if changed:
+        line.append(" (" + ", ".join(changed[:10]) + (", " + symbol(out, "…", "...") if len(changed) > 10 else "") + ")", style="red")
+    out.print(line)
+
+
+def accept_finding_groups(findings: list) -> list:
+    """Blocking (open blocking findings) first, then the follow-ups; each by severity, then file."""
+    def order(e):
+        return SEVERITY_ORDER.get(str(e.get("severity", "")).lower(), 9), str(e.get("location") or "")
+    blocking = [e for e in findings if e.get("blocking") and e.get("status") == "open"]
+    rest = [e for e in findings if e not in blocking]
+    return [("Blocking (would stop the commit)", sorted(blocking, key=order)),
+            ("Follow-ups (advisory)", sorted(rest, key=order))]
+
+
+def _finding_description(e: dict) -> Text:
+    body = Text(str(e.get("description", "")))
+    if e.get("note"):
+        body.append(f"\nnote: {e.get('note')}", style="italic dim")
+    return body
+
+
+def render_accept_findings(findings: list, out: Console = console) -> None:
+    # finding text comes from the LLM: always plain Text, never parsed as markup
+    for title, group in accept_finding_groups(findings):
+        if not group:
+            continue
+        out.print(Text(f"\n{title}: {len(group)}", style="bold magenta"))
+        if out.width >= WIDE_SCREEN:
+            table = Table(show_header=True, header_style="bold", expand=True)
+            for col in ("Id", "Severity", "Kind", "Location", "Status"):
+                table.add_column(col, no_wrap=col in ("Id", "Severity"))
+            table.add_column("Description", ratio=1)
+            for e in group:
+                sev = str(e.get("severity", "")).lower()
+                table.add_row(Text(str(e.get("id", ""))), Text(sev.upper(), style=SEVERITY_STYLE.get(sev, "")),
+                              Text(str(e.get("kind", ""))), Text(str(e.get("location") or "-")),
+                              Text(str(e.get("status", ""))), _finding_description(e))
+            out.print(table)
+            continue
+        for e in group:
+            sev = str(e.get("severity", "")).lower()
+            head = Text(f"{symbol(out, '•', '*')} [{e.get('id', '')}] ")
+            head.append(sev.upper(), style=SEVERITY_STYLE.get(sev, ""))
+            head.append(f" {e.get('kind', '')} {symbol(out, '·', '-')} {e.get('status', '')}")
+            out.print(head)
+            out.print(Text(f"  {e.get('location') or '-'}", style="cyan"))
+            out.print(Padding(_finding_description(e), (0, 0, 0, 4)))
+
+
+def render_accept_choices(blocker: str, budget: int, out: Console = console) -> None:
+    text = Text()
+    if blocker:
+        text.append("(a) approve - not possible: ", style="dim strike")
+        text.append(blocker + "\n", style="dim")
+    else:
+        text.append("(a) ", style="bold green")
+        text.append("approve the files exactly as last reviewed; the findings above stay as follow-ups\n")
+    text.append("(c) ", style="bold yellow")
+    text.append(f"allow {EXTRA_ROUNDS} more review rounds (budget {budget} -> {budget + EXTRA_ROUNDS}), "
+                "then run guard post\n")
+    text.append("(q) ", style="bold")
+    text.append("quit, nothing changes")
+    out.print(Panel(text, title="Your decision", border_style="yellow"))
+
+
+def render_accept_result(choice: str, session, out: Console = console) -> None:
+    ok, report = symbol(out, "✅", "[ok]"), ".guard/POST_TASK_REPORT.md"
+    if choice == "a":
+        body = (f"{ok} Approved by you. Status: completed.\n"
+                f"Follow-ups kept: {len(session.post.followups)}. Report: {report}\nNext: commit now.")
+        style = "green"
+    elif choice == "c":
+        body = (f"{ok} {EXTRA_ROUNDS} more review rounds allowed. Status: needs_fix.\n"
+                f"Review budget: {session.revise_budget}. Report: {report}\n"
+                "Next: fix the findings, then run guard post.")
+        style = "yellow"
+    else:
+        body = (f"Nothing changed. Status: needs_user. Report: {report}\n"
+                "Next: run guard accept again when you have decided.")
+        style = "dim"
+    out.print(Panel(Text(body), border_style=style))

@@ -30,6 +30,7 @@ MARKER = "agent-event"  # guard's entries are the ones that run `guard agent-eve
 # settings file run for every project; edits are picked up without a restart.
 CLAUDE_CODE: Dict[str, Any] = {
     "name": "claude-code",
+    "session_id": "session_id (documented: code.claude.com hooks reference, every hook payload)",
     "title": "Claude Code",
     "detect": "~/.claude",
     "config": "~/.claude/settings.json",
