@@ -107,17 +107,9 @@ def _format_domain_description(pre: PreTaskRecord) -> str:
     return base
 
 
-def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
-    """
-    Generate standard Pre-Task Impact Note.
-    """
+def contract_lines(pre: PreTaskRecord) -> list:
+    """The baseline contracts recorded at pre and where they came from (the LLM, or why none)."""
     md = []
-    md.append("### 🔍 PRE-TASK IMPACT NOTE:\n")
-    md.append(f"* **Task Request:** {pre.prompt}")
-    md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
-    
-    # Baseline
-    md.append("\n* **Current Baseline Contracts:**")
     if pre.existing_contracts:
         if pre.contracts_source:
             md.append(f"  - Source: `{_clean_inert(pre.contracts_source)}`")
@@ -133,6 +125,21 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
         md.append(f"  - none found (`{_clean_inert(pre.contracts_source)}`)")
     else:
         md.append(f"  - contracts: not extracted (`{_clean_inert(pre.contracts_source)}`)")
+    return md
+
+
+def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
+    """
+    Generate standard Pre-Task Impact Note.
+    """
+    md = []
+    md.append("### 🔍 PRE-TASK IMPACT NOTE:\n")
+    md.append(f"* **Task Request:** {pre.prompt}")
+    md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
+
+    # Baseline
+    md.append("\n* **Current Baseline Contracts:**")
+    md.extend(contract_lines(pre))
     # Expected Impact Range
     md.append("\n* **Expected Impact Range (Target Files):**")
     if pre.expected_files:
@@ -178,6 +185,11 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
     if pre and (pre.restarts or pre.late_scope):
         md.append("* **Session restarts:**")
         md.extend(restart_lines(pre))
+        md.append("")
+    if pre:  # what the review judged against, fixed at pre
+        md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
+        md.append("* **Baseline Contracts:**")
+        md.extend(contract_lines(pre))
         md.append("")
 
     # Actual Impact Range
