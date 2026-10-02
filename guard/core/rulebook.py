@@ -87,6 +87,7 @@ class OCRRulebookRunner:
         self._stages = set()
         self._open_comment = {}  # file -> the `*/` or `-->` that closes a comment left open on a diff line
         self._open_img = {}  # file -> (line, text so far) of an <img tag not closed on its first line
+        self._open_key = {}  # Info.plist -> (line, text, added) of a <key> whose value is on the next line
         self._open_string = {}
 
         for line in diff_text.splitlines():
@@ -103,6 +104,8 @@ class OCRRulebookRunner:
                 _carry_comment(self._open_comment, cf, line[1:])
                 _carry_string(self._open_string, cf, line[1:], open_comm)
                 self._file_context(current_file.lower(), line[1:].strip())
+                if cf.endswith("info.plist"):  # an added key over an unchanged value is reported here
+                    violations.extend(self._plist_value(cf, current_file, line_num, line[1:].strip(), added=False))
                 continue
             if line.startswith("@@"):
                 match = re.search(r"\+(\d+)", line)
@@ -111,6 +114,7 @@ class OCRRulebookRunner:
                 self._open_comment.pop(current_file.replace("\\", "/").lower(), None)
                 self._open_string.pop(current_file.replace("\\", "/").lower(), None)
                 self._open_img.pop(current_file.replace("\\", "/").lower(), None)
+                self._open_key.pop(current_file.replace("\\", "/").lower(), None)
                 continue
 
             if line.startswith("+") and not line.startswith("+++"):
@@ -194,6 +198,8 @@ class OCRRulebookRunner:
                     violations.extend(self._line_rules(cf_lower, current_file, line_num, visible, string_cutoff))
                     if cf_lower.endswith(MARKUP):
                         violations.extend(self._multiline_img(cf_lower, current_file, line_num, visible))
+                    if cf_lower.endswith("info.plist"):
+                        violations.extend(self._plist_value(cf_lower, current_file, line_num, visible, added=True))
                 self._file_context(cf_lower, added_code)
 
         return violations
@@ -215,6 +221,19 @@ class OCRRulebookRunner:
         if last >= 0 and _tag_end(code[last:]) < 0:
             if len(code[last:]) <= MAX_IMG_TAG:
                 self._open_img[path_lower] = (line_num, code[last:])
+        return found
+
+    def _plist_value(self, path_lower: str, path: str, line_num: int, code: str, added: bool) -> List[RuleViolation]:
+        """MOB rows for an Info.plist key whose value is on the next line: an added key, or an added value
+        under an unchanged key (`<false/>` turned `<true/>`), reported on the added line."""
+        found: List[RuleViolation] = []
+        key = self._open_key.pop(path_lower, None)
+        if key and (added or key[2]):
+            pair = f"{key[1]} {code}"
+            found = [v for v in self._line_rules(path_lower, path, key[0] if key[2] else line_num, pair)
+                     if v.rule_id.startswith("MOB-")]
+        if re.search(r"</key>\s*$", code):
+            self._open_key[path_lower] = (line_num, code, added)
         return found
 
     def _file_context(self, path_lower: str, code: str) -> None:

@@ -52,13 +52,8 @@ def review_cmd(
         hygiene_violations = hygiene.scan_diff_level(raw_diff, summary)
     violations.extend(hygiene_violations)
 
-    simplicity = SimplicityEngine(target_repo)
-    if (focus or "").lower() in ("simplicity", "yagni", "lazy"):
-        touched = [f.path for f in summary.files]
-        simplicity_violations = simplicity.scan_focus_level(touched)
-    else:
-        simplicity_violations = simplicity.scan_diff_level(raw_diff, summary)
-    violations.extend(simplicity_violations)
+    # dependency bloat is read from the diff, with or without --focus simplicity
+    violations.extend(SimplicityEngine(target_repo).scan_diff_level(raw_diff, summary))
     reviewer = LLMReviewerEngine(config=load_config(target_repo))
     dom_type = detect_domain(target_repo)
 

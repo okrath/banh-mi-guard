@@ -30,6 +30,8 @@ When a repository has no project invariants, guard adds a few generic **template
 | Container running as root (`USER root` / `USER 0` with no later `USER` of another user in the diff) | Rule | `INFRA-003` (MEDIUM) |
 | Android app shipped debuggable or allowing plain-HTTP traffic (`android:debuggable`, `usesCleartextTraffic`; not in `debug/` manifests) | Rule | `MOB-001` (HIGH) |
 | App data in device backups (`android:allowBackup="true"`) | Rule | `MOB-002` (MEDIUM) |
+| iOS App Transport Security off (`NSAllowsArbitraryLoads` true in `Info.plist`, value on the same or next line) | Rule | `MOB-001` (HIGH) |
+| iOS Documents folder shared through Finder (`UIFileSharingEnabled` true in `Info.plist`) | Rule | `MOB-002` (MEDIUM) |
 | Auth, RBAC, IDOR, public ports, secrets in manifests | LLM review (`--focus security`); template invariants for backend/infra | — |
 
 These line rules read added lines only, and skip docs (Markdown and text files, and anything in a `docs/` or `doc/` folder), test files (in a `tests/`, `test/` or `__tests__/` folder, or named `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`), comment lines, trailing comments (`#` in Python, YAML and Dockerfiles, `//` elsewhere, and a `/*` or `<!--` left open, found outside strings; code after a block comment closed on the line is still read), names quoted in prose (``eval()``), lines over 2,000 characters (minified or generated), and in a Dockerfile a `FROM` that names an earlier stage. Text inside strings and docstrings is read like code: a string can hold code that runs, and a security rule would rather report a sentence that mentions `eval(` than miss a call (mark such a line with `guard-allow`). A line that is intended keeps the finding as a LOW note with `guard-allow <RULE>: <reason>` in a comment on it (in a string it counts for nothing) (for example `# guard-allow SEC-005: fixed command, no user input`).
@@ -76,7 +78,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| New files that nothing references, draft names (`*.tmp`, `*backup*`, `temp_*`) | Rule | `DEAD-001` |
+| New files that nothing references in any language's code or config (a Go file also counts as referenced through its package directory), draft names (`*.tmp`, `*backup*`, `temp_*`) | Rule | `DEAD-001` |
 | A removed string key (`case 'edit':`), export or CSS class that is still referenced somewhere in the repository | Rule | `DEAD-REF` (HIGH) |
 | Commented-out code, unused imports and private functions (any language) | LLM review | — |
 
@@ -86,7 +88,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| Redundant packages (`is-odd`, `uuid`, `mkdirp`, `rimraf`, `pathlib2`, `mock`) when stdlib or the runtime suffices | Rule | `LAZY-001` |
+| Redundant packages when stdlib or the runtime suffices, matched as whole names: npm (`is-odd`, `uuid`, `mkdirp`, `rimraf`), Python (`pathlib2`, `mock`), Go (`github.com/pkg/errors`, not `// indirect` modules), Rust (`lazy_static`, `once_cell`), Java/Kotlin (`joda-time`), PHP (`paragonie/random_compat`), .NET (`System.ValueTuple`); Gemfile, pubspec.yaml and Package.swift list none yet; also with `--focus simplicity` | Rule | `LAZY-001` |
 | Over-engineering (pass-through wrappers, one-method classes, reinvented standard helpers in any language) | LLM review | — |
 | Net lines added or removed | Informational only (deleting code earns no score bonus) | `NET-LOC` |
 
@@ -103,7 +105,7 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 | Backend | `SEC-001` `SEC-002` `SEC-003` `SEC-004` `SEC-005` `SEC-006` `SEC-007` | LLM | LLM | build check, invariants | LLM | `DEAD-001` `DEAD-REF` | `LAZY-001` |
 | Fullstack | frontend + backend rules | as both | as both | invariants on the API contract | as both | `DEAD-REF` across halves | `LAZY-001` |
 | Infra | `SEC-001` `INFRA-001` `INFRA-003` `SEC-006` | LLM | LLM | `INFRA-002` | LLM | `DEAD-001` | LLM |
-| Mobile | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-008` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` | LLM |
+| Mobile | `SEC-001` `SEC-002` `SEC-004` `SEC-005` `SEC-006` `SEC-008` `MOB-001` `MOB-002` | LLM | LLM | LLM | LLM | `DEAD-001` | `LAZY-001` |
 
 ---
 

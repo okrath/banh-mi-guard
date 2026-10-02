@@ -465,6 +465,15 @@ LINE_RULES = [
     ("MOB-002", "MEDIUM", lambda f: f.endswith("androidmanifest.xml"),
      re.compile(r"android:allowBackup\s*=\s*[\"']true[\"']"),
      "App data goes into device backups (android:allowBackup): turn it off unless backups are intended."),
+    # iOS Info.plist: the value usually sits on the line after its key; the scan joins the two lines
+    ("MOB-001", "HIGH", lambda f: f.endswith("info.plist"),
+     re.compile(r"<key>\s*NSAllowsArbitraryLoads\s*</key>\s*<true\s*/>"),
+     "App Transport Security is off (NSAllowsArbitraryLoads): the app may load plain-HTTP content; allow only "
+     "the hosts that need it with NSExceptionDomains."),
+    ("MOB-002", "MEDIUM", lambda f: f.endswith("info.plist"),
+     re.compile(r"<key>\s*UIFileSharingEnabled\s*</key>\s*<true\s*/>"),
+     "The app's Documents folder is shared through Finder/iTunes (UIFileSharingEnabled): turn it off unless "
+     "users are meant to see those files."),
 ]
 
 
