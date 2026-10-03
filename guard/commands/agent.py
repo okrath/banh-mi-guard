@@ -333,6 +333,30 @@ def agent_add_cmd(
         console.print(f"[bold cyan]Proposed adapter for {name}[/bold cyan] (saved to ~/.guard/agents/{name}.json when installed):")
         console.print(json.dumps(adapter, indent=2), markup=False, highlight=False)
     _install_adapter(adapter, name)
+    _offer_agent_as_llm(name)
+
+
+# the agents whose CLI can also be guard's LLM (the review gate and Alibaba OCR): adapter -> CLI
+AGENT_CLI = {"claude-code": "claude", "codex": "codex", "omp": "omp"}
+
+
+def _offer_agent_as_llm(name: str) -> None:
+    """The agent just added can answer the review gate and OCR too: offered in a terminal, never forced."""
+    from guard.core import cli_llm
+    from guard.core.config import LLMProtocol, _cli_wizard, load_global_config
+    cli = AGENT_CLI.get(name)
+    if not cli or not cli_llm.find(cli):
+        return
+    cfg = load_global_config()
+    if cfg.llm.protocol == LLMProtocol.CLI and cfg.llm.cli_agent == cli:
+        return  # already guard's LLM
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print(f"[cyan]ℹ️  {cli} can also be guard's LLM (review gate and Alibaba OCR, no API key): "
+                      "run `guard config llm` and choose My agent CLI.[/cyan]")
+        return
+    from rich.prompt import Confirm
+    if Confirm.ask(f"Use the {cli} CLI as guard's LLM too (review gate and Alibaba OCR, no API key)?", default=True):
+        _cli_wizard(cfg, [cli], local=False, repo_path=None)
 
 
 def _registered_ok(adapter: dict, name: str) -> None:
