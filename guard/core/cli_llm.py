@@ -30,11 +30,16 @@ from typing import Dict, List, Optional
 # the fence and its rule are shared with the API path; re-exported for callers of this module
 from guard.core.llm_client import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, UNTRUSTED_RULE, fence_untrusted  # noqa: F401
 
-# How each CLI answers one prompt without tools (flags checked 2026-09-29: claude 2.1.284, codex 0.156.1)
+# How each CLI answers one prompt without tools (flags checked 2026-09-29: claude 2.1.284, codex 0.156.1;
+# 2026-10-03: omp 18.4.3). agy is not here: headless it asks for tools that only
+# --dangerously-skip-permissions would allow, which no prompt carrying repository text may get
 AGENTS: Dict[str, Dict[str, str]] = {
     "claude": {"title": "Claude Code", "binary": "claude"},
     "codex": {"title": "OpenAI Codex CLI", "binary": "codex"},
+    "omp": {"title": "Oh My Pi (omp)", "binary": "omp"},
 }
+# omp ignores a system prompt in print mode (checked live): its rules go first in the prompt instead
+RULES_IN_PROMPT = {"omp"}
 
 
 SESSION_VARS = {"CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ID", "CLAUDECODE"}
@@ -50,6 +55,7 @@ AGENT_ENV = {
     "claude": {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                "CLAUDE_CONFIG_DIR"},
     "codex": {"CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"},
+    "omp": set(),  # omp keeps its sign-in in its own home folder
 }
 
 
@@ -83,6 +89,16 @@ def _models(agent: str, binary: str, timeout: float = 60) -> List[str]:
     2.1.284: no model turn, no cost; another version may answer it through the model, which the user
     accepts for a connection test).
     """
+    if agent == "omp":
+        res = _quiet(agent, [binary, "models", "--json"], "", timeout)
+        if res.returncode != 0:
+            return []
+        try:
+            catalog = json.loads(res.stdout).get("models") or []
+        except (ValueError, AttributeError):
+            return []
+        return [m["selector"] for m in catalog
+                if isinstance(m, dict) and m.get("kind", "chat") == "chat" and isinstance(m.get("selector"), str)]
     if agent == "claude":
         res = _quiet(agent, [binary, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
                       "--no-session-persistence"], "/model", timeout)
@@ -118,6 +134,15 @@ def probe(agent: str, timeout: Optional[float] = None) -> tuple:
     binary = find(agent)
     if not binary:
         return False, f"`{AGENTS.get(agent, {}).get('binary', agent)}` is not on PATH", []
+    if agent == "omp":  # no sign-in status command: a model list read from omp is what it can answer with
+        try:
+            models = _models(agent, binary, timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"omp did not run: {type(e).__name__}: {e}", []
+        if not models:
+            return False, "omp lists no models: run `omp login`", []
+        shown = ", ".join(models[:8]) + (", …" if len(models) > 8 else "")
+        return True, f"omp is ready; models: {shown}", models
     status = [binary, "auth", "status"] if agent == "claude" else [binary, "login", "status"]
     try:
         res = _quiet(agent, status, "", timeout)
@@ -154,6 +179,8 @@ def _command(agent: str, binary: str, model: str, answer_file: Path, system_file
     argument. The review rules (`system_file`) go through the CLI's system channel, apart from the
     repository text on stdin, so that text cannot pass itself off as the rules.
     """
+    if agent == "omp":  # no tools at all, nothing kept; the answer is the last JSON line's assistant message
+        return [binary, "-p", "--no-tools", "--no-session", "--mode", "json"] + (["--model", model] if model else [])
     if agent == "claude":
         cmd = [binary, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
         cmd += ["--system-prompt-file", str(system_file)] if system_file else []
@@ -218,6 +245,8 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
     # what came from the repository is marked as data (a closing marker inside it cannot end the
     # data early), and the rules are never part of it
     text, framed_system = fence_untrusted(prompt, system_prompt)
+    if agent in RULES_IN_PROMPT and framed_system:  # ahead of the marked data, which cannot pass itself off as them
+        text, framed_system = f"{framed_system}\n\n{text}", None
     with tempfile.TemporaryDirectory(prefix="guard-llm-", ignore_cleanup_errors=True) as work:
         answer_file = Path(work) / "answer.txt"
         system_file = None
@@ -235,6 +264,8 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
             raise CLILLMError(f"{agent} did not run: {type(e).__name__}: {e}") from e
         if res.returncode != 0:
             raise CLILLMError(f"{agent} exited with {res.returncode}: {' '.join((res.stderr or res.stdout).split())[:300]}")
+        if agent == "omp":
+            return _omp_answer(res.stdout)
         if agent == "claude":
             try:
                 data = json.loads(res.stdout)
@@ -248,3 +279,27 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
         if not answer:
             raise CLILLMError("codex wrote no final answer")
         return answer
+
+
+def _omp_answer(stdout: str) -> str:
+    """
+    The text of the last assistant message in omp's JSON output: the last line that is a JSON object
+    holding the conversation (`messages`); other lines (events, progress, stray text) are skipped.
+    """
+    messages = None
+    for line in reversed(stdout.splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            messages = data["messages"]
+            break
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            parts = message.get("content")
+            text = parts if isinstance(parts, str) else "".join(
+                p.get("text", "") for p in parts or [] if isinstance(p, dict) and p.get("type") == "text")
+            if text.strip():
+                return text.strip()
+    raise CLILLMError(f"omp's answer has no assistant text: {' '.join(stdout.split())[-200:]}")

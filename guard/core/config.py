@@ -27,7 +27,7 @@ console = Console()
 class LLMProtocol(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
-    CLI = "cli"  # the user's own agent CLI (claude, codex): no API key, the subscription answers
+    CLI = "cli"  # the user's own agent CLI (claude, codex, omp): no API key, the subscription answers
 
 
 class LLMConfig(BaseModel):
@@ -36,7 +36,7 @@ class LLMConfig(BaseModel):
     api_key: str = Field(default="", description="API Authentication Token")
     model: str = Field(default="gpt-4o", description="Target model name")
     timeout: float = Field(default=60.0, description="HTTP Timeout in seconds")
-    cli_agent: str = Field(default="", description="With protocol cli: the agent CLI that answers (claude, codex)")
+    cli_agent: str = Field(default="", description="With protocol cli: the agent CLI that answers (claude, codex, omp)")
 
     @property
     def ready(self) -> bool:
@@ -234,9 +234,9 @@ def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]
 
 
 def _cli_wizard(current_cfg: GuardConfig, found: List[str], local: bool, repo_path: Optional[Path]) -> GuardConfig:
-    """Option 3: the review runs through `claude` or `codex` on this machine; tested before it is saved."""
+    """Option 3: the review runs through `claude`, `codex` or `omp` on this machine; tested before it is saved."""
     if not found:
-        console.print("[bold red]❌ Neither `claude` nor `codex` is on PATH.[/bold red] Install one and sign in, then run "
+        console.print("[bold red]❌ None of `claude`, `codex` or `omp` is on PATH.[/bold red] Install one and sign in, then run "
                       "[bold]guard config llm[/bold] again.")
         return current_cfg
     agent = Prompt.ask("Agent CLI", choices=found, default=current_cfg.llm.cli_agent if current_cfg.llm.cli_agent in found else found[0])
@@ -262,8 +262,7 @@ def _cli_wizard(current_cfg: GuardConfig, found: List[str], local: bool, repo_pa
     current_cfg.llm = new_llm
     target_path = save_config(current_cfg, local=local, repo_path=repo_path)
     console.print(f"[bold green]💾 Saved at:[/bold green] [dim]{target_path}[/dim]")
-    console.print("[yellow]ℹ️  Alibaba OCR keeps its own LLM settings: it needs an HTTP endpoint (an API key or a gateway "
-                  "such as cli-to-api), set with `ocr config` or `guard config sync` from an HTTP LLM config.[/yellow]")
+    console.print(f"[cyan]ℹ️  guard post --full runs Alibaba OCR through {agent} too; OCR's own settings are left as they are.[/cyan]")
     return current_cfg
 
 
