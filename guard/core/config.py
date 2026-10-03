@@ -204,10 +204,9 @@ class _sync_lock:
 
 def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]:
     if llm.protocol == LLMProtocol.CLI:
-        # OCR only calls an HTTP endpoint (with tool calls): an agent CLI cannot answer it directly
-        return False, ("Alibaba OCR needs an HTTP endpoint and keeps its own LLM settings: point it at an API key "
-                       "or a gateway (for example cli-to-api) with `guard config llm --local` + `guard config sync`, "
-                       "or `ocr config` directly.")
+        # nothing to sync: guard post --full gives OCR a local endpoint answered by the CLI, for that review only
+        return False, ("Nothing to sync: with an agent CLI, guard post --full runs Alibaba OCR through the same CLI "
+                       "and leaves OCR's own settings as they are.")
     ocr_bin = shutil.which(binary)
     if not ocr_bin:
         return False, f"CLI '{binary}' (@alibaba-group/open-code-review) not found in PATH."

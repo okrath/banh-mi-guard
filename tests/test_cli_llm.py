@@ -123,12 +123,12 @@ def test_a_cli_that_is_not_signed_in_says_how_to_sign_in(probes):
     ok, msg, _ = cli_llm.probe("codex")
     assert not ok and "codex login" in msg
 
-def test_ocr_is_never_pointed_at_a_cli():
+def test_ocr_settings_are_never_pointed_at_a_cli():
     ok, msg = sync_to_alibaba_ocr(LLMConfig(protocol=LLMProtocol.CLI, cli_agent="claude", model=""))
-    assert ok is False and "HTTP endpoint" in msg
+    assert ok is False and "Nothing to sync" in msg and "same CLI" in msg
 
 
-def test_doctor_names_the_cli_and_says_ocr_needs_its_own_endpoint(tmp_path, monkeypatch):
+def test_doctor_names_the_cli_and_says_ocr_runs_through_it(tmp_path, monkeypatch):
     import guard.core.config as config
     from guard.core.config import GuardConfig
     from guard.core.setup_health import setup_health
@@ -137,8 +137,7 @@ def test_doctor_names_the_cli_and_says_ocr_needs_its_own_endpoint(tmp_path, monk
     monkeypatch.setattr("shutil.which", lambda b: f"C:/bin/{b}.exe")
     rows = {r["item"]: r for r in setup_health(tmp_path)}
     assert rows["LLM"]["level"] == "ok" and "claude CLI" in rows["LLM"]["detail"]
-    assert rows["Alibaba OCR"]["level"] == "warn" and "HTTP endpoint" in rows["Alibaba OCR"]["detail"]
-    assert rows["Alibaba OCR"]["fix"]  # every warning names the command that fixes it
+    assert rows["Alibaba OCR"]["level"] == "ok" and "through the claude CLI" in rows["Alibaba OCR"]["detail"]
 
 
 def test_the_review_goes_through_the_cli(runs, tmp_path):
