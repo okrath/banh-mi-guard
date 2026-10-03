@@ -36,6 +36,10 @@ def test_parse_reads_one_tool_call_or_a_final_answer():
     call = msg["tool_calls"][0]
     assert call["function"]["name"] == "file_read" and json.loads(call["function"]["arguments"]) == {"file_path": "b.py"}
     assert parse('{"final": "looks fine"}', TOOLS) == {"role": "assistant", "content": "looks fine"}
+    # a model that keeps talking after its answer (seen live with omp's default model)
+    rambling = '{"tool": "file_read", "arguments": {"file_path": "c.py"}}` Wait! Look at {"tool": "task_done"}'
+    assert json.loads(parse(rambling, TOOLS)["tool_calls"][0]["function"]["arguments"]) == {"file_path": "c.py"}
+    assert parse('Sure: {not json} then {"final": "ok"}', TOOLS)["content"] == "ok"
     for bad in ("no json here", '{"tool": "shell", "arguments": {}}', '{"tool": "file_read", "arguments": []}', '{"x": 1}'):
         with pytest.raises(ValueError):
             parse(bad, TOOLS)

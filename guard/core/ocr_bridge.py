@@ -8,7 +8,6 @@ answer) read back from the agent's JSON reply. The agent itself gets no tools: O
 from __future__ import annotations
 
 import json
-import re
 import secrets
 import tempfile
 import threading
@@ -74,20 +73,22 @@ def render(body: dict) -> Tuple[str, str]:
     return f"{rules}\n\nThe program's instructions:\n{system}", "\n\n".join(turns)
 
 
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+def _first_object(text: str):
+    """The first complete JSON object in `text`: a model may add words or more JSON after its answer."""
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            return decoder.raw_decode(text, start)[0]
+        except ValueError:
+            start = text.find("{", start + 1)
+    return None
 
 
 def parse(answer: str, tools: List[dict]) -> dict:
     """The agent's JSON reply as an assistant message: one tool call or plain content."""
     names = {(t.get("function", t)).get("name") for t in tools}
-    text = answer.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
-    match = _JSON_OBJECT.search(text)
-    try:
-        data = json.loads(match.group(0)) if match else None
-    except ValueError:
-        data = None
+    data = _first_object(answer)
     if not isinstance(data, dict):
         raise ValueError(f"the agent's answer is not one JSON object: {' '.join(answer.split())[:200]}")
     if "tool" in data:
