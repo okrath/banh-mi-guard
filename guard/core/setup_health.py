@@ -239,9 +239,8 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
             True: "runs on every guard post (guard config ocr optional: only with --full)",
             False: "runs only with guard post --full (guard config ocr always: on every post)"}[always]
     if shutil.which(ocr_binary) and llm.protocol == LLMProtocol.CLI:
-        # guard cannot give OCR an agent CLI: OCR calls an HTTP endpoint, with tool calls
-        add("warn", "Alibaba OCR", f"{ocr_binary} found; the review gate uses the {llm.cli_agent} CLI, and OCR needs an "
-            f"HTTP endpoint of its own (an API key, or a gateway such as cli-to-api); {when}", "ocr config")
+        # guard post --full answers OCR through the same CLI (a local endpoint for that review only)
+        add("ok", "Alibaba OCR", f"{ocr_binary} found; it runs through the {llm.cli_agent} CLI, like the review gate; {when}")
     elif shutil.which(ocr_binary) and not llm.api_key:
         add("warn", "Alibaba OCR", f"{ocr_binary} found, not synced: there is no LLM to give it yet; {when}", "guard config llm")
     elif shutil.which(ocr_binary) and not ocr_in_sync(llm, ocr_binary):

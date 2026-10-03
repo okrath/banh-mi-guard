@@ -69,6 +69,7 @@ def run_ocr_review(
     concurrency: int = 0,
     on_snapshot=None,
     cache_key: Optional[str] = None,
+    env_for=None,
 ) -> Tuple[str, List[RuleViolation]]:
     """
     Review the task's changes with Alibaba OCR (`ocr review`, an LLM review) and return
@@ -122,7 +123,7 @@ def run_ocr_review(
     out_file = Path(name)
     try:
         line, violations = _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files,
-                                    concurrency, failed, exclude=sorted(reused))
+                                    concurrency, failed, exclude=sorted(reused), env_for=env_for)
         if fps and line.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in violations):
             covered = _covered_paths(out_file)
             fresh = {path: {"fp": fps[path], "findings": [v.model_dump() for v in violations if v.file_path == path]}
@@ -186,12 +187,15 @@ def _save_cache(guard_dir: Path, key: Optional[str], files: dict) -> None:
         pass  # only means the next review covers these files again
 
 
-def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed, exclude=()):
+def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_files, concurrency, failed, exclude=(),
+             env_for=None):
     # --timeout 0: OCR's own per-group limit (15 min by default) is off. Its per-request HTTP limit
     # cannot be switched off (0 means its 300 s default), so it is set to ten years: no limit in practice.
     cmd = [ocr_bin, "review", "--repo", str(repo_path), "--format", "json", "--audience", "agent",
            "--color", "never", "-o", str(out_file), "--background", background, "--timeout", "0"]
     env = {**os.environ, "OCR_LLM_TIMEOUT": str(OCR_REQUEST_TIMEOUT_S)}  # never a shorter value from the environment
+    if env_for:  # e.g. the agent bridge: OCR then reads a throwaway config that points at it
+        env = env_for(env)
     ranged = bool(base_ref and snapshot)
     if ranged:
         cmd += ["--from", base_ref, "--to", snapshot]

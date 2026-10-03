@@ -510,8 +510,7 @@ def _execute_post_task(
         ocr_status = f"skipped: no changes ({setting})"
     elif full and not hook:
         console.print("[cyan]🔎 Alibaba OCR is reviewing the changes (no time limit; it ends when OCR finishes or reports an error, Ctrl+C stops it)...[/cyan]")
-        ocr_status, ocr_violations = run_ocr_review(
-            target_repo,
+        review = dict(
             base_ref=pre.base_ref if pre else None,
             background=pre.prompt if pre else "Post-task verification",
             skip_files=preexisting_files,
@@ -520,6 +519,10 @@ def _execute_post_task(
             on_snapshot=start_build,
             cache_key=_ocr_cache_key(config, pre),
         )
+        if config.llm.protocol.value == "cli" and config.llm.cli_agent:
+            ocr_status, ocr_violations = _ocr_through_agent(target_repo, config, review)
+        else:
+            ocr_status, ocr_violations = run_ocr_review(target_repo, **review)
         violations.extend(ocr_violations)
         if ocr_status.startswith("did not run"):  # a failed review names the setting too
             ocr_status += f" ({setting})"
@@ -676,6 +679,33 @@ def _execute_post_task(
         ))
 
     return all_passed
+
+
+AGENT_OCR_CONCURRENCY = 2  # each OCR request starts the agent CLI: a few at a time, not OCR's default of 8
+
+
+def _ocr_through_agent(target_repo: Path, config, review: dict):
+    """
+    OCR answered by the agent CLI the LLM gate uses (`protocol: cli`), through a local endpoint that
+    lives for this review only; the user's own OCR settings are never changed. The status names the
+    agent and the path, and an agent failure is an OCR failure with the agent's reason.
+    """
+    from guard.core.ocr_bridge import AgentBridge
+    agent = config.llm.cli_agent
+    review = {**review, "concurrency": min(review.get("concurrency") or AGENT_OCR_CONCURRENCY, AGENT_OCR_CONCURRENCY)}
+    with AgentBridge(agent, model=config.llm.model, timeout=config.llm.timeout or None) as bridge:
+        status, found = run_ocr_review(target_repo, env_for=bridge.env, **review)
+    path = f"answered by the {agent} CLI (tool calls written as text)"
+    if bridge.errors:  # a failed agent call is an OCR failure, even when OCR carried on and says complete
+        reason = f"{len(bridge.errors)} {agent} CLI call(s) failed, the last said: {bridge.errors[-1][:200]}"
+        if not status.startswith("did not run"):
+            status = f"did not run: {reason} (OCR reported: {status})"
+            found = list(found) + [RuleViolation(
+                rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)",
+                message=f"Alibaba OCR review did not run completely: {reason}. Run guard post --full again.")]
+        else:
+            status += f"; {reason}"
+    return f"{status}; {path}", found
 
 
 def _ocr_cache_key(config, pre) -> Optional[str]:
