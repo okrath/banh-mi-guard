@@ -46,6 +46,25 @@ def test_omp_without_an_assistant_answer_is_an_llm_failure(omp, monkeypatch):
         cli_llm.call("omp", "q")
 
 
+def test_a_failed_omp_call_reports_the_models_error_not_the_session_events(omp, monkeypatch):
+    out = "\n".join([
+        json.dumps({"type": "session", "id": "s1"}),
+        json.dumps({"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q"}]},
+            {"role": "assistant", "content": [], "model": "gemini-3.8-flash", "stopReason": "error",
+             "errorMessage": "Generation failed with finish reason: MALFORMED_FUNCTION_CALL"}]}),
+    ])
+    monkeypatch.setattr(cli_llm, "_run", lambda cmd, text, cwd, timeout, env: subprocess.CompletedProcess(cmd, 1, out, ""))
+    with pytest.raises(cli_llm.CLILLMError) as e:
+        cli_llm.call("omp", "q")
+    assert str(e.value) == "omp exited with 1: gemini-3.8-flash failed: Generation failed with finish reason: MALFORMED_FUNCTION_CALL"
+    # no conversation in the output (an unknown model): what omp printed
+    monkeypatch.setattr(cli_llm, "_run", lambda cmd, text, cwd, timeout, env: subprocess.CompletedProcess(
+        cmd, 1, "", 'Model "x/y" not found'))
+    with pytest.raises(cli_llm.CLILLMError, match='omp exited with 1: Model "x/y" not found'):
+        cli_llm.call("omp", "q")
+
+
 def test_omp_is_ready_when_it_lists_chat_models(omp, monkeypatch):
     ready, msg, models = cli_llm.probe("omp")
     assert ready and models == ["cta/group:cta-worker"]

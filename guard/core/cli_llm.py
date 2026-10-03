@@ -263,7 +263,8 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
         except (OSError, subprocess.SubprocessError) as e:
             raise CLILLMError(f"{agent} did not run: {type(e).__name__}: {e}") from e
         if res.returncode != 0:
-            raise CLILLMError(f"{agent} exited with {res.returncode}: {' '.join((res.stderr or res.stdout).split())[:300]}")
+            said = (_omp_error(res.stdout) if agent == "omp" else "") or " ".join((res.stderr or res.stdout).split())[:300]
+            raise CLILLMError(f"{agent} exited with {res.returncode}: {said}")
         if agent == "omp":
             return _omp_answer(res.stdout)
         if agent == "claude":
@@ -281,21 +282,33 @@ def call(agent: str, prompt: str, system_prompt: Optional[str] = None, model: st
         return answer
 
 
-def _omp_answer(stdout: str) -> str:
+def _omp_messages(stdout: str) -> list:
     """
-    The text of the last assistant message in omp's JSON output: the last line that is a JSON object
-    holding the conversation (`messages`); other lines (events, progress, stray text) are skipped.
+    The conversation in omp's JSON output: the last line that is a JSON object holding `messages`;
+    other lines (events, progress, stray text) are skipped.
     """
-    messages = None
     for line in reversed(stdout.splitlines()):
         try:
             data = json.loads(line)
         except ValueError:
             continue
         if isinstance(data, dict) and isinstance(data.get("messages"), list):
-            messages = data["messages"]
-            break
-    for message in reversed(messages or []):
+            return data["messages"]
+    return []
+
+
+def _omp_error(stdout: str) -> str:
+    """The error omp's model gave in its last assistant message (the output itself starts with session events)."""
+    for message in reversed(_omp_messages(stdout)):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            error = message.get("errorMessage")
+            return f"{message.get('model') or 'the model'} failed: {' '.join(str(error).split())[:300]}" if error else ""
+    return ""
+
+
+def _omp_answer(stdout: str) -> str:
+    """The text of the last assistant message in omp's JSON output."""
+    for message in reversed(_omp_messages(stdout)):
         if isinstance(message, dict) and message.get("role") == "assistant":
             parts = message.get("content")
             text = parts if isinstance(parts, str) else "".join(
