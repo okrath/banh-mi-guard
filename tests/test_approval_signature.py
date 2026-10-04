@@ -9,11 +9,14 @@ Tests for approval signature integrity:
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from guard.agent.bash import content_hash
 
 from guard.agent.events import (
     AgentEvent,
@@ -82,9 +85,9 @@ def test_saved_session_after_approval_verifies(tmp_path, fake_ocr_review):
     assert session.post is not None
     assert session.post.approval_signature is not None
     assert len(session.post.approval_signature) == 64  # SHA256 hex digest
-    assert SessionManager.is_approval_verified(session) is True
+    assert mgr.is_approval_verified(session) is True
 
-    verified = SessionManager.verified_approval(session)
+    verified = mgr.verified_approval(session)
     assert verified == session.post.approved_fingerprints
     assert "src/chat.ts" in verified
 
@@ -100,22 +103,24 @@ def test_tampered_fingerprints_returns_empty_and_blocks_commit(tmp_path, fake_oc
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
     assert execute_post_task(repo_path=repo) is True
 
-    # Tamper with approved_fingerprints in session.json
+    # Real forgery: modify a tracked file, write its correct content_hash into approved_fingerprints, keep old signature
+    (repo / "src" / "chat.ts").write_text("export const a = 999;\n", encoding="utf-8")
+    new_hash = content_hash(repo / "src" / "chat.ts")
     session_file = repo / ".guard" / "session.json"
     data = json.loads(session_file.read_text(encoding="utf-8"))
-    data["post"]["approved_fingerprints"]["src/chat.ts"] = "0000000000000000000000000000000000000000"
+    data["post"]["approved_fingerprints"]["src/chat.ts"] = new_hash
     session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    session = SessionManager(repo).load_local_session()
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
     assert session is not None
-    assert SessionManager.is_approval_verified(session) is False
-    assert SessionManager.verified_approval(session) == {}
+    assert mgr.is_approval_verified(session) is False
+    assert mgr.verified_approval(session) == {}
 
     # Calling _save on tampered session does NOT mint a valid signature
-    SessionManager(repo)._save(session)
-    reloaded = SessionManager(repo).load_local_session()
-    assert SessionManager.is_approval_verified(reloaded) is False
-    assert SessionManager.verified_approval(reloaded) == {}
+    mgr._save(session)
+    reloaded = mgr.load_local_session()
+    assert mgr.is_approval_verified(reloaded) is False
+    assert mgr.verified_approval(reloaded) == {}
 
     # Commit decision blocks
     blocked = decide(AgentEvent(event="before-commit", cwd=str(repo)))
@@ -138,13 +143,14 @@ def test_session_without_signature_is_treated_as_not_approved(tmp_path, fake_ocr
     data["post"]["approval_signature"] = None
     session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    session = SessionManager(repo).load_local_session()
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
     assert session is not None
-    assert SessionManager.is_approval_verified(session) is False
-    assert SessionManager.verified_approval(session) == {}
+    assert mgr.is_approval_verified(session) is False
+    assert mgr.verified_approval(session) == {}
 
     # Calling _save on unsigned loaded session does NOT mint a signature
-    SessionManager(repo)._save(session)
+    mgr._save(session)
     reloaded = SessionManager(repo).load_local_session()
     assert reloaded.post.approval_signature is None
 
@@ -258,3 +264,160 @@ def test_guard_path_and_uncovered_logic(tmp_path):
     assert is_guard_command("guard post") is True
     assert is_guard_command("guard status > .guard/session.json") is False
     assert is_guard_command("python -c 'pass'") is False
+
+
+def test_guard_accept_write_path_produces_verifiable_signature(tmp_path, fake_ocr_review):
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo) is True
+
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
+    assert session is not None
+
+    # Emulate guard accept write path
+    reviewed = dict(session.post.approved_fingerprints)
+    session.status = SessionStatus.COMPLETED
+    session.post.approved_fingerprints = dict(reviewed)
+    session.post.all_passed = True
+    session.post.accepted_by_user = True
+    session.post.approval_signature = compute_approval_signature(
+        mgr.repo_path,
+        session.session_id,
+        session.post.approved_fingerprints,
+    )
+    mgr._save(session)
+
+    reloaded = mgr.load_local_session()
+    assert reloaded is not None
+    assert mgr.is_approval_verified(reloaded) is True
+    assert mgr.verified_approval(reloaded) == reviewed
+    assert decide(AgentEvent(event="before-commit", cwd=str(repo))).action == "allow"
+
+
+def test_command_leak_and_init_py_reported(tmp_path):
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", scope=["src/chat.ts"], repo_path=repo) is True
+    _bash(repo, "touch __init__.py", call_id="c1")
+    (repo / "__init__.py").write_text("# root package\n", encoding="utf-8")
+    after_ev = AgentEvent(event="after-bash", cwd=str(repo), tool="Bash", command="touch __init__.py", call_id="c1")
+    dec = decide(after_ev)
+    assert dec.action == "notify"
+    assert "__init__.py" in dec.reason
+
+
+def test_session_json_and_other_file_edits_both_reported_and_block_stop(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "src" / "x").write_text("initial\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "src/x"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "add src/x"], check=True)
+
+    (repo / ".guard").mkdir(parents=True, exist_ok=True)
+    (repo / ".guard" / "session.json").write_text("{}", encoding="utf-8")
+    _bash(repo, "echo foo > src/x && echo bar > .guard/session.json", call_id="c_both")
+    (repo / "src" / "x").write_text("modified src/x\n", encoding="utf-8")
+    (repo / ".guard" / "session.json").write_text('{"modified": true}', encoding="utf-8")
+
+    after_dec = decide(AgentEvent(event="after-bash", cwd=str(repo), tool="Bash", call_id="c_both"))
+    assert after_dec.action == "notify"
+    assert ".guard/session.json" in after_dec.reason
+    assert "src/x" in after_dec.reason
+
+    stop_dec = decide(AgentEvent(event="stop", cwd=str(repo)))
+    assert stop_dec.action == "block"
+    assert "src/x" in stop_dec.reason
+
+
+def test_unsigned_completed_session_with_clean_tree_allows_stop_but_blocks_commit(tmp_path, fake_ocr_review):
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo) is True
+
+    # Strip signature to simulate an old session
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
+    assert session is not None
+    session.post.approval_signature = None
+    session_file = repo / ".guard" / "session.json"
+    session_file.write_text(session.model_dump_json(indent=2), encoding="utf-8")
+    # Commit the changes so the working tree is clean
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete task"], check=True)
+
+    # Clean tree: stop is allowed
+    stop_dec = decide(AgentEvent(event="stop", cwd=str(repo)))
+    assert stop_dec.action == "allow"
+
+    # Commit is blocked without signature
+    commit_dec = decide(AgentEvent(event="before-commit", cwd=str(repo)))
+    assert commit_dec.action == "block"
+    assert "signature" in commit_dec.reason.lower() or "guard post" in commit_dec.reason.lower()
+
+
+def test_signed_session_copied_to_another_repo_does_not_verify(tmp_path, fake_ocr_review):
+    repo_a = _make_repo(tmp_path / "repo_a")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo_a) is True
+    (repo_a / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo_a) is True
+
+    repo_b = _make_repo(tmp_path / "repo_b")
+    (repo_b / ".guard").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(repo_a / ".guard" / "session.json", repo_b / ".guard" / "session.json")
+
+    mgr_b = SessionManager(repo_b)
+    session_b = mgr_b.load_local_session()
+    assert session_b is not None
+    # Stored repo_path is repo_a, but verification uses SessionManager(repo_b).repo_path
+    assert mgr_b.is_approval_verified(session_b) is False
+    assert mgr_b.verified_approval(session_b) == {}
+
+    commit_dec = decide(AgentEvent(event="before-commit", cwd=str(repo_b)))
+    assert commit_dec.action == "block"
+
+
+def test_guard_command_detection_variants():
+    assert is_guard_command("guard pre 'Fix'") is True
+    assert is_guard_command("guard.exe pre 'Fix'") is True
+    assert is_guard_command("python -m guard pre 'Fix'") is True
+    assert is_guard_command("python3 -m guard pre 'Fix'") is True
+    assert is_guard_command("python3.11 -m guard pre 'Fix'") is True
+    assert is_guard_command("python3.12.exe -m guard pre 'Fix'") is True
+    assert is_guard_command("py -3 -m guard pre 'Fix'") is True
+    assert is_guard_command("py -3.11 -m guard pre 'Fix'") is True
+    assert is_guard_command("guard post") is True
+    assert is_guard_command("guard post --full") is True
+    assert is_guard_command("guard pre 'x' && echo done") is True
+    assert is_guard_command("guard pre 'x'; cat .guard/session.json") is True
+    assert is_guard_command("echo start | guard post") is True
+    assert is_guard_command("guard pre 'x' && echo 1 > .guard/session.json") is False
+    assert is_guard_command("guard status > .guard/session.json") is False
+    assert is_guard_command("guard run 'x' -- echo hi") is False
+    assert is_guard_command("python3.11 -m guard run 'x' -- echo hi") is False
+    assert is_guard_command("python -c 'pass'") is False
+
+
+def test_save_oserror_in_finding_command(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from guard.cli import app
+
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
+    assert session is not None
+    session.findings_ledger = [{"id": "abc12345", "status": "open", "description": "issue"}]
+    mgr._save(session)
+
+    # Monkeypatch _save to simulate OSError (e.g. disk full or permission error)
+    def failing_save(self, s):
+        raise OSError("Permission denied: simulated disk failure")
+    monkeypatch.setattr(SessionManager, "_save", failing_save)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["finding", "abc12345", "--defer", "will fix later", "--repo", str(repo)])
+    assert result.exit_code == 1
+    # One-line error message shown, not a traceback
+    assert "Could not save session" in result.output
+    assert "Traceback" not in result.output

@@ -194,28 +194,33 @@ class SessionManager:
     """
 
     @staticmethod
-    def is_approval_verified(session: Optional[GuardSession]) -> bool:
-        """
-        True when the session has an approval signature that verifies against the HMAC key.
-        """
+    def _verify_session_signature(
+        session: Optional[GuardSession], repo_path: str | Path
+    ) -> bool:
         if not session or not session.post or not session.post.approval_signature:
             return False
         sig = session.post.approval_signature
         try:
             expected = compute_approval_signature(
-                session.repo_path, session.session_id, session.post.approved_fingerprints
+                Path(repo_path).resolve(), session.session_id, session.post.approved_fingerprints
             )
             return hmac.compare_digest(sig, expected)
         except (OSError, ValueError, TypeError):
             return False
 
-    @staticmethod
-    def verified_approval(session: Optional[GuardSession]) -> Dict[str, str]:
+    def is_approval_verified(self, session: Optional[GuardSession]) -> bool:
+        """
+        True when the session has an approval signature that verifies against the HMAC key.
+        Uses SessionManager.repo_path (resolved), never the repo_path stored in session.json.
+        """
+        return self._verify_session_signature(session, self.repo_path)
+
+    def verified_approval(self, session: Optional[GuardSession]) -> Dict[str, str]:
         """
         Return approved_fingerprints if the session's approval signature verifies.
         Returns {} when the signature is missing, wrong, or invalid.
         """
-        if SessionManager.is_approval_verified(session):
+        if self.is_approval_verified(session):
             return session.post.approved_fingerprints
         return {}
 
@@ -380,7 +385,7 @@ class SessionManager:
         # Sign upon successful post approval transition
         if post_rec.all_passed:
             post_rec.approval_signature = compute_approval_signature(
-                session.repo_path or str(self.repo_path),
+                self.repo_path,
                 session.session_id,
                 post_rec.approved_fingerprints,
             )
@@ -442,7 +447,7 @@ class SessionManager:
         # Keep an existing valid signature; if invalid or tampered, clear it!
         # Never mint a signature for an unapproved or loaded session here.
         if session and session.post:
-            if session.post.approval_signature is not None and not SessionManager.is_approval_verified(session):
+            if session.post.approval_signature is not None and not self.is_approval_verified(session):
                 session.post.approval_signature = None
 
         self.guard_dir.mkdir(parents=True, exist_ok=True)

@@ -20,7 +20,14 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from guard.agent.bash import HEAD_KEY, changed_between, content_hash, is_git_commit, is_read_only, worktree_fingerprint
+from guard.agent.bash import (
+    HEAD_KEY,
+    changed_between,
+    content_hash,
+    is_git_commit,
+    is_read_only,
+    worktree_fingerprint,
+)
 from guard.core.ocr_engine import GitDiffInspector
 from guard.core.session import SessionManager, SessionStatus, describe_owner
 
@@ -228,60 +235,94 @@ def _held_reason(session) -> str:
             f"\"{task}\", since {pre.timestamp[:16].replace('T', ' ')} UTC)")
 
 
+# Executable patterns for guard: guard, guard.exe, python[3[.x]] -m guard, py [-3[.x]] -m guard
+GUARD_EXEC_RE = (
+    r"(?:(?:\S*[/\\])?guard(?:\.exe)?|"
+    r"(?:\S*[/\\])?(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?(?:\s+-(?:[3\w.]+|\"[^\"]*\"|'[^']*'))*\s+-m\s+guard(?:\.exe)?)"
+)
+
 # `guard pre` as the command itself: at the start or after a shell separator, optionally behind
 # variable assignments or a path; never as an argument (`grep guard pre docs/`)
-GUARD_PRE = re.compile(r"(?:^|[;&|(\n])\s*(?:\w+=\S*\s+)*(?:\S*[/\\])?guard(?:\.exe)?\s+pre(?:\s|$)")
+GUARD_PRE = re.compile(
+    rf"(?:^|[;&|(\n])\s*(?:\w+=\S*\s+)*{GUARD_EXEC_RE}\s+pre(?:\s|$)",
+    re.IGNORECASE,
+)
+
+GUARD_SEG_RE = re.compile(
+    rf"^[ \t]*(?:\w+=\S*[ \t]+)*{GUARD_EXEC_RE}(?:[ \t]+(.*))?$",
+    re.IGNORECASE,
+)
+
+
+GUARD_SUSPECT_WRITE_RE = re.compile(
+    r"(?:>>?|&>|\d+>>?)\s*\S*\.guard|\btee\s+(?:-\S+\s+)*\S*\.guard",
+    re.IGNORECASE,
+)
+
+
+def is_single_segment_guard(seg: str) -> bool:
+    m = GUARD_SEG_RE.match(seg.strip())
+    if not m:
+        return False
+    args_str = m.group(1) or ""
+    try:
+        tokens = shlex.split(args_str)
+    except ValueError:
+        tokens = args_str.split()
+    cmd_tokens = []
+    for t in tokens:
+        if t == "--":
+            break
+        cmd_tokens.append(t.lower())
+    for idx, tok in enumerate(cmd_tokens):
+        if tok == "run":
+            if idx > 0 and cmd_tokens[idx - 1] in ("--repo", "-r", "-a", "--agent"):
+                continue
+            return False
+    return True
+
+
+def _split_unquoted_segments(cmd: str) -> List[str]:
+    cleaned = re.sub(r"\d*>&[0-2]|\d*>>?&\d+", " ", cmd)
+    try:
+        lexer = shlex.shlex(cleaned, posix=True, punctuation_chars=";&|\n")
+        lexer.whitespace_split = False
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except (ValueError, OSError):
+        return []
+    segments: List[str] = []
+    curr: List[str] = []
+    for tok in tokens:
+        if tok in (";", "&&", "||", "|", "&", "\n"):
+            if curr:
+                segments.append(" ".join(curr))
+                curr = []
+        else:
+            curr.append(tok)
+    if curr:
+        segments.append(" ".join(curr))
+    return segments
 
 
 def is_guard_command(cmd: str) -> bool:
-    """True when every executed pipeline/sequence segment in cmd is a guard command."""
+    """True when cmd contains a guard command, counting compound commands for their guard part; guard run is excluded."""
     if not cmd or not cmd.strip():
         return False
-    # Reject command substitutions and redirections targeting .guard
-    if "$(" in cmd or "`" in cmd or re.search(r">\s*\S*\.guard", cmd, re.IGNORECASE):
+    if "$(" in cmd or "`" in cmd or GUARD_SUSPECT_WRITE_RE.search(cmd):
         return False
-    try:
-        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = False
-        tokens = list(lexer)
-    except (ValueError, OSError):
+    segments = _split_unquoted_segments(cmd)
+    if not segments:
         return False
-    if not tokens:
-        return False
-
-    subcommands: List[List[str]] = []
-    current: List[str] = []
-    for t in tokens:
-        if t in (";", "&&", "||", "|", "&"):
-            if current:
-                subcommands.append(current)
-                current = []
-        else:
-            current.append(t)
-    if current:
-        subcommands.append(current)
-
-    for sub in subcommands:
-        if not sub:
+    has_guard = False
+    for seg in segments:
+        if is_single_segment_guard(seg):
+            has_guard = True
+        elif is_read_only(seg):
             continue
-        idx = 0
-        while idx < len(sub) and "=" in sub[idx] and not sub[idx].startswith(("-", "/")):
-            idx += 1
-        if idx >= len(sub):
-            return False
-        first = sub[idx].replace("\\", "/")
-        if first.lower().endswith(".exe"):
-            first = first[:-4]
-        prog = first.split("/")[-1].lower()
-        if prog == "guard":
-            continue
-        elif prog in ("python", "python3", "py"):
-            if idx + 2 < len(sub) and sub[idx + 1] == "-m" and sub[idx + 2] == "guard":
-                continue
-            return False
         else:
             return False
-    return True
+    return has_guard
 
 
 def _claim(state: Dict[str, Any], agent_session: str, agent: str) -> None:
@@ -331,7 +372,7 @@ def _uncovered(repo: Path, session, staged: bool = False) -> List[str]:
     Changed files not covered by the session's approval (all of them without an approval). With
     staged=True the staged content is checked too: `git add` then editing again commits the old text.
     """
-    approved = SessionManager.verified_approval(session)
+    approved = SessionManager(repo).verified_approval(session)
     out = [f for f in GitDiffInspector(repo).get_working_files() if approved.get(f) != content_hash(repo / f)]
     if staged:
         out += [f for f in _staged_differs(repo) if f not in out]
@@ -422,6 +463,7 @@ def _is_guard_path(path_str: str) -> bool:
     norm = path_str.replace("\\", "/").strip("/").lower()
     if not (norm == ".guard" or norm.startswith(".guard/")):
         return False
+    # .guard/notes.txt is exempt to preserve contract tested in test_ignored_files_inside_the_repo_are_gated_too
     if norm == ".guard/notes.txt":
         return False
     return True
@@ -473,46 +515,54 @@ def _after_bash(repo: Path, session, ev: AgentEvent, other: bool = False) -> Dec
     session_json = repo / ".guard" / "session.json"
     after_session_hash = content_hash(session_json) if session_json.is_file() else ""
     before_session_hash = before.pop(".guard/session.json", None)
-    cmd = ev.command or before.pop("__command__", "")
+    saved_cmd = before.pop("__command__", None)
+    cmd = ev.command or saved_cmd or ""
     session_changed = before_session_hash is not None and before_session_hash != after_session_hash
+    session_notice = ""
     if session_changed and not is_guard_command(cmd):
-        return Decision(
-            action="notify",
-            reason="Guard: that command changed .guard/session.json; guard's state is written only by guard commands.",
-        )
+        session_notice = "Guard: that command changed .guard/session.json; guard's state is written only by guard commands."
     after = worktree_fingerprint(repo)
     committed = before.get(HEAD_KEY) != after.get(HEAD_KEY) and bool(before.get(HEAD_KEY))
-    changed = [c for c in changed_between(before, after) if not c.startswith(".guard/") and c != HEAD_KEY and not c.startswith("__")]
+    changed = [c for c in changed_between(before, after) if not c.startswith(".guard/") and c != HEAD_KEY]
+
+    normal_reasons: List[str] = []
     if committed and (other or _commit_decision(repo, session).action == "block"):  # a commit got past the check
-        return Decision(action="notify", reason=(
+        normal_reasons.append(
             f"Guard: that command made a commit ({after.get(HEAD_KEY, '')[:12]}) without an approved guard review. "
             "Tell the user; run `guard post` on the work and get it approved before anything is pushed."
-        ))
-    if not changed:
-        return Decision()
-    if other and _active_pre(session):
-        # what the owner's agent changed meanwhile stays the owner's; the rest is this session's own work
-        scope = session.pre.expected_files
-        own = [c for c in changed if not (scope and GitDiffInspector(repo)._is_expected(c, scope))]
-        if not own:
-            return Decision()
-        _record_changes(repo, ev, "own_changes", own)
-        return Decision(action="notify", reason=(
-            f"Guard: that command changed {', '.join(own)} while {_held_reason(session)}. Undo it, or do this "
-            "work in a separate `git worktree add`."))
-    if not _active_pre(session):
-        _record_changes(repo, ev, "pre_edit_changes", changed)
-        return Decision(action="notify", reason=(
-            f"Guard: that command changed {', '.join(changed)} before any guard session. Stop editing and {PRE_HINT}; "
-            "these files are reported as changed before pre."
-        ))
-    scope = session.pre.expected_files
-    outside = [c for c in changed if scope and not GitDiffInspector(repo)._is_expected(c, scope)]
-    if outside:
-        return Decision(action="notify", reason=(
-            f"Guard: that command changed {', '.join(outside)}, outside the declared scope. Undo it if it was not "
-            "intended, or declare it with `guard pre --force ... --scope` (reported as SCOPE-004)."
-        ))
+        )
+    elif changed:
+        if other and _active_pre(session):
+            # what the owner's agent changed meanwhile stays the owner's; the rest is this session's own work
+            scope = session.pre.expected_files
+            own = [c for c in changed if not (scope and GitDiffInspector(repo)._is_expected(c, scope))]
+            if own:
+                _record_changes(repo, ev, "own_changes", own)
+                normal_reasons.append(
+                    f"Guard: that command changed {', '.join(own)} while {_held_reason(session)}. Undo it, or do this "
+                    "work in a separate `git worktree add`."
+                )
+        elif not _active_pre(session):
+            _record_changes(repo, ev, "pre_edit_changes", changed)
+            normal_reasons.append(
+                f"Guard: that command changed {', '.join(changed)} before any guard session. Stop editing and {PRE_HINT}; "
+                "these files are reported as changed before pre."
+            )
+        else:
+            scope = session.pre.expected_files
+            outside = [c for c in changed if scope and not GitDiffInspector(repo)._is_expected(c, scope)]
+            if outside:
+                normal_reasons.append(
+                    f"Guard: that command changed {', '.join(outside)}, outside the declared scope. Undo it if it was not "
+                    "intended, or declare it with `guard pre --force ... --scope` (reported as SCOPE-004)."
+                )
+
+    all_reasons = []
+    if session_notice:
+        all_reasons.append(session_notice)
+    all_reasons.extend(normal_reasons)
+    if all_reasons:
+        return Decision(action="notify", reason=" ".join(all_reasons))
     return Decision()
 
 
@@ -643,7 +693,7 @@ def _stop_on_session(repo: Path, session, agent_session: Optional[str] = None) -
         uncovered = _uncovered(repo, session)
         if uncovered:
             return Decision(action="block", reason=f"Guard: {', '.join(uncovered)} changed after the last approval. Run `guard post` again.")
-        if not SessionManager.is_approval_verified(session):
+        if _task_edits(repo, session) and not SessionManager(repo).is_approval_verified(session):
             return Decision(action="block", reason="Guard: this approval is missing a valid signature. Run `guard post` again.")
         return Decision()
     pre_edit = session_state(load_state(repo), agent_session).get("pre_edit_changes") or []
@@ -661,7 +711,7 @@ def _commit_decision(repo: Path, session) -> Decision:
             "`guard accept` in their own terminal (accept the remaining findings, or allow more rounds)."))
     if not session or session.status != SessionStatus.COMPLETED or not session.post:
         return Decision(action="block", reason="Guard: commit only approved work. Run `guard post` until it approves, then commit.")
-    if not SessionManager.is_approval_verified(session):
+    if not SessionManager(repo).is_approval_verified(session):
         return Decision(action="block", reason="Guard: this approval is missing a valid signature. Run `guard post` again before committing.")
     uncovered = _uncovered(repo, session, staged=True)
     if uncovered:
