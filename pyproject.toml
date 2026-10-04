@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "banh-mi-guard"
-version = "0.14.0"
+version = "0.15.0"
 description = "Banh Mi Guard: dual-gate impact analysis & regression guard for AI coding agents (scope, invariants, build, Alibaba Open Code Review rules and LLM review)"
 readme = "README.md"
 requires-python = ">=3.10"
