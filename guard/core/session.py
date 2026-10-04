@@ -9,7 +9,12 @@ Automatically ensures `.guard/` is ignored in `.gitignore` or local `.git/info/e
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
+import secrets
+import tempfile
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,6 +26,7 @@ from pydantic import BaseModel, Field
 from guard.core.impact import ImpactRange
 from guard.core.invariant_eval import DomainType, InvariantResult
 from guard.core.ocr_engine import DiffSummary, RuleViolation
+from guard.core.repo_setup import guard_home
 
 
 class SessionStatus(str, Enum):
@@ -111,6 +117,7 @@ class PostTaskRecord(BaseModel):
     deleted_files: List[str] = Field(default_factory=list)
     # Content fingerprints of every changed file when APPROVED: the approval covers exactly these
     approved_fingerprints: Dict[str, str] = Field(default_factory=dict)
+    approval_signature: Optional[str] = None
     learned_invariants: List[str] = Field(default_factory=list)  # ids the LLM added to guard.invariants.json
     rejected_invariant_proposals: List[str] = Field(default_factory=list)
     ocr_status: str = ""  # "complete: N finding(s) ..." or "did not run: <reason>"
@@ -141,10 +148,91 @@ class GuardSession(BaseModel):
     revise_budget: int = 3
 
 
+def get_approval_key() -> bytes:
+    """
+    Return the 32-byte approval key from ~/.guard/approval.key.
+    Created on first use, written atomically, mode 0600 on POSIX.
+    """
+    key_dir = guard_home()
+    key_file = key_dir / "approval.key"
+    if key_file.is_file():
+        data = key_file.read_bytes()
+        if len(data) == 32:
+            return data
+    key_dir.mkdir(parents=True, exist_ok=True)
+    new_key = secrets.token_bytes(32)
+    fd, tmp = tempfile.mkstemp(dir=key_dir, prefix=".approval-key-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_key)
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, key_file)
+        except (FileExistsError, OSError):
+            try:
+                if not key_file.is_file() or len(key_file.read_bytes()) != 32:
+                    os.replace(tmp, key_file)
+            except OSError:
+                pass
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    if key_file.is_file():
+        data = key_file.read_bytes()
+        if len(data) == 32:
+            return data
+    raise RuntimeError(f"Approval key file {key_file} is corrupt or invalid length")
+
+
+def compute_approval_signature(repo_path: str | Path, session_id: str, approved_fingerprints: Dict[str, str]) -> str:
+    """
+    HMAC-SHA256 over canonical JSON of repo root path, session id, and approved_fingerprints.
+    """
+    key = get_approval_key()
+    payload = {
+        "approved_fingerprints": approved_fingerprints,
+        "repo_path": str(Path(repo_path).resolve()),
+        "session_id": str(session_id),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 class SessionManager:
     """
     Manages `.guard/session.json` lifecycle.
     """
+
+    @staticmethod
+    def _verify_session_signature(
+        session: Optional[GuardSession], repo_path: str | Path
+    ) -> bool:
+        if not session or not session.post or not session.post.approval_signature:
+            return False
+        sig = session.post.approval_signature
+        try:
+            expected = compute_approval_signature(
+                Path(repo_path).resolve(), session.session_id, session.post.approved_fingerprints
+            )
+            return hmac.compare_digest(sig, expected)
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def is_approval_verified(self, session: Optional[GuardSession]) -> bool:
+        """
+        True when the session has an approval signature that verifies against the HMAC key.
+        Uses SessionManager.repo_path (resolved), never the repo_path stored in session.json.
+        """
+        return self._verify_session_signature(session, self.repo_path)
+
+    def verified_approval(self, session: Optional[GuardSession]) -> Dict[str, str]:
+        """
+        Return approved_fingerprints if the session's approval signature verifies.
+        Returns {} when the signature is missing, wrong, or invalid.
+        """
+        if self.is_approval_verified(session):
+            return session.post.approved_fingerprints
+        return {}
 
     def __init__(self, repo_path: Optional[Path] = None):
         self.repo_path = Path(repo_path or Path.cwd()).resolve()
@@ -175,7 +263,7 @@ class SessionManager:
             return None
         try:
             return GuardSession.model_validate_json(self.session_file.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
             return None
 
     def load_session(self) -> Optional[GuardSession]:
@@ -185,7 +273,7 @@ class SessionManager:
                 with open(self.session_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     return GuardSession.model_validate(data)
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
         # 2. Parent directory walk-up (for monorepo sub-repos up to 4 levels)
@@ -197,7 +285,7 @@ class SessionManager:
                     with open(parent_session, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         return GuardSession.model_validate(data)
-                except Exception:
+                except (OSError, ValueError):
                     pass
             if curr.parent == curr:
                 break
@@ -218,10 +306,9 @@ class SessionManager:
                             if curr_rp == sess_rp or curr_rp.is_relative_to(sess_rp):
                                 return sess
                         except AttributeError:
-                            import os
                             if curr_rp == sess_rp or str(curr_rp).startswith(str(sess_rp) + os.sep):
                                 return sess
-        except Exception:
+        except (OSError, ValueError):
             pass
         return None
 
@@ -305,6 +392,16 @@ class SessionManager:
             session.status = SessionStatus.COMPLETED if post_rec.all_passed else SessionStatus.NEEDS_FIX
             session.updated_at = datetime.now(timezone.utc).isoformat()
 
+        # Sign upon successful post approval transition
+        if post_rec.all_passed:
+            post_rec.approval_signature = compute_approval_signature(
+                self.repo_path,
+                session.session_id,
+                post_rec.approved_fingerprints,
+            )
+        else:
+            post_rec.approval_signature = None
+
         session.post = post_rec
         self._save(session)
         return session
@@ -334,7 +431,7 @@ class SessionManager:
         if self.session_file.exists():
             try:
                 self.session_file.unlink()
-            except Exception:
+            except OSError:
                 pass
         try:
             global_file = self._get_global_active_session_file()
@@ -349,30 +446,38 @@ class SessionManager:
                         if curr_rp == g_rp or curr_rp.is_relative_to(g_rp):
                             global_file.unlink(missing_ok=True)
                     except AttributeError:
-                        import os
                         if curr_rp == g_rp or str(curr_rp).startswith(str(g_rp) + os.sep):
                             global_file.unlink(missing_ok=True)
                 else:
                     global_file.unlink(missing_ok=True)
-        except Exception:
+        except (OSError, ValueError):
             pass
 
     def _save(self, session: GuardSession):
+        # Keep an existing valid signature; if invalid or tampered, clear it!
+        # Never mint a signature for an unapproved or loaded session here.
+        if session and session.post:
+            if session.post.approval_signature is not None and not self.is_approval_verified(session):
+                session.post.approval_signature = None
+
         self.guard_dir.mkdir(parents=True, exist_ok=True)
         temp_file = self.session_file.with_suffix(".tmp")
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 f.write(session.model_dump_json(indent=2))
             temp_file.replace(self.session_file)
-        except Exception:
+        except OSError:
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
+            raise
         # Sync to global active session for cross-workspace/cross-repo discovery
+        global_temp = None
         try:
             global_file = self._get_global_active_session_file()
             global_temp = global_file.with_suffix(".tmp")
             with open(global_temp, "w", encoding="utf-8") as f:
                 f.write(session.model_dump_json(indent=2))
             global_temp.replace(global_file)
-        except Exception:
-            pass
+        except OSError:
+            if global_temp is not None and global_temp.exists():
+                global_temp.unlink(missing_ok=True)

@@ -25,6 +25,13 @@ from guard.reporters.terminal import (
     symbol,
 )
 
+def _save_or_exit(mgr: SessionManager, session) -> None:
+    try:
+        mgr._save(session)
+    except OSError as err:
+        console.print(f"[bold red]❌ Could not save session: {err}[/bold red]")
+        raise typer.Exit(code=1)
+
 
 @app.command("finding")
 def finding_cmd(
@@ -47,7 +54,7 @@ def finding_cmd(
         console.print(f"[bold red]❌ No finding {finding_id!r} in this session's ledger.[/bold red]")
         raise typer.Exit(code=1)
     entry["status"], entry["note"] = ("deferred", defer) if defer is not None else ("rejected", reject)
-    mgr._save(session)
+    _save_or_exit(mgr, session)
     console.print(f"[bold green]✅ Finding {finding_id} {entry['status']}; the next review sees why.[/bold green]")
 
 
@@ -104,12 +111,18 @@ def accept_cmd(
         session.post.approved_fingerprints = dict(reviewed)
         session.post.all_passed, session.post.accepted_by_user = True, True
         session.post.followups, session.post.needs_user = remaining, False
-        mgr._save(session)
+        from guard.core.session import compute_approval_signature
+        session.post.approval_signature = compute_approval_signature(
+            mgr.repo_path,
+            session.session_id,
+            session.post.approved_fingerprints,
+        )
+        _save_or_exit(mgr, session)
         _write_post_report(target, session.post, session.pre)
     elif choice == "c":
         session.revise_budget += EXTRA_ROUNDS
         session.status, session.post.needs_user = SessionStatus.NEEDS_FIX, False
-        mgr._save(session)
+        _save_or_exit(mgr, session)
         _write_post_report(target, session.post, session.pre)
     render_accept_result(choice, session, console)
 

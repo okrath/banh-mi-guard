@@ -392,7 +392,8 @@ def test_ignored_files_inside_the_repo_are_gated_too(tmp_path):
     repo = make_repo(tmp_path)
     (repo / ".gitignore").write_text("out/\n", encoding="utf-8")
     assert edit(repo, "out/bundle.js").action == "block"
-    assert edit(repo, ".guard/notes.txt").action == "allow"  # guard's own folder
+    # guard's state is written only by guard commands
+    assert edit(repo, ".guard/notes.txt").action == "block"
 
 
 def test_pre_keeps_fingerprints_of_commands_still_running(tmp_path):
