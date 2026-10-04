@@ -46,8 +46,10 @@ from guard.reporters.markdown import generate_post_task_markdown, generate_pre_t
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
 
 console = Console()
+# The project's build and test command: a hung command must not hold the gate forever, but a
+# test suite routinely takes longer than a minute
 BUILD_TIMEOUT_S = 1800
-AGENT_OCR_CONCURRENCY = 2
+AGENT_OCR_CONCURRENCY = 2  # each OCR request starts the agent CLI: a few at a time, not OCR's default of 8
 
 
 def _fingerprint(path: Path) -> str:
@@ -79,6 +81,7 @@ def _drop_diff_files(raw_diff: str, drop: set) -> str:
 
 def _prompt_paths(prompt: str, repo: Path) -> List[str]:
     """Paths named in the prompt: existing files/dirs, or new `dir/file.ext` paths to be created."""
+    # Globs are only accepted through --scope: prose like "do not edit *.css" must not widen scope.
     tokens = re.findall(r"[\w\-\.\/\\\[\]]+\.[a-zA-Z0-9]+|[\w\-\.]+[\/\\][\w\-\.\/\\\[\]]*", prompt)
     out = []
     for t in tokens:
@@ -95,18 +98,25 @@ def _pre_check_session_and_owner(
     session_mgr: SessionManager, target_repo: Path, force: bool,
 ) -> Optional[Tuple[Optional[Any], Optional[dict]]]:
     """Validate prior session status, ownership, and restart permission; returns (superseded, owner) or None."""
+    # A pre-task gate that can be re-run after editing would let scope be declared retroactively.
+    # An unfinished (AWAITING_POST) or rejected (NEEDS_FIX) session can only be superseded with
+    # --force, and the new session inherits its baseline, base commit and scope: a restart can
+    # never turn the task's own edits into "pre-existing" baseline or widen the audited scope.
     previous = session_mgr.load_local_session()
     superseded = previous if (
         previous and previous.pre and previous.status in (
             SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX, SessionStatus.NEEDS_USER)
     ) else None
     if superseded and superseded.status == SessionStatus.NEEDS_USER:
+        # A restart would take back the decision the round budget handed to the user
         console.print(
             f"[bold red]❌ The guard session {superseded.session_id} is waiting for the user.[/bold red] "
             "Stop and ask the user to run [bold]guard accept[/bold] in their own terminal."
         )
         return None
 
+    # The agent session that started this pre (a claim taken by the agent hook seconds ago); a restart
+    # keeps the first pre's owner, and another agent session cannot take over a held working tree
     from guard.agent.events import fresh_claim, load_state
     from guard.core.session import describe_owner
     claim = fresh_claim(load_state(target_repo))
@@ -134,6 +144,9 @@ def _pre_check_session_and_owner(
 
 def _pre_check_untracked(target_repo: Path, superseded: Optional[Any], invariants_existed: bool) -> bool:
     """Ensure all untracked paths have user decisions before starting the baseline."""
+    # Untracked paths nobody decided about (agent folders such as plans/) cannot be snapshotted as a
+    # baseline: the user says once whether each is part of the repository or always ignored. Checked
+    # for a first pre and for a --force restart alike (a restart does not ask about its task's files).
     from guard.core.untracked import ASK_USER, RegistryError, printable, shown, undecided
     try:
         pending = [p for p in undecided(target_repo, skip_task_files=bool(superseded))
@@ -181,10 +194,12 @@ def _pre_scope_and_baseline(
             "status": superseded.status.value,
             "at": datetime.now(timezone.utc).isoformat(),
         }]
+        # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
         impact = superseded.pre.impact
     else:
         working_files = diff_inspector.get_working_files()
         if not invariants_existed:
+            # The file guard setup just created is not the user's pending work
             working_files = [f for f in working_files if f != INVARIANTS_FILENAME]
         if working_files and not allow_dirty:
             listing = "\n".join(f"  • {f}" for f in working_files[:20])
@@ -222,6 +237,7 @@ def _pre_analyze(
     impact: Optional[dict], config, superseded: Optional[Any],
 ) -> _PreAnalysis:
     """Analyze domain, reason, and baseline contracts with LLM or inheritance."""
+    # A restart keeps the first pre's analysis: the task may have edited the scoped files since
     if superseded:
         old = superseded.pre
         return _PreAnalysis(
@@ -242,6 +258,7 @@ def _pre_lock_invariants(
     baseline: _PreBaseline, superseded: Optional[Any],
 ) -> Optional[Tuple[list, dict]]:
     """Extract and evaluate baseline invariants; updates baseline.impact in place when checked invariants exist."""
+    # Template invariants follow task_domain
     try:
         _, invariants = extract_contracts_and_invariants(
             repo_path=target_repo, prompt=prompt, domain=task_domain, files=baseline.candidate_files,
@@ -252,12 +269,16 @@ def _pre_lock_invariants(
     baseline_eval = evaluate_invariants(
         invariants=[inv.model_dump() for inv in invariants], git_diff="", files_changed=[], repo_path=target_repo,
     )
+    # Only real checks have a meaningful baseline; diff heuristics trivially "pass" on an empty diff
     checked = {inv.id for inv in invariants if inv.checks}
     baseline_status = {c.id: c.status for c in baseline_eval.checks if c.id in checked}
     if superseded:
+        # A restart keeps the rules locked at the first pre: re-locking from a rulebook edited in the
+        # meantime would let the task choose the rules it is judged by
         baseline_status = dict(superseded.pre.baseline_invariant_status)
         invariants = list(superseded.pre.locked_invariants)
     elif baseline.candidate_files and baseline.impact is not None and any(inv.checks for inv in invariants):
+        # the first scan had no invariants to map onto the scoped files; only checked ones add anything
         baseline.impact = expected_impact(target_repo, baseline.candidate_files, [inv.model_dump() for inv in invariants])
     return invariants, baseline_status
 
@@ -268,22 +289,24 @@ def _pre_save_session(
     owner: Optional[dict], superseded: Optional[Any],
 ):
     """Save the pre-task session with agent state integration."""
+    # What the agent hook recorded before this pre: the user's own prompt, files changed early
     from guard.agent.events import session_state, update_state
 
-    def take(state):
-        if owner:
+    def take(state):  # consumed by this pre: never reused for a later task
+        if owner:  # this pre's claim is consumed; another session's claim stays for its own pre
             (state.get("claims") or {}).pop(owner["session"], None)
-        own = session_state(state, owner["session"]) if owner else state
-        taken = {k: own.pop(k, None) for k in ("user_prompt", "prompt_at", "pre_edit_changes")}
+        own = session_state(state, owner["session"]) if owner else state  # the owner's prompt, not the last one typed
+        taken = {k: own.pop(k, None) for k in ("user_prompt", "prompt_at", "pre_edit_changes")}  # in-flight "bash" stays
         return taken["user_prompt"], taken["pre_edit_changes"] or []
 
     recorded_prompt, recorded_changes = update_state(target_repo, take)
-    user_prompt = recorded_prompt or (superseded.pre.user_prompt if superseded else None)
+    user_prompt = recorded_prompt or (superseded.pre.user_prompt if superseded else None)  # a new prompt wins
     pre_edit_changes = sorted(set(recorded_changes) | set(superseded.pre.pre_edit_changes if superseded else []))
 
     session = session_mgr.start_pre_session(
         user_prompt=user_prompt, pre_edit_changes=pre_edit_changes, impact=baseline.impact,
-        carry=superseded, owner=owner, prompt=prompt, expected_files=baseline.candidate_files,
+        carry=superseded,  # a restart keeps the task's findings ledger and round count
+        owner=owner, prompt=prompt, expected_files=baseline.candidate_files,
         contracts=analysis.contracts, invariants=invariants,
         non_regression_strategy=f"Isolate changes to domain {analysis.task_domain.value.upper()}. Maintain 100% existing baseline contracts.",
         domain=analysis.task_domain, repo_domain=analysis.repo_domain,
@@ -362,11 +385,13 @@ def _post_check_hook_and_session(
     target_repo: Path, session_mgr: SessionManager, hook: bool,
 ) -> Tuple[bool, bool, Optional[Any]]:
     """Verify session existence, git hook skip conditions, and user wait states; returns (proceed, result, session)."""
+    # In a git hook only this repo's own session counts; never adopt another repo's session.
     session = session_mgr.load_local_session() if hook else session_mgr.load_session()
     if hook and session is None:
         console.print("[dim]Banh-Mi-Guard: no guard session in this repository, skipping.[/dim]")
         return False, True, None
     if hook and session.status == SessionStatus.COMPLETED:
+        # An approval covers only the exact file contents it approved, not later or unrelated work
         approved = session.post.approved_fingerprints if session.post else {}
         uncovered = [
             f for f in GitDiffInspector(target_repo).get_working_files()
@@ -385,6 +410,7 @@ def _post_check_hook_and_session(
         return False, False, None
 
     if session is not None and session.status == SessionStatus.NEEDS_USER:
+        # Another round would take back the decision the round budget handed to the user
         console.print(
             f"[bold red]❌ Guard session {session.session_id} is waiting for the user.[/bold red] "
             "Stop and ask the user to run [bold]guard accept[/bold] in their own terminal."
@@ -410,24 +436,31 @@ class _PostDiffScope:
 
 def _post_diff_and_scope_audit(target_repo: Path, pre: Optional[Any]) -> _PostDiffScope:
     """Inspect raw git diff against pre base_ref, separate preexisting changes, and build task diff."""
+    # OCR diff & blast radius audit (no declared scope -> no scope verdict, instead of flagging every file)
     expected_files = pre.expected_files if pre else []
     scope_declared = bool(expected_files)
     baseline_dirty = pre.baseline_dirty if pre else {}
 
     diff_inspector = GitDiffInspector(target_repo)
+    # Diff against the commit recorded at pre, so commits made mid-task are still audited
     raw_diff = diff_inspector.get_diff(base_ref=pre.base_ref if pre else None) or ""
     diff_summary = diff_inspector.parse_diff(raw_diff, expected_files=expected_files if scope_declared else None)
 
+    # Files dirty before pre-task and untouched since are not attributed to this task.
     for f in diff_summary.files:
         if f.path in baseline_dirty and baseline_dirty[f.path] == _fingerprint(target_repo / f.path):
             f.preexisting = True
             f.is_out_of_scope = False
         elif f.path == INVARIANTS_FILENAME:
+            # guard.invariants.json may grow outside the declared scope (guard writes learned rules into it);
+            # removing or relaxing an existing rule is checked separately below and blocks.
             f.is_out_of_scope = False
     diff_summary.out_of_scope_files = [f.path for f in diff_summary.files if f.is_out_of_scope]
     preexisting_files = [f.path for f in diff_summary.files if f.preexisting]
     deleted_files = [f.path for f in diff_summary.files if f.status == "deleted" and not f.preexisting]
 
+    # With a baseline snapshot, rules and the LLM see exactly the task's own edits; pre-existing
+    # changes stay listed (and scope-audited) but are not reviewed as if the task wrote them.
     task_diff = raw_diff
     snapshot = pre.baseline_snapshot if pre else None
     if snapshot:
@@ -478,6 +511,7 @@ def _audit_invariants_rulebook(
     target_repo: Path, pre: Optional[Any], diff_scope: _PostDiffScope,
 ) -> Tuple[List[RuleViolation], Set[str], Dict[str, list]]:
     """Audit changes to INVARIANTS_FILENAME for retired, redefined, or weakened rules."""
+    # Weakening the rulebook is never a side effect: a removed or relaxed invariant blocks
     rulebook_retired: Set[str] = set()
     rulebook_redefined: Dict[str, list] = {}
     violations: List[RuleViolation] = []
@@ -493,6 +527,7 @@ def _audit_invariants_rulebook(
                 INVARIANTS_FILENAME, diff_scope.expected_files
             )
             if declared:
+                # An explicit, scoped rulebook edit: judge the locked rules by what the task decided
                 new_by_id = {str(i["id"]): i for i in new_items}
                 for old in old_items:
                     oid = str(old["id"])
@@ -502,7 +537,9 @@ def _audit_invariants_rulebook(
                         rulebook_redefined[oid] = new_by_id[oid].get("checks") or []
             for note in removed_or_relaxed(old_items, new_items):
                 violations.append(RuleViolation(
-                    rule_id="INV-WEAKENED", severity="MEDIUM" if declared else "CRITICAL",
+                    rule_id="INV-WEAKENED",
+                    # An explicitly scoped rulebook edit is reported to the reviewer; a silent one blocks
+                    severity="MEDIUM" if declared else "CRITICAL",
                     file_path=INVARIANTS_FILENAME,
                     message=f"Invariant {note}. Removing or relaxing a project invariant needs an explicit task and review.",
                 ))
@@ -523,10 +560,12 @@ def _post_rules_and_hygiene(
 ) -> _PostRulesResult:
     """Run rulebook, symbol removals, blast radius impact, invariant edits, hygiene and simplicity."""
     violations = _scan_scope_violations(diff_scope, pre)
+    # Removals a compiler cannot see (string keys, exports, CSS classes) checked over the whole repo
     removal_violations, removal_summary = check_removed_symbols(target_repo, diff_scope.task_diff)
     violations.extend(removal_violations)
     evidence = [removal_summary] if removal_summary else []
 
+    # Changed symbols against the impact range pre expected (MEDIUM: reported, never blocking)
     impact_violations, impact_summary = check_impact(
         target_repo, diff_scope.task_diff, pre.impact if pre else None, diff_scope.expected_files,
     )
@@ -545,6 +584,7 @@ def _post_rules_and_hygiene(
         hygiene_violations = hygiene.scan_diff_level(diff_scope.task_diff, diff_scope.task_summary)
     violations.extend(hygiene_violations)
 
+    # dependency bloat is read from the diff, with or without --focus simplicity
     violations.extend(SimplicityEngine(target_repo).scan_diff_level(diff_scope.task_diff, diff_scope.task_summary))
     return _PostRulesResult(
         violations=violations, evidence=evidence, impact_summary=impact_summary,
@@ -566,9 +606,14 @@ def _post_ocr(
     preexisting_files: List[str], hook: bool, full: bool,
 ) -> _PostOcrResult:
     """Coordinate Alibaba OCR review and start the background build; returns OCR result with findings."""
+    # Alibaba OCR (an LLM review that reads the repository) runs only for a full review (--full, never
+    # in a Git hook); then OCR not running blocks like a HIGH finding. Without it the report says so.
+    # The user can make it permanent: `guard config ocr always` (machine-wide) runs it on every post
     always = bool(load_global_config().ocr.always)
     full = full or always
 
+    # The build (tests) runs in parallel with the reviews: with OCR it starts once OCR has taken its
+    # snapshot (build output never enters the reviewed tree), without OCR it starts now
     pool = ThreadPoolExecutor(max_workers=1)
     build = {}
 
@@ -576,6 +621,7 @@ def _post_ocr(
         if "future" not in build:
             build["future"] = pool.submit(_run_build, target_repo)
 
+    # The status always names the setting, so the user knows when OCR runs and how to change it
     setting = (
         "`guard config ocr always` is on: every guard post runs it" if always
         else "optional: guard post --full adds it; `guard config ocr always` runs it on every post"
@@ -598,11 +644,11 @@ def _post_ocr(
         else:
             ocr_status, found = run_ocr_review(target_repo, **review)
         ocr_violations.extend(found)
-        if ocr_status.startswith("did not run"):
+        if ocr_status.startswith("did not run"):  # a failed review names the setting too
             ocr_status += f" ({setting})"
 
-    with_ocr = full and not hook and bool(task_diff.strip())
-    start_build()
+    with_ocr = full and not hook and bool(task_diff.strip())  # then the gate waits for OCR and the build
+    start_build()  # no OCR (or it stopped before its snapshot): the build starts here
 
     return _PostOcrResult(
         ocr_status=ocr_status, with_ocr=with_ocr, pool=pool,
@@ -614,6 +660,7 @@ def _post_invariants(
     target_repo: Path, pre: Optional[Any], diff_scope: _PostDiffScope, rules_res: _PostRulesResult,
 ) -> Tuple[InvariantResult, List[RuleViolation]]:
     """Evaluate project and template invariants on current code; returns (eval_result, violations)."""
+    # Invariants: project checks run on current files; template invariants only get diff heuristics
     invariants_dicts = [inv.model_dump() for inv in (pre.locked_invariants if pre else [])]
     inv_eval = evaluate_invariants(
         invariants=invariants_dicts, git_diff=diff_scope.task_diff,
@@ -622,6 +669,7 @@ def _post_invariants(
     baseline_status = pre.baseline_invariant_status if pre else {}
     for c in inv_eval.checks:
         if c.status == "failed" and baseline_status.get(c.id) == "failed":
+            # Not a regression caused by this task: warn, do not block
             c.status = "baseline_failed"
             c.passed = True
             c.notes += " (already failing before this task)"
@@ -636,6 +684,8 @@ def _post_invariants(
 
     inv_violations: List[RuleViolation] = []
     if any(f.path == INVARIANTS_FILENAME for f in diff_scope.diff_summary.files):
+        # A new or edited guard.invariants.json is not locked by this session, so self-check it on the
+        # current tree: a rule that fails on the code it was written for is a broken rule.
         try:
             new_items = load_shared_invariants(target_repo) or []
         except InvariantsFileError as e:
@@ -670,9 +720,13 @@ def _record_learned_invariants(
     target_repo: Path, review_verdict, session_id: str,
 ) -> Tuple[List[str], List[dict]]:
     """Persist and format rules proposed by LLM review after verifying they pass on current code."""
+    # Rules the reviewer discovered are written only after validation (new, and passing on this code),
+    # before fingerprints are taken so the updated file is part of what was approved.
     learned, rejected_props = append_learned_invariants(
         target_repo, review_verdict.proposed_invariants, session_id,
     )
+    # The report says what verified each added rule: how many of its checks pass on the current code
+    # counted from the rules as written, not from the proposals (two proposals may share an id)
     check_counts = {str(i["id"]): len(i.get("checks") or []) for i in (load_local_invariants(target_repo) or [])} if learned else {}
     learned = [f"{i} ({check_counts.get(i, 0)} check(s) pass on the current code)" for i in learned]
     return learned, rejected_props
@@ -680,10 +734,10 @@ def _record_learned_invariants(
 
 def _run_gate_review(gate, target_repo: Path, ocr_res: _PostOcrResult) -> Tuple[Any, Optional[BuildCheckResult]]:
     """Coordinate the gate review with parallel build execution."""
-    if ocr_res.with_ocr:
+    if ocr_res.with_ocr:  # the gate sees OCR's findings and the build result
         build_res = ocr_res.build_future.result()
         review_verdict = gate(build_res, True, [])
-    else:
+    else:  # the LLM reviews while the build runs; a failing build still rejects on its own
         build_cmd = detect_build_command(target_repo)
         notes = [
             f"The build and tests ({build_cmd}) run in parallel with this review; guard rejects the change by "
@@ -692,6 +746,7 @@ def _run_gate_review(gate, target_repo: Path, ocr_res: _PostOcrResult) -> Tuple[
         review_verdict = gate(None, True, notes)
         build_res = ocr_res.build_future.result()
         if build_res is not None and not build_res.passed:
+            # decided by the build, not by the LLM: the heuristic verdict (REVISE), and no LLM round counted
             llm_ran = review_verdict.review_mode == "llm_deep"
             review_verdict = gate(build_res, False, [])
             if llm_ran:
@@ -710,6 +765,7 @@ def _post_llm_gate(
     domain = pre.domain if pre else DomainType.BACKEND
     prompt = pre.prompt if pre else "Post-task verification"
     if pre and pre.user_prompt and pre.user_prompt.strip() != pre.prompt.strip():
+        # The agent wrote `prompt`; the hook recorded what the user actually asked
         prompt = f"{pre.prompt}\n\nThe user's own message before this pre (verbatim, recorded by the agent hook; judge the task against it): {pre.user_prompt}"
 
     def gate(build_res: Optional[BuildCheckResult], use_llm: bool, notes: List[str]):
@@ -759,7 +815,7 @@ def _post_record_and_report(
         learned_invariants=gate_res.learned, rejected_invariant_proposals=gate_res.rejected_props,
         ocr_status=ocr_res.ocr_status, impact_summary=rules_res.impact_summary,
         ocr_complete=ocr_res.ocr_status.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in rules_res.violations),
-        commit_mode=load_global_config().commit_mode,
+        commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
 
     session_mgr.complete_post_session(post_rec)
@@ -804,6 +860,7 @@ def _execute_post_task(
             f"Files an agent command changed before guard pre ran: {', '.join(pre.pre_edit_changes)}"
         )
 
+    # Build and tests: running in parallel (see start_build); waited for before the gate decides
     gate_res = _post_llm_gate(
         target_repo, config, session, pre, diff_scope, rules_res, inv_eval, ocr_res, focus,
     )
@@ -858,6 +915,7 @@ def _ocr_cache_key(config, pre) -> Optional[str]:
     import re
     from guard.core.config import _llm_fingerprint
     from guard.core.updater import get_installed_ocr_version
+    # the version is read from `ocr`: for another configured binary it says nothing
     version = get_installed_ocr_version() if config.ocr.binary_path == "ocr" else None
     if not version or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         return None
@@ -872,6 +930,8 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
     if build_cmd:
         start_t = time.perf_counter()
         try:
+            # detect_build_command returns guard's own fixed commands (never user config); shell=True needed for npm/pnpm on Windows.
+            # Turn into an argument list before ever reading a build command from config.
             p = subprocess.run(
                 build_cmd,
                 shell=True,
@@ -935,6 +995,7 @@ def _record_round(session_mgr: SessionManager, verdict, post_rec) -> bool:
     if session is None:
         return False
     if verdict.review_mode != "llm_deep":
+        # No LLM round to count, but an approval still carries the task's follow-ups
         if post_rec.all_passed and session.post:
             post_rec.followups = session.post.followups = _followups(session.findings_ledger)
             session_mgr._save(session)
@@ -942,7 +1003,7 @@ def _record_round(session_mgr: SessionManager, verdict, post_rec) -> bool:
     session.llm_rounds += 1
     raised = {f.id for f in verdict.findings}
     by_id = {entry.get("id"): entry for entry in session.findings_ledger}
-    for entry in session.findings_ledger:
+    for entry in session.findings_ledger:  # earlier findings this round did not raise again
         if entry.get("status") == "open" and entry.get("id") not in raised:
             entry["status"], entry["note"] = "not raised again", f"round {session.llm_rounds}"
     for f in verdict.findings:
