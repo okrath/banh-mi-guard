@@ -19,6 +19,9 @@ from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.removal_check import check_removed_symbols
 from guard.domains.pre_analysis import analyze_task
 from guard.hooks.runner import run_sandwich_task
+from guard.core.session import SessionManager
+from guard.reporters.markdown import snapshot_missing_reason
+from guard.task_flow import execute_post_task, execute_pre_task
 
 
 SAMPLE_REMOVAL_DIFF = """diff --git a/src/app.ts b/src/app.ts
@@ -494,3 +497,122 @@ def test_config_ocr_sync_catches_value_error():
             assert ok is False
             assert "Error executing OCR CLI" in msg
             assert "ValueError" in msg or "embedded null byte" in msg
+
+
+def _make_error_paths_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "app"
+    repo.mkdir(parents=True, exist_ok=True)
+    for cmd in (["git", "init"], ["git", "config", "user.email", "t@t"], ["git", "config", "user.name", "t"]):
+        subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "chat.ts").write_text("export function send() { return 1; }\n", encoding="utf-8")
+    (repo / "src" / "other.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+def test_snapshot_diff_error_forces_revise(tmp_path):
+    """Snapshot diff error surfaces on diff_summary, forces REVISE verdict, and is named in report."""
+    repo = _make_error_paths_repo(tmp_path)
+    (repo / "src" / "other.ts").write_text("export const x = 2;\n", encoding="utf-8")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is True
+    pre = SessionManager(repo).load_local_session().pre
+    snapshot_sha = pre.baseline_snapshot
+    assert snapshot_sha is not None
+
+    (repo / "src" / "chat.ts").write_text("export function send() { return 2; }\n", encoding="utf-8")
+
+    real_get_diff = GitDiffInspector.get_diff
+
+    def fake_get_diff(self, base_ref=None):
+        if base_ref == snapshot_sha:
+            self.last_error = "git diff failed (exit code 128): fatal: bad object"
+            return "# [ERROR: git diff failed (exit code 128): fatal: bad object]\n"
+        return real_get_diff(self, base_ref=base_ref)
+
+    with patch.object(GitDiffInspector, "get_diff", fake_get_diff):
+        passed = execute_post_task(repo_path=repo)
+        assert passed is False
+        post = SessionManager(repo).load_local_session().post
+        assert post.muse_verdict == "REVISE"
+        assert post.muse_score <= 5.0
+        assert post.diff_summary is not None
+        assert post.diff_summary.error is not None
+        assert "git diff failed" in post.diff_summary.error
+        report = (repo / ".guard" / "POST_TASK_REPORT.md").read_text(encoding="utf-8")
+        assert "Diff inspection error" in report
+        assert "git diff failed" in report
+
+
+def test_failed_baseline_snapshot_at_pre_records_reason(tmp_path):
+    """Failed baseline snapshot at pre is recorded with reason; post reviews full diff; pre does not fail on fresh repo."""
+    # 1. Fresh repository with no commits and staged dirty file
+    fresh_repo = tmp_path / "fresh"
+    fresh_repo.mkdir()
+    subprocess.run(["git", "init"], cwd=fresh_repo, check=True, capture_output=True)
+    for cmd in (["git", "config", "user.email", "t@t"], ["git", "config", "user.name", "t"]):
+        subprocess.run(cmd, cwd=fresh_repo, check=True, capture_output=True)
+    (fresh_repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    subprocess.run(["git", "add", "dirty.txt"], cwd=fresh_repo, check=True, capture_output=True)
+
+    ok = execute_pre_task("Init task", repo_path=fresh_repo, allow_dirty=True)
+    assert ok is True
+    session = SessionManager(fresh_repo).load_local_session()
+    assert session.pre.baseline_snapshot is None
+    reason = snapshot_missing_reason(session.pre)
+    assert reason is not None
+    assert "no commits" in reason or "failed" in reason or "initial commit" in reason
+
+    (fresh_repo / "dirty.txt").write_text("uncommitted\nedit\n", encoding="utf-8")
+    execute_post_task(repo_path=fresh_repo)
+    post = SessionManager(fresh_repo).load_local_session().post
+    scope3 = [v for v in post.rule_violations if v.rule_id == "SCOPE-003"][0]
+    assert scope3.severity == "HIGH"
+    assert "Baseline snapshot is missing" in scope3.message
+    assert "review covers the full diff" in scope3.message
+    assert reason in scope3.message
+
+    # 2. Repo with commits where create_baseline_snapshot fails and records last_error
+    repo = _make_error_paths_repo(tmp_path / "committed")
+    (repo / "src" / "other.ts").write_text("export const x = 2;\n", encoding="utf-8")
+
+    def fake_create_snapshot(self):
+        self.last_error = "git update-ref failed (exit code 1): fatal: update-ref failed"
+        return None
+
+    with patch.object(GitDiffInspector, "create_baseline_snapshot", fake_create_snapshot):
+        ok = execute_pre_task("Fix chat", repo_path=repo, allow_dirty=True)
+        assert ok is True
+        session = SessionManager(repo).load_local_session()
+        assert session.pre.baseline_snapshot is None
+        reason = snapshot_missing_reason(session.pre)
+        assert reason == "git update-ref failed (exit code 1): fatal: update-ref failed"
+
+    (repo / "src" / "chat.ts").write_text("export function send() { return 2; }\n", encoding="utf-8")
+    execute_post_task(repo_path=repo)
+    post = SessionManager(repo).load_local_session().post
+    scope3 = [v for v in post.rule_violations if v.rule_id == "SCOPE-003"][0]
+    assert scope3.severity == "HIGH"
+    assert "Baseline snapshot is missing" in scope3.message
+    assert "git update-ref failed" in scope3.message
+
+
+def test_normal_path_no_errors_unchanged(tmp_path):
+    """Normal path without errors creates snapshot and reviews snapshot diff cleanly."""
+    repo = _make_error_paths_repo(tmp_path)
+    (repo / "src" / "other.ts").write_text("export const x = 2;\n", encoding="utf-8")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo, allow_dirty=True) is True
+    pre = SessionManager(repo).load_local_session().pre
+    assert pre.baseline_snapshot is not None
+    assert snapshot_missing_reason(pre) is None
+
+    (repo / "src" / "chat.ts").write_text("export function send() { return 2; }\n", encoding="utf-8")
+    execute_post_task(repo_path=repo)
+    post = SessionManager(repo).load_local_session().post
+    assert post.diff_summary is not None
+    assert post.diff_summary.error is None
+    scope3 = [v for v in post.rule_violations if v.rule_id == "SCOPE-003"][0]
+    assert scope3.severity == "MEDIUM"
+    assert "Review covers only edits made after pre-task (diff vs baseline snapshot)" in scope3.message
+    assert "src/other.ts" in post.preexisting_files
