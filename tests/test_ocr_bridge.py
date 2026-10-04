@@ -160,8 +160,8 @@ def test_a_failed_agent_call_is_named_even_when_ocr_completes(tmp_path, monkeypa
     monkeypatch.setattr(task_flow, "run_ocr_review", review_with_a_failed_call)
     config = SimpleNamespace(llm=SimpleNamespace(cli_agent="codex", model="", timeout=60.0))
     status, _ = task_flow._ocr_through_agent(tmp_path, config, {"concurrency": 0})
-    # the fallback (here without a base commit) cannot run either: both reasons are named
-    assert status.startswith("did not run: the delegation mode needs the base commit")
+    # the fallback cannot run either (no base commit, or no ocr on this machine): both reasons are named
+    assert status.startswith("did not run: ") and "as the fallback after" in status
     assert "did not run: 1 codex CLI call(s) failed, the last said: codex exited with 1: rate limited" in status
     assert [v.rule_id for v in _] == ["OCR-RUN"]  # never counted as a complete review
 
