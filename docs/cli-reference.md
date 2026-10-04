@@ -204,7 +204,8 @@ guard update
 # Explicitly bypass quarantine hold:
 guard update --force
 
-# Upgrade Banh-Mi-Guard CLI itself from GitHub:
+# Upgrade Banh-Mi-Guard CLI itself from the GitHub main branch (newest code, possibly ahead of the last release;
+# for released versions only use `pipx upgrade banh-mi-guard` or `pip install --upgrade banh-mi-guard`):
 guard update self
 
 # Check for Guard CLI updates on GitHub without installing:

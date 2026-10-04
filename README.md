@@ -29,16 +29,25 @@ It automates the impact and regression protocol from `oh-my-ainovel` across thre
 
 Install the `guard` CLI globally on any platform using one of the following methods:
 
-### Method 1: Install directly from GitHub (Recommended)
+### Method 1: Install from PyPI (Recommended)
 ```bash
-# On Linux / macOS (Recommended with pipx for isolated global binary):
-pipx install git+https://github.com/okrath/banh-mi-guard.git
+# With pipx (isolated global binary, recommended on Linux / macOS):
+pipx install banh-mi-guard
 
 # Or with standard pip across all platforms (Windows / Linux / macOS):
+pip install banh-mi-guard
+```
+PyPI carries each released version (https://pypi.org/project/banh-mi-guard/). To upgrade: `pipx upgrade banh-mi-guard` or `pip install --upgrade banh-mi-guard`.
+
+### Method 2: Install the latest `main` directly from GitHub
+```bash
+pipx install git+https://github.com/okrath/banh-mi-guard.git
+# or
 pip install git+https://github.com/okrath/banh-mi-guard.git
 ```
+This is the newest code, which can be ahead of the last release. `guard update self` upgrades from here (see `guard update` below).
 
-### Method 2: Clone repository & install in editable mode
+### Method 3: Clone repository & install in editable mode
 ```bash
 git clone https://github.com/okrath/banh-mi-guard.git
 cd banh-mi-guard
@@ -221,7 +230,8 @@ guard update
 # Bypass quarantine hold explicitly:
 guard update --force
 
-# Upgrade the Guard CLI itself directly from GitHub:
+# Upgrade the Guard CLI itself directly from the GitHub main branch
+# (installed from PyPI and want released versions only? use pipx upgrade / pip install --upgrade banh-mi-guard):
 guard update self
 
 # Check for Guard CLI updates on GitHub without installing:
