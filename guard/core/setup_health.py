@@ -10,7 +10,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from guard.core.repo_setup import (
     AGENT_DOC_NAMES, DIRECTIVE_END, DIRECTIVE_START, GLOBAL_AGENT_DOCS, LEGACY_COMMENT, MANUAL_HOOK_LINE,
@@ -55,20 +55,7 @@ def _local_agent_docs(cwd: Path) -> List[Path]:
     return docs
 
 
-def setup_health(cwd: Path) -> List[Dict[str, str]]:
-    """
-    Check an installation made by any guard version. Each entry: level ('missing' | 'warn' | 'ok'),
-    item, detail and the fix command, so users of older setups know exactly what to run.
-    """
-    out: List[Dict[str, str]] = []
-
-    def add(level: str, item: str, detail: str, fix: str = ""):
-        out.append({"level": level, "item": item, "detail": detail, "fix": fix})
-
-    repo = git_root(cwd)
-    install_fix = "guard install   (or: guard install --workspace <dir>)"
-
-    # 1. Git hooks
+def _check_git_hooks(repo: Optional[Path], add: Callable[[str, str, str, str], None], install_fix: str) -> None:
     if _global_hooks_active():
         if (guard_home() / "hooks" / "pre-commit").is_file():
             add("ok", "Git hooks", "global hooks check every repository")
@@ -96,7 +83,8 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     else:
         add("missing", "Git hooks", "no global guard hooks are installed", install_fix)
 
-    # 2. Agent directives: an agent must be told to run guard, otherwise nothing starts
+
+def _check_agent_directives(cwd: Path, add: Callable[[str, str, str, str], None], install_fix: str) -> None:
     global_docs = global_agent_docs()
     local_docs = _local_agent_docs(cwd)
     states = {d: _doc_state(d) for d in global_docs + local_docs}
@@ -117,39 +105,46 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     elif not any(s == "unmarked" for s in states.values()):
         add("missing", "Agent directives", "no agent instruction file tells the agent to run guard pre/post", install_fix)
 
-    # 2b. Agent hooks: the directives ask; the hooks enforce
+
+def _check_by_hand_adapter(adapter: dict, add: Callable[[str, str, str, str], None]) -> None:
+    name = adapter["name"]
+    from guard.agent.adapter import test_record_path
+    try:
+        tested = json.loads(test_record_path(name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        tested = None
+    from guard.agent.adapter import config_fingerprint, config_path
+    refuses = "before-edit" in (adapter.get("can_block") or [])
+    now = config_fingerprint(config_path(adapter))  # None: unreadable now, so nothing to compare with
+    same_file = isinstance(tested, dict) and now is not None and tested.get("config") == now
+    unknown = isinstance(tested, dict) and (now is None or not tested.get("config"))
+    if isinstance(tested, dict) and tested.get("events") and unknown:
+        add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; guard cannot tell whether its "
+            f"config is the one the last test ({str(tested.get('at'))[:10]}) saw", f"guard agent test {name}")
+    elif isinstance(tested, dict) and tested.get("events") and not same_file:
+        add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; its config changed since the "
+            f"last test ({str(tested.get('at'))[:10]})", f"guard agent test {name}")
+    elif isinstance(tested, dict) and tested.get("events") and (tested.get("blocked_edit") or not refuses):
+        # guard cannot read that file to check it now: the last test is the evidence
+        add("ok", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
+            f"({str(tested.get('at'))[:10]}) saw guard's events (run guard agent test {name} after "
+            "changing that file)")
+    elif isinstance(tested, dict) and tested.get("events"):
+        add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
+            f"({str(tested.get('at'))[:10]}) refused no edit", f"guard agent test {name}")
+    else:
+        add("warn", "Agent hooks", f"{adapter['title']}: its config is not JSON, so guard's entries are "
+            "added by hand; no test has seen them yet", f"guard agent test {name}")
+
+
+def _check_agent_hooks(add: Callable[[str, str, str, str], None]) -> None:
     from guard.agent.adapter import installed, protection, test_record_path
     for adapter in _detected_adapters():
         name = adapter["name"]
         by_hand = adapter.get("kind") != "extension" and not str(adapter.get("config", "")).endswith(".json")
         if by_hand or not installed(adapter):
             if by_hand:  # guard printed the entries to add; only a test shows they are there
-                try:
-                    tested = json.loads(test_record_path(name).read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    tested = None
-                from guard.agent.adapter import config_fingerprint, config_path
-                refuses = "before-edit" in (adapter.get("can_block") or [])
-                now = config_fingerprint(config_path(adapter))  # None: unreadable now, so nothing to compare with
-                same_file = isinstance(tested, dict) and now is not None and tested.get("config") == now
-                unknown = isinstance(tested, dict) and (now is None or not tested.get("config"))
-                if isinstance(tested, dict) and tested.get("events") and unknown:
-                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; guard cannot tell whether its "
-                        f"config is the one the last test ({str(tested.get('at'))[:10]}) saw", f"guard agent test {name}")
-                elif isinstance(tested, dict) and tested.get("events") and not same_file:
-                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; its config changed since the "
-                        f"last test ({str(tested.get('at'))[:10]})", f"guard agent test {name}")
-                elif isinstance(tested, dict) and tested.get("events") and (tested.get("blocked_edit") or not refuses):
-                    # guard cannot read that file to check it now: the last test is the evidence
-                    add("ok", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
-                        f"({str(tested.get('at'))[:10]}) saw guard's events (run guard agent test {name} after "
-                        "changing that file)")
-                elif isinstance(tested, dict) and tested.get("events"):
-                    add("warn", "Agent hooks", f"{adapter['title']}: hooks added by hand; the last test "
-                        f"({str(tested.get('at'))[:10]}) refused no edit", f"guard agent test {name}")
-                else:
-                    add("warn", "Agent hooks", f"{adapter['title']}: its config is not JSON, so guard's entries are "
-                        "added by hand; no test has seen them yet", f"guard agent test {name}")
+                _check_by_hand_adapter(adapter, add)
                 continue
             stale = False
             if adapter.get("kind") == "extension":
@@ -185,30 +180,32 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
             add("ok", "Agent hooks", f"{adapter['title']}: {protection(adapter)}; last test {str(last.get('at'))[:10]}: "
                 "an edit was refused")
 
-    # 3. Project invariants
-    if repo:
-        from guard.core.project_invariants import InvariantsFileError, load_project_invariants
-        try:
-            items = load_project_invariants(repo)
-        except InvariantsFileError as e:
-            add("missing", "Invariants", str(e), "fix the file, then guard invariants check")
-        else:
-            if items is None:
-                add("warn", "Invariants", f"{repo.name} has no project invariants", "guard invariants init   (local, not committed)")
-            elif not items:
-                add("warn", "Invariants", "the invariants file is empty; generic domain templates are used",
-                    "add project rules, then guard invariants check")
-            else:
-                unchecked = sum(1 for i in items if not i.get("checks"))
-                if unchecked == len(items):
-                    add("warn", "Invariants", f"all {len(items)} invariants have no checks (UNVERIFIED)",
-                        "add {files, forbid|require} checks, then guard invariants check")
-                else:
-                    add("ok", "Invariants", f"{len(items) - unchecked}/{len(items)} invariants have automated checks")
 
-    # 4. The LLM behind the review gate (and Alibaba OCR, which guard keeps in sync with it)
-    from guard.core.config import load_config, load_global_config, ocr_in_sync
-    from guard.core.config import LLMProtocol
+def _check_invariants(repo: Optional[Path], add: Callable[[str, str, str, str], None]) -> None:
+    if not repo:
+        return
+    from guard.core.project_invariants import InvariantsFileError, load_project_invariants
+    try:
+        items = load_project_invariants(repo)
+    except InvariantsFileError as e:
+        add("missing", "Invariants", str(e), "fix the file, then guard invariants check")
+    else:
+        if items is None:
+            add("warn", "Invariants", f"{repo.name} has no project invariants", "guard invariants init   (local, not committed)")
+        elif not items:
+            add("warn", "Invariants", "the invariants file is empty; generic domain templates are used",
+                "add project rules, then guard invariants check")
+        else:
+            unchecked = sum(1 for i in items if not i.get("checks"))
+            if unchecked == len(items):
+                add("warn", "Invariants", f"all {len(items)} invariants have no checks (UNVERIFIED)",
+                    "add {files, forbid|require} checks, then guard invariants check")
+            else:
+                add("ok", "Invariants", f"{len(items) - unchecked}/{len(items)} invariants have automated checks")
+
+
+def _check_llm(add: Callable[[str, str, str, str], None]) -> None:
+    from guard.core.config import LLMProtocol, load_global_config
     llm = load_global_config().llm
     if llm.protocol == LLMProtocol.CLI and not llm.ready:
         add("missing", "LLM", "the review runs through an agent CLI, but none is chosen: guard post falls back to "
@@ -231,7 +228,10 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
     else:
         add("missing", "LLM", "no LLM configured: guard post falls back to the heuristic gate", "guard config llm")
 
-    # 4b. Alibaba OCR: only `guard post --full` runs it
+
+def _check_ocr(repo: Optional[Path], cwd: Path, add: Callable[[str, str, str, str], None]) -> None:
+    from guard.core.config import LLMProtocol, load_config, load_global_config, ocr_in_sync
+    llm = load_global_config().llm
     ocr_binary = load_config(repo or cwd).ocr.binary_path  # the config guard post uses here
     always = load_global_config().ocr.always
     # Every row for an installed OCR says when it runs, and how to change that
@@ -255,7 +255,9 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
             f"once installed it {when}",
             "npm install -g @alibaba-group/open-code-review   then: guard config sync")
 
-    # 5. Commit messages: the user decides who writes them (machine-wide)
+
+def _check_commit_messages(add: Callable[[str, str, str, str], None]) -> None:
+    from guard.core.config import load_global_config
     cfg = load_global_config()
     if cfg.commit_mode:
         who = "the agent writes them" if cfg.commit_mode == "auto" else "the agent asks you for each one"
@@ -264,24 +266,27 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
         add("warn", "Commit messages", "not chosen yet: auto (the agent writes them) or ask (the agent asks you for each one)",
             "guard config commit auto   (or: guard config commit ask)")
 
-    # 6. Untracked paths the user has not decided about stop guard pre
-    if repo:
-        from guard.core.untracked import RegistryError, undecided
-        try:
-            pending = undecided(repo)
-        except (RuntimeError, RegistryError) as e:
-            pending = []
-            from rich.markup import escape
-            from guard.core.untracked import printable
-            add("warn", "Untracked paths", f"cannot list untracked paths: {escape(printable(str(e)))}",
-                "git status   (fix the repository, then guard doctor)")
-        if pending:
-            from guard.core.untracked import shown as show_path
-            shown = ", ".join(show_path(p) for p in pending[:5]) + (" …" if len(pending) > 5 else "")
-            add("warn", "Untracked paths", f"{len(pending)} untracked path(s) without a decision: {shown}",
-                "guard untracked <path> --include   (or --ignore)")
 
-    # 7. Files left by guard <= 0.10 (the Laya model is no longer used)
+def _check_untracked(repo: Optional[Path], add: Callable[[str, str, str, str], None]) -> None:
+    if not repo:
+        return
+    from guard.core.untracked import RegistryError, undecided
+    try:
+        pending = undecided(repo)
+    except (RuntimeError, RegistryError) as e:
+        pending = []
+        from rich.markup import escape
+        from guard.core.untracked import printable
+        add("warn", "Untracked paths", f"cannot list untracked paths: {escape(printable(str(e)))}",
+            "git status   (fix the repository, then guard doctor)")
+    if pending:
+        from guard.core.untracked import shown as show_path
+        shown = ", ".join(show_path(p) for p in pending[:5]) + (" …" if len(pending) > 5 else "")
+        add("warn", "Untracked paths", f"{len(pending)} untracked path(s) without a decision: {shown}",
+            "guard untracked <path> --include   (or --ignore)")
+
+
+def _check_legacy_files(cwd: Path, add: Callable[[str, str, str, str], None]) -> None:
     models = guard_home() / "models"
     if models.is_dir():
         size_mb = sum(f.stat().st_size for f in models.rglob("*") if f.is_file()) / (1024 * 1024)
@@ -290,6 +295,31 @@ def setup_health(cwd: Path) -> List[Dict[str, str]]:
                 f"delete the folder to free the space: {models}")
     for detail, fix in legacy_items(cwd):
         add("warn", "Old laya-ocr-guard files", detail, fix)
+
+
+def setup_health(cwd: Path) -> List[Dict[str, str]]:
+    """
+    Check an installation made by any guard version. Each entry: level ('missing' | 'warn' | 'ok'),
+    item, detail and the fix command, so users of older setups know exactly what to run.
+    """
+    out: List[Dict[str, str]] = []
+
+    def add(level: str, item: str, detail: str, fix: str = ""):
+        out.append({"level": level, "item": item, "detail": detail, "fix": fix})
+
+    repo = git_root(cwd)
+    install_fix = "guard install   (or: guard install --workspace <dir>)"
+
+    _check_git_hooks(repo, add, install_fix)
+    _check_agent_directives(cwd, add, install_fix)
+    _check_agent_hooks(add)
+    _check_invariants(repo, add)
+    _check_llm(add)
+    _check_ocr(repo, cwd, add)
+    _check_commit_messages(add)
+    _check_untracked(repo, add)
+    _check_legacy_files(cwd, add)
+
     return out
 
 
@@ -343,6 +373,6 @@ def legacy_items(cwd: Path) -> List[Tuple[str, str]]:
                       f"{tool} uninstall laya-ocr-guard"))
     except PackageNotFoundError:
         pass
-    except Exception:
+    except (OSError, ValueError):
         pass  # metadata that cannot be read is not a reason to fail the check
     return items
