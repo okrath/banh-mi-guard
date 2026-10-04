@@ -229,7 +229,7 @@ def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]
     except subprocess.CalledProcessError as e:
         err_out = (e.stderr or "") + (e.stdout or "")
         return False, f"Failed to sync to OCR CLI: {err_out or str(e)}"
-    except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as e:
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError) as e:
         return False, f"Error executing OCR CLI: {str(e)}"
 
 

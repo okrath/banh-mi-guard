@@ -49,7 +49,7 @@ def run_sandwich_task(
         proc = subprocess.run(command, cwd=str(target_repo), check=False)
         cmd_duration = time.perf_counter() - cmd_start
         console.print(f"[dim]Agent command finished in {cmd_duration:.1f}s with exit code {proc.returncode}[/dim]")
-    except (subprocess.SubprocessError, OSError) as e:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
         console.print(f"[bold red]Failed to execute agent command:[/bold red] {e}")
         return 1
 

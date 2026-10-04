@@ -77,12 +77,12 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
     except (subprocess.SubprocessError, OSError) as e:
         origin = next(iter(removed.values()))[1]
         violation = RuleViolation(
-            rule_id="DEAD-REF",
+            rule_id="DEAD-REF-UNVERIFIED",
             severity="HIGH",
             file_path=origin,
-            message=f"Removal check could not verify removed symbols: git ls-files failed ({e}).",
+            message="could not verify removed-symbol references",
         )
-        return [violation], f"Removed-symbol reference check failed: git ls-files failed ({e})."
+        return [violation], "could not verify removed-symbol references"
 
     texts = {}
     violations: List[RuleViolation] = []
@@ -91,7 +91,7 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
             texts[f.relative_to(repo_path).as_posix()] = f.read_text(encoding="utf-8", errors="ignore")
         except OSError as e:
             violations.append(RuleViolation(
-                rule_id="DEAD-REF",
+                rule_id="DEAD-REF-UNREADABLE",
                 severity="HIGH",
                 file_path=f.relative_to(repo_path).as_posix(),
                 message=f"Removal check could not read `{f.relative_to(repo_path).as_posix()}` to verify references: {e}",
@@ -131,9 +131,9 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
             ))
 
     kinds = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
-    dead_refs = [v for v in violations if "is no longer defined but still referenced" in v.message]
+    dead_refs = [v for v in violations if v.rule_id == "DEAD-REF"]
     broken = ", ".join(f"`{v.message.split('`')[1]}`" for v in dead_refs if "`" in v.message) or "none"
-    read_errs = [v for v in violations if "could not read" in v.message]
+    read_errs = [v for v in violations if v.rule_id == "DEAD-REF-UNREADABLE"]
     err_note = f"; unreadable files: {len(read_errs)}" if read_errs else ""
     summary = (
         f"Removed-symbol reference check (deterministic, whole repository): removed {kinds}; "

@@ -64,7 +64,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
             except httpx.ConnectError:
                 latency = (time.perf_counter() - start) * 1000
                 return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except httpx.HTTPError:
+            except (httpx.HTTPError, httpx.InvalidURL):
                 pass
 
             # Fallback to /chat/completions
@@ -101,7 +101,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
             except httpx.ConnectError:
                 latency = (time.perf_counter() - start) * 1000
                 return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except httpx.HTTPError:
+            except (httpx.HTTPError, httpx.InvalidURL):
                 pass
 
             # Fallback to /messages
@@ -129,7 +129,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     except httpx.TimeoutException:
         latency = (time.perf_counter() - start) * 1000
         return False, f"Connection timed out after {cfg.timeout}s", latency
-    except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError) as e:
+    except (httpx.HTTPError, httpx.InvalidURL, httpx.UnsupportedProtocol, OSError, ValueError, KeyError, TypeError) as e:
         latency = (time.perf_counter() - start) * 1000
         return False, str(e), latency
 
@@ -147,6 +147,8 @@ def call_llm(
             return cli_llm.call(cfg.cli_agent, prompt, system_prompt=system_prompt, model=cfg.model, timeout=cfg.timeout)
         except cli_llm.CLILLMError as e:
             raise LLMClientError(f"Agent CLI error: {e}") from e
+        except Exception as e:
+            raise LLMClientError(f"Agent CLI error ({type(e).__name__}): {e}") from e
     prompt, system_prompt = fence_untrusted(prompt, system_prompt)
     headers = {"Content-Type": "application/json"}
 

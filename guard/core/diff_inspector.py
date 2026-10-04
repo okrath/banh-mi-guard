@@ -76,23 +76,30 @@ class GitDiffInspector:
                 errors="replace",
                 check=False,
             )
-            if res.returncode == 0 and res.stdout:
-                diff_output = res.stdout
+            if res.returncode == 0:
+                diff_output = res.stdout or ""
                 self.last_error = None
             else:
-                res2 = subprocess.run(
-                    ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if res2.returncode == 0:
-                    diff_output = res2.stdout or ""
-                    self.last_error = None
+                # Diff command failed
+                # Keep fallback to unstaged-only `git diff` only when there is no base_ref
+                # and the repository has no commits.
+                if not base_ref and not staged_only and self.get_head() is None:
+                    res2 = subprocess.run(
+                        ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                    if res2.returncode == 0:
+                        diff_output = res2.stdout or ""
+                        self.last_error = None
+                    else:
+                        self.last_error = f"git diff failed (exit code {res2.returncode}): {res2.stderr or ''}".strip()
+                        diff_output = f"# [ERROR: {self.last_error}]\n"
                 else:
-                    self.last_error = f"git diff failed (exit code {res2.returncode}): {res2.stderr or ''}".strip()
+                    self.last_error = f"git diff failed (exit code {res.returncode}): {res.stderr or ''}".strip()
                     diff_output = f"# [ERROR: {self.last_error}]\n"
         except (subprocess.SubprocessError, OSError) as e:
             self.last_error = f"git diff error: {e}"
@@ -212,6 +219,7 @@ class GitDiffInspector:
             )
             if res_ref.returncode != 0:
                 self.last_error = f"git update-ref failed (exit code {res_ref.returncode})"
+                return None
             return sha
         except (subprocess.SubprocessError, OSError) as e:
             self.last_error = f"create_baseline_snapshot error: {e}"
@@ -251,12 +259,8 @@ class GitDiffInspector:
                 ["git", "-C", str(self.repo_path), "rev-parse", "--verify", "-q", "HEAD"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
-            out = res.stdout.strip()
-            if not out and res.returncode != 0:
-                self.last_error = f"git rev-parse HEAD failed (exit code {res.returncode}): {res.stderr or ''}".strip()
-            return out or None
-        except (subprocess.SubprocessError, OSError) as e:
-            self.last_error = f"get_head error: {e}"
+            return res.stdout.strip() or None
+        except (subprocess.SubprocessError, OSError):
             return None
 
     def parse_diff(self, raw_diff: Optional[str], expected_files: Optional[List[str]] = None) -> DiffSummary:
@@ -269,7 +273,10 @@ class GitDiffInspector:
             if line.startswith("# [ERROR:"):
                 error_msg = line.removeprefix("# [ERROR:").removesuffix("]").strip()
                 break
-        if not error_msg and self.last_error and not diff_text.strip():
+            if line.startswith("+# [ERROR:"):
+                error_msg = line.removeprefix("+# [ERROR:").removesuffix("]").strip()
+                break
+        if not error_msg and self.last_error:
             error_msg = self.last_error
 
         if not diff_text.strip():

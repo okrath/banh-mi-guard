@@ -10,12 +10,15 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from guard.core.config import GuardConfig, load_config
+import pytest
+
+from guard.core.config import GuardConfig, LLMConfig, LLMProtocol, load_config, sync_to_alibaba_ocr
 from guard.core.diff_inspector import DiffSummary, GitDiffInspector
-from guard.core.llm_client import LLMClientError
-from guard.core.llm_reviewer import LLMReviewerEngine
+from guard.core.llm_client import LLMClientError, call_llm, ping_llm
+from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.removal_check import check_removed_symbols
 from guard.domains.pre_analysis import analyze_task
+from guard.hooks.runner import run_sandwich_task
 
 
 SAMPLE_REMOVAL_DIFF = """diff --git a/src/app.ts b/src/app.ts
@@ -30,7 +33,7 @@ SAMPLE_REMOVAL_DIFF = """diff --git a/src/app.ts b/src/app.ts
 
 
 def test_removal_check_git_ls_files_error_surfaces_violation(tmp_path):
-    """Rule 1: If git ls-files fails during removal check, failure surfaces as a HIGH DEAD-REF violation."""
+    """Rule 1: If git ls-files fails during removal check, failure surfaces as a HIGH DEAD-REF-UNVERIFIED violation."""
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -44,14 +47,13 @@ def test_removal_check_git_ls_files_error_surfaces_violation(tmp_path):
         violations, summary = check_removed_symbols(repo, SAMPLE_REMOVAL_DIFF)
 
     assert len(violations) >= 1
-    assert any(v.rule_id == "DEAD-REF" for v in violations)
+    assert any(v.rule_id == "DEAD-REF-UNVERIFIED" for v in violations)
     assert any(v.severity == "HIGH" for v in violations)
-    assert "Removal check could not verify removed symbols" in violations[0].message
-    assert "failed" in summary.lower()
-
+    assert "could not verify removed-symbol references" in violations[0].message
+    assert "could not verify removed-symbol references" in summary
 
 def test_removal_check_file_read_error_surfaces_violation(tmp_path):
-    """Rule 1: If an individual file cannot be read, failure surfaces as a HIGH DEAD-REF violation and error note in summary."""
+    """Rule 1: If an individual file cannot be read, failure surfaces as a HIGH DEAD-REF-UNREADABLE violation and error note in summary."""
     repo = tmp_path / "repo"
     repo.mkdir()
     code_file = repo / "src" / "index.ts"
@@ -63,7 +65,7 @@ def test_removal_check_file_read_error_surfaces_violation(tmp_path):
             violations, summary = check_removed_symbols(repo, SAMPLE_REMOVAL_DIFF)
 
     assert len(violations) >= 1
-    assert any(v.rule_id == "DEAD-REF" for v in violations)
+    assert any(v.rule_id == "DEAD-REF-UNREADABLE" for v in violations)
     assert any("could not read" in v.message for v in violations)
     assert "unreadable files: 1" in summary
 
@@ -151,8 +153,6 @@ def test_diff_inspector_records_error_on_subprocess_failure(tmp_path):
 
         head = inspector.get_head()
         assert head is None
-        assert "get_head error" in inspector.last_error
-
         sha = inspector.create_baseline_snapshot()
         assert sha is None
         assert "create_baseline_snapshot error" in inspector.last_error
@@ -243,3 +243,189 @@ def test_llm_reviewer_heuristic_penalizes_diff_error():
     assert verdict.score <= 5.0
     assert any("Diff Inspection Error" in note for note in verdict.technical_audit)
     assert any("Resolve Git error" in step for step in verdict.remediation_steps)
+
+
+def test_diff_inspector_base_ref_failure_surfaces_revise_verdict(tmp_path):
+    """Base_ref diff failure records error, surfaces in DiffSummary, and yields REVISE verdict."""
+    (tmp_path / ".git").mkdir()
+    inspector = GitDiffInspector(tmp_path)
+    with patch("subprocess.run") as mock_subproc:
+        proc = MagicMock()
+        proc.returncode = 128
+        proc.stdout = ""
+        proc.stderr = "fatal: bad revision 'origin/main'"
+        mock_subproc.return_value = proc
+
+        raw_diff = inspector.get_diff(base_ref="origin/main")
+        assert "ERROR: git diff failed" in raw_diff
+        assert inspector.last_error is not None
+        assert "bad revision" in inspector.last_error
+
+        summary = inspector.parse_diff(raw_diff)
+        assert summary.error is not None
+        assert "bad revision" in summary.error
+        assert summary.is_clean is False
+
+        # Pass through gate scoring and assert the verdict, not only the score
+        engine = LLMReviewerEngine()
+        verdict = engine._evaluate_heuristics(
+            build_check=None,
+            diff_summary=summary,
+            violations=[],
+            invariant_result=None,
+        )
+        assert verdict.verdict == ReviewVerdict.REVISE
+        assert verdict.score <= 5.0
+        assert any("Diff Inspection Error" in note for note in verdict.technical_audit)
+
+
+def test_diff_inspector_unreadable_untracked_with_nonempty_tracked_diff(tmp_path):
+    """Unreadable untracked file error surfaces in DiffSummary even when tracked diff is non-empty."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    untracked_file = repo / "notes.txt"
+    untracked_file.write_text("secret", encoding="utf-8")
+
+    inspector = GitDiffInspector(repo)
+    tracked_diff = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n+x = 1\n"
+
+    def _fake_diff_run(cmd, *args, **kwargs):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = tracked_diff
+        proc.stderr = ""
+        return proc
+
+    with patch("subprocess.run", side_effect=_fake_diff_run):
+        with patch.object(inspector, "get_untracked_files", return_value=["notes.txt"]):
+            with patch.object(Path, "read_text", side_effect=OSError("Permission denied")):
+                raw_diff = inspector.get_diff()
+
+    assert "diff --git a/app.py b/app.py" in raw_diff
+    assert "ERROR: unreadable untracked file" in raw_diff
+
+    summary = inspector.parse_diff(raw_diff)
+    assert summary.error is not None
+    assert "Permission denied" in summary.error
+    assert summary.is_clean is False
+    assert any(f.path == "app.py" for f in summary.files)
+
+
+def test_diff_inspector_git_status_failure_with_nonempty_tracked_diff(tmp_path):
+    """Failed git status error surfaces in DiffSummary even when tracked diff is non-empty."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    inspector = GitDiffInspector(repo)
+    tracked_diff = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n+x = 1\n"
+
+    def _fake_status_run(cmd, *args, **kwargs):
+        proc = MagicMock()
+        if "diff" in cmd:
+            proc.returncode = 0
+            proc.stdout = tracked_diff
+            proc.stderr = ""
+        elif "status" in cmd:
+            proc.returncode = 128
+            proc.stdout = ""
+            proc.stderr = "fatal: error reading status"
+        else:
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+        return proc
+
+    with patch("subprocess.run", side_effect=_fake_status_run):
+        raw_diff = inspector.get_diff()
+        assert inspector.last_error is not None
+        assert "git status failed" in inspector.last_error
+
+        summary = inspector.parse_diff(raw_diff)
+        assert summary.error is not None
+        assert "git status failed" in summary.error
+        assert summary.is_clean is False
+
+
+def test_diff_inspector_update_ref_failure_is_reported(tmp_path):
+    """Failed git update-ref during baseline snapshot is recorded and returns None."""
+    (tmp_path / ".git").mkdir()
+    inspector = GitDiffInspector(tmp_path)
+
+    def _fake_updateref_run(cmd, *args, **kwargs):
+        proc = MagicMock()
+        if "stash" in cmd:
+            proc.returncode = 0
+            proc.stdout = "abc1234\n"
+            proc.stderr = ""
+        elif "update-ref" in cmd:
+            proc.returncode = 1
+            proc.stdout = ""
+            proc.stderr = "fatal: update-ref failed"
+        else:
+            proc.returncode = 0
+            proc.stdout = ""
+            proc.stderr = ""
+        return proc
+
+    with patch("subprocess.run", side_effect=_fake_updateref_run):
+        sha = inspector.create_baseline_snapshot()
+        assert sha is None
+        assert inspector.last_error is not None
+        assert "git update-ref failed" in inspector.last_error
+
+
+def test_ping_llm_invalid_url_returns_false_no_exception():
+    """ping_llm with an invalid URL returns (False, msg) without raising an unhandled exception."""
+    cfg = LLMConfig(
+        provider="custom",
+        protocol=LLMProtocol.OPENAI,
+        base_url="http://localhost:abc/v1",
+        model="gpt-4o",
+    )
+    ok, msg, latency = ping_llm(cfg)
+    assert ok is False
+    assert isinstance(msg, str)
+    assert len(msg) > 0
+
+
+def test_call_llm_cli_unexpected_exception_wraps_in_llm_client_error(tmp_path):
+    """cli_llm.call raising unexpected exception raises LLMClientError; guard pre falls back with reason."""
+    cfg = LLMConfig(
+        provider="cli",
+        protocol=LLMProtocol.CLI,
+        cli_agent="claude",
+        model="claude-3-5-sonnet",
+    )
+    with patch("guard.core.cli_llm.call", side_effect=TypeError("unexpected type in CLI call")):
+        with pytest.raises(LLMClientError) as exc_info:
+            call_llm(cfg, "prompt")
+        assert "TypeError" in str(exc_info.value)
+
+        # Pre-task analysis falls back to heuristic with reason
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        result = analyze_task(repo, "Task prompt", [], None, GuardConfig(llm=cfg))
+        assert result.domain_source.startswith("heuristic: LLMClientError")
+        assert "TypeError" in result.contracts_source
+
+
+def test_hook_runner_catches_value_error(tmp_path):
+    """run_sandwich_task catches ValueError (e.g. embedded null byte in argument)."""
+    with patch("guard.task_flow.execute_pre_task", return_value=True):
+        with patch("subprocess.run", side_effect=ValueError("embedded null byte")):
+            code = run_sandwich_task("prompt", ["bad\0cmd"], repo_path=tmp_path)
+            assert code == 1
+
+
+def test_config_ocr_sync_catches_value_error():
+    """sync_to_alibaba_ocr catches ValueError (e.g. embedded null byte in setting)."""
+    cfg = LLMConfig(provider="custom", protocol=LLMProtocol.OPENAI, model="test", base_url="http://localhost:8000")
+    with patch("subprocess.run", side_effect=ValueError("embedded null byte")):
+        with patch("guard.core.config.shutil.which", return_value="/bin/ocr"):
+            ok, msg = sync_to_alibaba_ocr(cfg)
+            assert ok is False
+            assert "Error executing OCR CLI" in msg
+            assert "ValueError" in msg or "embedded null byte" in msg
