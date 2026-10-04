@@ -31,6 +31,15 @@
       ]
     },
     {
+      "id": "GATE-04",
+      "description": "An agent commit is allowed only by an approval whose HMAC signature verifies",
+      "rationale": "An agent could tamper with .guard/session.json to forge approved fingerprints and bypass review.",
+      "checks": [
+        { "files": "guard/core/session.py", "require": "hmac\\.compare_digest" },
+        { "files": "guard/agent/events.py", "require": "verified_approval" }
+      ]
+    },
+    {
       "id": "SCOPE-01",
       "description": "Scope is only what the prompt or --scope declares: dirty files are never added to it, and a restart inherits baseline and scope instead of redefining them.",
       "rationale": "pre merged every dirty file into scope, and could be re-run after editing to widen it.",

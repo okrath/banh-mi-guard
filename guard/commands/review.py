@@ -104,6 +104,12 @@ def accept_cmd(
         session.post.approved_fingerprints = dict(reviewed)
         session.post.all_passed, session.post.accepted_by_user = True, True
         session.post.followups, session.post.needs_user = remaining, False
+        from guard.core.session import compute_approval_signature
+        session.post.approval_signature = compute_approval_signature(
+            session.repo_path or str(mgr.repo_path),
+            session.session_id,
+            session.post.approved_fingerprints,
+        )
         mgr._save(session)
         _write_post_report(target, session.post, session.pre)
     elif choice == "c":
