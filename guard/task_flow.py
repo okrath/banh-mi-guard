@@ -392,12 +392,12 @@ def _post_check_hook_and_session(
         return False, True, None
     if hook and session.status == SessionStatus.COMPLETED:
         # An approval covers only the exact file contents it approved, not later or unrelated work
-        approved = session.post.approved_fingerprints if session.post else {}
+        approved = session_mgr.verified_approval(session)
         uncovered = [
             f for f in GitDiffInspector(target_repo).get_working_files()
             if approved.get(f) != _fingerprint(target_repo / f)
         ]
-        if not uncovered:
+        if not uncovered and session_mgr.is_approval_verified(session):
             console.print("[dim]Banh-Mi-Guard: changes match the last approved guard session, skipping.[/dim]")
             return False, True, None
         listing = "\n".join(f"  • {f}" for f in uncovered[:20])

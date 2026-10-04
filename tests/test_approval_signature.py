@@ -31,7 +31,7 @@ from guard.core.session import (
     compute_approval_signature,
     get_approval_key,
 )
-from guard.task_flow import execute_post_task, execute_pre_task
+from guard.task_flow import _post_check_hook_and_session, execute_post_task, execute_pre_task
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +129,41 @@ def test_tampered_fingerprints_returns_empty_and_blocks_commit(tmp_path, fake_oc
 
     commit = "git add -A && git commit -m 'forged'"
     assert _bash(repo, commit).action == "block"
+
+    # Git pre-commit hook path refuses the forged approval
+    assert execute_post_task(repo_path=repo, hook=True) is False
+
+
+def test_hook_path_refuses_forged_approval(tmp_path, fake_ocr_review, capsys):
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo) is True
+
+    # Genuine signed approval passes the git pre-commit hook path
+    capsys.readouterr()
+    assert execute_post_task(repo_path=repo, hook=True) is True
+    out_pass = capsys.readouterr().out
+    assert "changes match the last approved guard session" in out_pass
+
+    # Forged approval: modified file + its correct hash, stale signature
+    (repo / "src" / "chat.ts").write_text("export const a = 999;\n", encoding="utf-8")
+    new_hash = content_hash(repo / "src" / "chat.ts")
+    session_file = repo / ".guard" / "session.json"
+    data = json.loads(session_file.read_text(encoding="utf-8"))
+    data["post"]["approved_fingerprints"]["src/chat.ts"] = new_hash
+    session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # Hook path does NOT report "changes match the last approved session" and commit is refused
+    capsys.readouterr()
+    assert execute_post_task(repo_path=repo, hook=True) is False
+    out_fail = capsys.readouterr().out
+    assert "changes match the last approved guard session" not in out_fail
+    assert "not covered by the last approved guard session" in out_fail
+
+    # _post_check_hook_and_session directly verifies this behavior
+    proceed, result, _ = _post_check_hook_and_session(repo, SessionManager(repo), hook=True)
+    assert proceed is False and result is False
 
 
 def test_session_without_signature_is_treated_as_not_approved(tmp_path, fake_ocr_review):
@@ -253,6 +288,7 @@ def test_guard_path_and_uncovered_logic(tmp_path):
     assert _is_guard_path(".guard/session.json") is True
     assert _is_guard_path(".GUARD/session.json") is True  # case-insensitive check
     assert _is_guard_path("src/chat.ts") is False
+    assert _is_guard_path(".guard/notes.txt") is True
 
     mgr = SessionManager(repo)
     session = mgr.load_local_session()

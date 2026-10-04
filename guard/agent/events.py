@@ -463,9 +463,6 @@ def _is_guard_path(path_str: str) -> bool:
     norm = path_str.replace("\\", "/").strip("/").lower()
     if not (norm == ".guard" or norm.startswith(".guard/")):
         return False
-    # .guard/notes.txt is exempt to preserve contract tested in test_ignored_files_inside_the_repo_are_gated_too
-    if norm == ".guard/notes.txt":
-        return False
     return True
 
 
