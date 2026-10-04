@@ -373,10 +373,13 @@ guard review --focus ux</code></pre>
     <section id="installation">
       <h2>4. Installation Guide (Cross-Platform)</h2>
       <p>Works natively on Windows, Linux, and macOS:</p>
-      <pre><code># Recommended: Install globally via pipx (Linux/macOS)
-pipx install git+https://github.com/okrath/banh-mi-guard.git
+      <pre><code># Recommended: Install globally from PyPI via pipx (Linux/macOS)
+pipx install banh-mi-guard
 
 # Or with standard pip (Windows / Linux / macOS)
+pip install banh-mi-guard
+
+# Or the newest main branch straight from GitHub (can be ahead of the last release)
 pip install git+https://github.com/okrath/banh-mi-guard.git
 
 # Install globally (hooks + agent directives), no model download needed:
