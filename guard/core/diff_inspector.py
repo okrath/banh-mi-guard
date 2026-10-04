@@ -273,9 +273,6 @@ class GitDiffInspector:
             if line.startswith("# [ERROR:"):
                 error_msg = line.removeprefix("# [ERROR:").removesuffix("]").strip()
                 break
-            if line.startswith("+# [ERROR:"):
-                error_msg = line.removeprefix("+# [ERROR:").removesuffix("]").strip()
-                break
         if not error_msg and self.last_error:
             error_msg = self.last_error
 

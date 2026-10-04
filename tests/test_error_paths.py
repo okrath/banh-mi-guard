@@ -51,6 +51,8 @@ def test_removal_check_git_ls_files_error_surfaces_violation(tmp_path):
     assert any(v.severity == "HIGH" for v in violations)
     assert "could not verify removed-symbol references" in violations[0].message
     assert "could not verify removed-symbol references" in summary
+    assert "fatal: not a git repository" in violations[0].message
+    assert "fatal: not a git repository" in summary
 
 def test_removal_check_file_read_error_surfaces_violation(tmp_path):
     """Rule 1: If an individual file cannot be read, failure surfaces as a HIGH DEAD-REF-UNREADABLE violation and error note in summary."""
@@ -347,6 +349,69 @@ def test_diff_inspector_git_status_failure_with_nonempty_tracked_diff(tmp_path):
         assert "git status failed" in summary.error
         assert summary.is_clean is False
 
+def test_diff_inspector_content_containing_error_marker_does_not_revise(tmp_path):
+    """Added content containing '# [ERROR: codes] reference' in tracked and untracked files does not set DiffSummary.error or force REVISE."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # 1. Tracked file with added content containing the error marker
+    tracked_diff = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        "+# [ERROR: codes] reference\n"
+    )
+    inspector_tracked = GitDiffInspector(repo)
+    summary_tracked = inspector_tracked.parse_diff(tracked_diff)
+    assert summary_tracked.error is None
+    assert any(f.path == "app.py" for f in summary_tracked.files)
+
+    engine = LLMReviewerEngine()
+    verdict_tracked = engine._evaluate_heuristics(
+        build_check=None,
+        diff_summary=summary_tracked,
+        violations=[],
+        invariant_result=None,
+    )
+    assert verdict_tracked.verdict != ReviewVerdict.REVISE
+    assert verdict_tracked.score == 10.0
+    assert not any("Diff Inspection Error" in note for note in verdict_tracked.technical_audit)
+
+    # 2. Untracked file whose content contains the error marker
+    untracked_file = repo / "reference.md"
+    untracked_file.write_text("# [ERROR: codes] reference\nDocumentation line\n", encoding="utf-8")
+
+    inspector_untracked = GitDiffInspector(repo)
+
+    def _mock_empty_diff(cmd, *args, **kwargs):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = ""
+        proc.stderr = ""
+        return proc
+
+    with patch("subprocess.run", side_effect=_mock_empty_diff):
+        with patch.object(inspector_untracked, "get_untracked_files", return_value=["reference.md"]):
+            raw_diff = inspector_untracked.get_diff()
+
+    assert "+# [ERROR: codes] reference" in raw_diff
+    assert inspector_untracked.last_error is None
+
+    summary_untracked = inspector_untracked.parse_diff(raw_diff)
+    assert summary_untracked.error is None
+    assert any(f.path == "reference.md" for f in summary_untracked.files)
+
+    verdict_untracked = engine._evaluate_heuristics(
+        build_check=None,
+        diff_summary=summary_untracked,
+        violations=[],
+        invariant_result=None,
+    )
+    assert verdict_untracked.verdict != ReviewVerdict.REVISE
+    assert verdict_untracked.score == 10.0
+    assert not any("Diff Inspection Error" in note for note in verdict_untracked.technical_audit)
 
 def test_diff_inspector_update_ref_failure_is_reported(tmp_path):
     """Failed git update-ref during baseline snapshot is recorded and returns None."""

@@ -76,13 +76,14 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
         files = _repo_files(repo_path)
     except (subprocess.SubprocessError, OSError) as e:
         origin = next(iter(removed.values()))[1]
+        msg = f"could not verify removed-symbol references ({e})"
         violation = RuleViolation(
             rule_id="DEAD-REF-UNVERIFIED",
             severity="HIGH",
             file_path=origin,
-            message="could not verify removed-symbol references",
+            message=msg,
         )
-        return [violation], "could not verify removed-symbol references"
+        return [violation], msg
 
     texts = {}
     violations: List[RuleViolation] = []
