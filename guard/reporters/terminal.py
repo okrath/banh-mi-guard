@@ -17,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
-from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
+from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings, snapshot_missing_reason
 
 console = Console()
 
@@ -91,7 +91,12 @@ def render_pre_task_terminal(pre: PreTaskRecord):
         console.print(f"[bold yellow]⚠️ Scope added by restart (SCOPE-004 if touched): {', '.join(pre.late_scope)}[/bold yellow]")
 
     if pre.baseline_dirty:
-        console.print(f"[bold yellow]⚠️ Started with {len(pre.baseline_dirty)} pre-existing modified file(s); they will be reported, not vouched for.[/bold yellow]")
+        if not pre.baseline_snapshot:
+            snapshot_reason = snapshot_missing_reason(pre)
+            reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
+            console.print(f"[bold yellow]⚠️ Started with {len(pre.baseline_dirty)} pre-existing modified file(s). Baseline snapshot missing{reason_part}; post will review the full diff.[/bold yellow]")
+        else:
+            console.print(f"[bold yellow]⚠️ Started with {len(pre.baseline_dirty)} pre-existing modified file(s); they will be reported, not vouched for.[/bold yellow]")
 
     # Target Files
     if pre.expected_files:
@@ -131,6 +136,12 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
 
     console.print(Panel(summary_text, border_style="green" if is_approved else "red"))
 
+    if pre and pre.baseline_dirty and not pre.baseline_snapshot:
+        snapshot_reason = snapshot_missing_reason(pre)
+        reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
+        console.print(f"[bold yellow]⚠️ Baseline snapshot missing{reason_part}: review covers the full diff.[/bold yellow]")
+    if post.diff_summary and post.diff_summary.error:
+        console.print(f"[bold red]❌ Diff inspection error: {post.diff_summary.error}[/bold red]")
     # Diff & Blast Radius Table
     if post.diff_summary:
         diff_table = Table(title="📊 Actual Impact Range & Blast Radius (OCR Inspector)", show_header=True)

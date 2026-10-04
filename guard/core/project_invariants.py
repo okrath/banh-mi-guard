@@ -406,7 +406,8 @@ def _example(pattern: str) -> Optional[str]:
 
     try:
         return build(sre_parse.parse(pattern))
-    except Exception:  # an unusual construct: no example, the caller does not reject on it
+    # Unusual regex construct: no example string can be built, caller does not reject on it
+    except (re.error, ValueError, IndexError, TypeError, RecursionError, OverflowError, MemoryError):
         return None
 
 

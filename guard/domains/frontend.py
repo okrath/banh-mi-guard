@@ -51,7 +51,7 @@ class FrontendDomainAnalyzer(BaseDomainAnalyzer):
                 return f"{pm} run build"
             if '"check":' in content:
                 return f"{pm} run check"
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             pass
         return f"{pm} test"
 

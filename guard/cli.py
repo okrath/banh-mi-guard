@@ -212,7 +212,8 @@ def _force_utf8_console():
         try:
             if stream and (stream.encoding or "").lower().replace("-", "") != "utf8":
                 stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
+        except (AttributeError, ValueError, OSError):
+            # Best-effort console UTF-8 reconfigure: never crash on non-standard streams
             pass
 
 
@@ -226,7 +227,8 @@ def main():
                 console.print(f"[cyan]🔄 guard {__version__}: {msg}[/cyan]")
             # Once per version: tell users of older setups what is still missing and how to fix it
             print_setup_health(Path.cwd(), f"🧩 guard {__version__} setup check", only_problems=True)
-    except Exception as e:  # never block the actual command
+    except Exception as e:
+        # CLI boundary: post-upgrade hook refresh must never block the user's command
         console.print(f"[yellow]guard refresh skipped: {e}[/yellow]")
     maybe_trigger_background_update_check()
     try:

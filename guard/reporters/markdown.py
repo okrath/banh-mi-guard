@@ -15,6 +15,17 @@ from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 INVARIANT_ICONS = {"passed": "✅", "failed": "❌", "unverified": "⚪", "baseline_failed": "⚠️", "retired": "🗑️"}
 
 
+def snapshot_missing_reason(pre: Optional[PreTaskRecord]) -> Optional[str]:
+    """Extract baseline snapshot failure reason recorded at pre, if any."""
+    if not pre or not pre.non_regression_strategy:
+        return None
+    marker = "Baseline snapshot missing: "
+    if marker in pre.non_regression_strategy:
+        reason = pre.non_regression_strategy.split(marker, 1)[1].rstrip(".")
+        return reason.strip()
+    return None
+
+
 def restart_lines(pre: PreTaskRecord) -> list:
     lines = []
     for r in pre.restarts:
@@ -166,6 +177,10 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
 
     if pre.baseline_dirty:
         md.append("\n* **⚠️ Pre-existing modifications (started with --allow-dirty):**")
+        if not pre.baseline_snapshot:
+            snapshot_reason = snapshot_missing_reason(pre)
+            reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
+            md.append(f"  - ⚠️ *Baseline snapshot missing{reason_part}:* post will review the full diff.")
         for f in sorted(pre.baseline_dirty):
             md.append(f"  - `{f}`")
 
@@ -218,9 +233,15 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
     else:
         md.append("  - No files were modified.")
 
+    if pre and pre.baseline_dirty and not pre.baseline_snapshot:
+        snapshot_reason = snapshot_missing_reason(pre)
+        reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
+        md.append(f"  - ⚠️ *Baseline snapshot missing{reason_part}:* review covers the full diff.")
     if post.diff_summary:
         net = post.diff_summary.total_insertions - post.diff_summary.total_deletions
         md.append(f"  - *Diff Statistics:* +{post.diff_summary.total_insertions} lines / -{post.diff_summary.total_deletions} lines across {len(post.diff_summary.files)} files (net {net:+d} LOC, not scored).")
+        if post.diff_summary.error:
+            md.append(f"  - ⚠️ *Diff inspection error:* {post.diff_summary.error}")
 
     # Build Check
     md.append("\n* **Build & Project Health Check:**")

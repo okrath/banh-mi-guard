@@ -42,7 +42,7 @@ from guard.core.session import BuildCheckResult, PostTaskRecord, SessionManager,
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.domains.detector import detect_build_command, extract_contracts_and_invariants
 from guard.domains.pre_analysis import analyze_task
-from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
+from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown, snapshot_missing_reason
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
 
 console = Console()
@@ -76,7 +76,12 @@ def _drop_diff_files(raw_diff: str, drop: set) -> str:
         return raw_diff
     chunks = raw_diff.split("diff --git ")
     kept = [c for c in chunks[1:] if not any(c.startswith(f"a/{p} b/") for p in drop)]
-    return (chunks[0] + "".join("diff --git " + c for c in kept)) if kept else ""
+    header = chunks[0]
+    if kept:
+        return header + "".join("diff --git " + c for c in kept)
+    if "# [ERROR:" in header:
+        return header
+    return ""
 
 
 def _prompt_paths(prompt: str, repo: Path) -> List[str]:
@@ -174,6 +179,7 @@ class _PreBaseline:
     late_scope: List[str]
     restarts: List[dict]
     impact: Optional[dict]
+    snapshot_error: Optional[str] = None
 
 
 def _pre_scope_and_baseline(
@@ -196,6 +202,7 @@ def _pre_scope_and_baseline(
         }]
         # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
         impact = superseded.pre.impact
+        snapshot_error = snapshot_missing_reason(old)
     else:
         working_files = diff_inspector.get_working_files()
         if not invariants_existed:
@@ -215,10 +222,16 @@ def _pre_scope_and_baseline(
         baseline_snapshot = diff_inspector.create_baseline_snapshot() if working_files else None
         candidate_files, late_scope, restarts = requested_scope, [], []
         impact = expected_impact(target_repo, candidate_files, []) if candidate_files else None
+        snapshot_error = None
+        if working_files and not baseline_snapshot:
+            snapshot_error = diff_inspector.last_error or (
+                "repository has no commits" if not base_ref else "no tracked modifications to snapshot"
+            )
 
     return _PreBaseline(
         baseline_dirty=baseline_dirty, base_ref=base_ref, baseline_snapshot=baseline_snapshot,
         candidate_files=candidate_files, late_scope=late_scope, restarts=restarts, impact=impact,
+        snapshot_error=snapshot_error,
     )
 
 
@@ -308,7 +321,10 @@ def _pre_save_session(
         carry=superseded,  # a restart keeps the task's findings ledger and round count
         owner=owner, prompt=prompt, expected_files=baseline.candidate_files,
         contracts=analysis.contracts, invariants=invariants,
-        non_regression_strategy=f"Isolate changes to domain {analysis.task_domain.value.upper()}. Maintain 100% existing baseline contracts.",
+        non_regression_strategy=(
+            f"Isolate changes to domain {analysis.task_domain.value.upper()}. Maintain 100% existing baseline contracts."
+            + (f" Baseline snapshot missing: {baseline.snapshot_error}." if baseline.snapshot_error else "")
+        ),
         domain=analysis.task_domain, repo_domain=analysis.repo_domain,
         domain_source=analysis.domain_source, domain_reason=analysis.domain_reason,
         contracts_source=analysis.contracts_source, baseline_dirty=baseline.baseline_dirty,
@@ -467,6 +483,11 @@ def _post_diff_and_scope_audit(target_repo: Path, pre: Optional[Any]) -> _PostDi
         task_diff = _drop_diff_files(diff_inspector.get_diff(base_ref=snapshot) or "", set(preexisting_files))
     task_summary = diff_inspector.parse_diff(task_diff)
 
+    if task_summary.error:
+        if diff_summary.error:
+            diff_summary.error = f"{diff_summary.error}; {task_summary.error}"
+        else:
+            diff_summary.error = task_summary.error
     return _PostDiffScope(
         diff_summary=diff_summary, task_diff=task_diff, task_summary=task_summary,
         scope_declared=scope_declared, preexisting_files=preexisting_files,
@@ -495,14 +516,22 @@ def _scan_scope_violations(diff_scope: _PostDiffScope, pre: Optional[Any]) -> Li
     baseline_dirty, snapshot = diff_scope.baseline_dirty, diff_scope.snapshot
     if baseline_dirty:
         attributable = bool(snapshot)
+        snapshot_reason = snapshot_missing_reason(pre)
+        if attributable:
+            message = (
+                f"{len(baseline_dirty)} file(s) were already modified before pre-task (--allow-dirty). "
+                "Review covers only edits made after pre-task (diff vs baseline snapshot); the pre-existing changes are not vouched for."
+            )
+        else:
+            reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
+            message = (
+                f"{len(baseline_dirty)} file(s) were already modified before pre-task (--allow-dirty). "
+                f"Baseline snapshot is missing{reason_part}; review covers the full diff; guard cannot attribute or vouch for those changes."
+            )
         violations.append(RuleViolation(
             rule_id="SCOPE-003", severity="MEDIUM" if attributable else "HIGH",
             file_path=", ".join(sorted(baseline_dirty)[:10]) + (" …" if len(baseline_dirty) > 10 else ""),
-            message=(
-                f"{len(baseline_dirty)} file(s) were already modified before pre-task (--allow-dirty). "
-                + ("Review covers only edits made after pre-task (diff vs baseline snapshot); the pre-existing changes are not vouched for."
-                   if attributable else "Guard cannot attribute or vouch for those changes.")
-            ),
+            message=message,
         ))
     return violations
 

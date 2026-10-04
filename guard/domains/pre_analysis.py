@@ -16,14 +16,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 from guard.core.config import GuardConfig
 from guard.core.invariant_eval import DomainType
-from guard.core.llm_client import call_llm
+from guard.core.llm_client import LLMClientError, call_llm
 from guard.core.session import DomainContract
 from guard.domains.detector import (
     SKIP_DIRS,
@@ -551,7 +554,7 @@ def analyze_task(
                 system_prompt=SYSTEM_PROMPT,
                 temperature=0.0,
             )
-        except Exception as e:
+        except (LLMClientError, httpx.HTTPError, OSError, subprocess.SubprocessError) as e:
             err_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             return _heuristic_fallback(repo, err_msg)
 
@@ -565,7 +568,7 @@ def analyze_task(
             or malformed_count > 0
         ):
             return _heuristic_fallback(repo, "unparsable answer")
-    except Exception:
+    except (ValueError, TypeError, AttributeError, IndexError, KeyError):
         return _heuristic_fallback(repo, "unparsable answer")
 
     if not from_cache:

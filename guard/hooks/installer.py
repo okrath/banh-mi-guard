@@ -108,7 +108,7 @@ class HookInstaller:
             )
             if res.returncode == 0:
                 current_path = res.stdout.strip()
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             pass
 
         is_active = bool(current_path and Path(current_path).resolve() == hooks_dir.resolve())
@@ -139,7 +139,7 @@ class HookInstaller:
         try:
             pre_commit.chmod(pre_commit.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             prep_msg.chmod(prep_msg.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        except Exception:
+        except OSError:
             pass
 
         messages.append(f"Installed global hook scripts in: {hooks_dir}")
@@ -154,7 +154,7 @@ class HookInstaller:
             )
             messages.append("Configured 'git config --global core.hooksPath ~/.guard/hooks'")
             return True, messages
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             messages.append(f"Failed to set git global config: {e}")
             return False, messages
 
@@ -169,7 +169,7 @@ class HookInstaller:
                 encoding="utf-8",
             )
             messages.append("Unset 'git config --global core.hooksPath'")
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             pass
         return True, messages
 
@@ -406,7 +406,7 @@ class HookInstaller:
         try:
             current_mode = target_path.stat().st_mode
             target_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        except Exception:
+        except OSError:
             pass
 
     def _inject_directive(self, target_path: Path):
