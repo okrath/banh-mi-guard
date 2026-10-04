@@ -688,9 +688,12 @@ def _ocr_through_agent(target_repo: Path, config, review: dict):
     """
     OCR answered by the agent CLI the LLM gate uses (`protocol: cli`), through a local endpoint that
     lives for this review only; the user's own OCR settings are never changed. The status names the
-    agent and the path, and an agent failure is an OCR failure with the agent's reason.
+    agent and the path, and an agent failure is an OCR failure with the agent's reason. When that
+    does not run, guard warns and falls back to OCR's delegation mode answered by the same CLI; the
+    status then names the fallback and why the first path failed.
     """
     from guard.core.ocr_bridge import AgentBridge
+    from guard.core.ocr_delegate import run_delegate_review
     agent = config.llm.cli_agent
     review = {**review, "concurrency": min(review.get("concurrency") or AGENT_OCR_CONCURRENCY, AGENT_OCR_CONCURRENCY)}
     with AgentBridge(agent, model=config.llm.model, timeout=config.llm.timeout or None) as bridge:
@@ -705,7 +708,17 @@ def _ocr_through_agent(target_repo: Path, config, review: dict):
                 message=f"Alibaba OCR review did not run completely: {reason}. Run guard post --full again.")]
         else:
             status += f"; {reason}"
-    return f"{status}; {path}", found
+    if not status.startswith("did not run"):
+        return f"{status}; {path}", found
+    why = f"OCR {path} did not run: {status[len('did not run: '):]}"
+    console.print(f"[yellow]⚠️ {escape(why[:300])}. Falling back to OCR's delegation mode: its rules and the diff, "
+                  f"one prompt per rule group, answered by the same {agent} CLI.[/yellow]")
+    d_status, d_found = run_delegate_review(target_repo, review.get("base_ref"), review.get("background") or "",
+                                            review.get("skip_files"), review.get("binary") or "ocr", bridge.ask)
+    if d_status.startswith("did not run"):  # both paths failed: the first one's findings and failure stay
+        return f"{d_status}; answered by the {agent} CLI as the fallback after {why}", list(found) + [
+            v for v in d_found if v.rule_id != "OCR-RUN"]
+    return f"{d_status}; answered by the {agent} CLI as the fallback after {why}", d_found
 
 
 def _ocr_cache_key(config, pre) -> Optional[str]:

@@ -60,6 +60,31 @@ def _complete(data: dict, returncode: int = 0) -> bool:
             and not lists["failed"] and ids(lists["selected"]) <= reviewed)
 
 
+def ocr_failed(reason: str) -> Tuple[str, List[RuleViolation]]:
+    """The status line and the blocking OCR-RUN finding of a review that did not run."""
+    reason = reason.rstrip(". ")
+    return f"did not run: {reason}", [RuleViolation(
+        rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)",
+        message=f"Alibaba OCR review did not run: {reason}. Fix the cause above (for a provider or configuration error: guard config sync, then ocr llm test) and run guard post --full again.",
+    )]
+
+
+def ocr_comment_violation(c: dict) -> RuleViolation:
+    """One OCR comment (path, start_line, severity, category, content, existing_code) as a finding."""
+    raw = str(c.get("severity") or "").lower()
+    message = str(c.get("content") or "").strip()[:600]
+    if raw not in OCR_SEVERITY:  # a finding without a known severity is not assumed harmless
+        message = f"(OCR gave no known severity: {raw or 'none'}) {message}"
+    return RuleViolation(
+        rule_id=f"OCR-{str(c.get('category') or 'finding').upper()}",
+        severity=OCR_SEVERITY.get(raw, "HIGH"),
+        file_path=c.get("path") or "(unknown)",
+        line_number=c.get("start_line"),
+        message=message,
+        snippet=str(c.get("existing_code") or "")[:120],
+    )
+
+
 def run_ocr_review(
     repo_path: Path,
     base_ref: Optional[str],
@@ -78,13 +103,7 @@ def run_ocr_review(
     violation, never a silent pass. There is no time limit: AI review takes as long as it takes, it
     ends when OCR finishes or reports the provider's error, and only the user stops it (Ctrl+C). Findings on `skip_files` (pre-existing changes) are dropped.
     """
-    def failed(reason: str) -> Tuple[str, List[RuleViolation]]:
-        reason = reason.rstrip(". ")
-        return f"did not run: {reason}", [RuleViolation(
-            rule_id="OCR-RUN", severity="HIGH", file_path="(ocr)",
-            message=f"Alibaba OCR review did not run: {reason}. Fix the cause above (for a provider or configuration error: guard config sync, then ocr llm test) and run guard post --full again.",
-        )]
-
+    failed = ocr_failed
     ocr_bin = shutil.which(binary)
     if not ocr_bin:
         return failed(f"'{binary}' not found on PATH (npm install -g @alibaba-group/open-code-review)")
@@ -242,18 +261,7 @@ def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_
         if c.get("path") in skip:  # dirty before pre and not touched by this task since
             dropped += 1
             continue
-        raw = str(c.get("severity") or "").lower()
-        message = str(c.get("content") or "").strip()[:600]
-        if raw not in OCR_SEVERITY:  # a finding without a known severity is not assumed harmless
-            message = f"(OCR gave no known severity: {raw or 'none'}) {message}"
-        violations.append(RuleViolation(
-            rule_id=f"OCR-{str(c.get('category') or 'finding').upper()}",
-            severity=OCR_SEVERITY.get(raw, "HIGH"),
-            file_path=c.get("path") or "(unknown)",
-            line_number=c.get("start_line"),
-            message=message,
-            snippet=str(c.get("existing_code") or "")[:120],
-        ))
+        violations.append(ocr_comment_violation(c))
     status = data.get("status")
     if not _complete(data, res.returncode):  # partial, failed, with errors or unknown: blocks, but findings are still reported
         line, run_violation = failed(str(data.get("message") or f"status {status}"))
