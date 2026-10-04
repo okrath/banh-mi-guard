@@ -1,0 +1,64 @@
+name: Publish to PyPI
+
+# A published GitHub Release (tag vX.Y.Z) uploads that version to PyPI. No token is stored: PyPI
+# trusts this workflow and the `pypi` environment (trusted publishing).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The release tag matches the package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(python -c "import re, pathlib; print(re.search(r'^version = \"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))")
+          init=$(python -c "import re, pathlib; print(re.search(r'^__version__ = \"([^\"]+)\"', pathlib.Path('guard/__init__.py').read_text(), re.M).group(1))")
+          if [ "$TAG" != "v$version" ] || [ "$version" != "$init" ]; then
+            echo "tag $TAG, pyproject.toml $version, guard/__init__.py $init: they must all be the same version (tag with a leading v)"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/banh-mi-guard/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the build
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

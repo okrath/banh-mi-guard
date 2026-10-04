@@ -387,3 +387,7 @@ The project includes a comprehensive end-to-end integration and unit test suite 
 ```bash
 pytest
 ```
+
+## Releasing (maintainers)
+
+A version reaches PyPI through GitHub: bump the version in `pyproject.toml`, `guard/__init__.py` and `docs/index.html`, merge it, then publish a GitHub Release whose tag is the version with a leading `v` (for example `v0.15.0`). The `Publish to PyPI` workflow builds the sdist and wheel and uploads them with PyPI trusted publishing, so no token is stored; it refuses a tag that differs from the two version strings. One-time setup on pypi.org: add a (pending) trusted publisher for project `banh-mi-guard`, owner `okrath`, repository `banh-mi-guard`, workflow `publish.yml`, environment `pypi`, and create the `pypi` environment in the repository settings. A version on PyPI cannot be changed or reused: a mistake is fixed by the next version.
