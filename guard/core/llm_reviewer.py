@@ -129,7 +129,7 @@ class LLMReviewerEngine:
                 if llm_verdict:
                     return llm_verdict
                 llm_error = getattr(self, "last_failure", "") or "LLM response did not follow the SCORE/VERDICT format"
-            except Exception as e:
+            except Exception as e:  # Record failure reason and fall back to heuristic evaluation
                 llm_error = f"{type(e).__name__}: {str(e)[:200]}"
         elif use_llm:
             llm_error = "No LLM configured (run: guard config llm)"
@@ -151,6 +151,12 @@ class LLMReviewerEngine:
         tech_notes: List[str] = []
         ux_notes: List[str] = []
         remediation: List[str] = []
+
+        # Check 0: Git diff inspection error
+        if diff_summary and diff_summary.error:
+            score -= 5.0
+            tech_notes.append(f"Diff Inspection Error: {diff_summary.error}")
+            remediation.append(f"Resolve Git error preventing diff inspection: {diff_summary.error}")
 
         # Check 1: Build check
         if build_check:
@@ -516,6 +522,7 @@ Findings so far in this session (id, round, status, your earlier wording):
                 review_mode="llm_deep",
             )
         except Exception:
+            # Parsing boundary: return None so caller falls back to heuristic
             return None
 
     def _extract_bullet_items(self, text: str, section_header: str) -> List[str]:

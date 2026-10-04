@@ -64,7 +64,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
             except httpx.ConnectError:
                 latency = (time.perf_counter() - start) * 1000
                 return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except Exception:
+            except httpx.HTTPError:
                 pass
 
             # Fallback to /chat/completions
@@ -101,7 +101,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
             except httpx.ConnectError:
                 latency = (time.perf_counter() - start) * 1000
                 return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except Exception:
+            except httpx.HTTPError:
                 pass
 
             # Fallback to /messages
@@ -129,7 +129,7 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     except httpx.TimeoutException:
         latency = (time.perf_counter() - start) * 1000
         return False, f"Connection timed out after {cfg.timeout}s", latency
-    except Exception as e:
+    except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError) as e:
         latency = (time.perf_counter() - start) * 1000
         return False, str(e), latency
 
@@ -204,6 +204,7 @@ def call_llm(
     except httpx.HTTPError as e:
         raise LLMClientError(f"HTTP Network error: {str(e)}")
     except Exception as e:
+        # LLM client boundary: wrap any unexpected error as LLMClientError so callers handle failure uniformly
         if isinstance(e, LLMClientError):
             raise
-        raise LLMClientError(f"Unexpected error: {str(e)}")
+        raise LLMClientError(f"Unexpected error ({type(e).__name__}): {str(e)}")

@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -87,7 +87,7 @@ def load_config(repo_path: Optional[Path] = None) -> GuardConfig:
             with open(local_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return GuardConfig.model_validate(data)
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
             console.print(f"[yellow]Warning: Could not read local config at {local_path}: {e}[/yellow]")
 
     return load_global_config()
@@ -100,7 +100,7 @@ def load_global_config() -> GuardConfig:
             with open(global_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return GuardConfig.model_validate(data)
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
             console.print(f"[yellow]Warning: Could not read global config at {global_path}: {e}[/yellow]")
 
     return GuardConfig()
@@ -229,7 +229,7 @@ def sync_to_alibaba_ocr(llm: LLMConfig, binary: str = "ocr") -> Tuple[bool, str]
     except subprocess.CalledProcessError as e:
         err_out = (e.stderr or "") + (e.stdout or "")
         return False, f"Failed to sync to OCR CLI: {err_out or str(e)}"
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as e:
         return False, f"Error executing OCR CLI: {str(e)}"
 
 

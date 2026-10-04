@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 class UpdateSecurityStatus(str, Enum):
@@ -54,7 +54,7 @@ def parse_version_tuple(ver_str: str) -> Tuple[int, ...]:
 def is_version_newer(latest: str, current: str) -> bool:
     try:
         return parse_version_tuple(latest) > parse_version_tuple(current)
-    except Exception:
+    except (TypeError, ValueError):
         return latest != current
 
 
@@ -67,7 +67,7 @@ def get_installed_ocr_version() -> Optional[str]:
         out = (res.stdout or "") + (res.stderr or "")
         nums = re.findall(r"\d+\.\d+\.\d+", out)
         return nums[0] if nums else "installed"
-    except Exception:
+    except (subprocess.SubprocessError, OSError, UnicodeDecodeError, TypeError):
         return "installed"
 
 
@@ -152,6 +152,7 @@ def check_ocr_update(quarantine_days: float = 3.0, timeout: float = 4.0) -> Vers
             )
 
     except Exception as e:
+        # Best-effort update check: failure to query npm must never crash guard
         return VersionCheckResult(
             package_name=package_name,
             registry=registry,
@@ -188,7 +189,7 @@ def perform_ocr_upgrade(force: bool = False, quarantine_days: float = 3.0) -> Tu
             return True, f"✅ Successfully upgraded Alibaba OCR to version v{new_ver}!"
         err_out = (proc.stderr or "") + (proc.stdout or "")
         return False, f"npm install failed (exit code {proc.returncode}): {err_out}"
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError) as e:
         return False, f"Error running npm install: {str(e)}"
 
 
@@ -216,7 +217,7 @@ def perform_self_upgrade() -> Tuple[bool, str]:
                 return True, "✅ Successfully upgraded Banh-Mi-Guard via pipx!"
             err_out = (proc.stderr or "") + (proc.stdout or "")
             return False, f"pipx upgrade failed: {err_out}"
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             return False, f"Error upgrading guard via pipx: {str(e)}"
 
     # Standard pip fallback with --force-reinstall and Windows binary lock mitigation
@@ -242,11 +243,11 @@ def perform_self_upgrade() -> Tuple[bool, str]:
                     if bak_path.exists():
                         try:
                             bak_path.unlink()
-                        except Exception:
+                        except OSError:
                             pass
                     guard_path.rename(bak_path)
                     exe_renamed = (guard_path, bak_path)
-                except Exception:
+                except OSError:
                     pass
 
     try:
@@ -257,13 +258,13 @@ def perform_self_upgrade() -> Tuple[bool, str]:
                 if exe_renamed[0].exists():
                     try:
                         exe_renamed[1].unlink(missing_ok=True)
-                    except Exception:
+                    except OSError:
                         pass
                 else:
                     # Restore backup if new exe is missing
                     try:
                         exe_renamed[1].rename(exe_renamed[0])
-                    except Exception:
+                    except OSError:
                         pass
             return True, "✅ Successfully upgraded Banh-Mi-Guard from GitHub repository!"
 
@@ -276,7 +277,7 @@ def perform_self_upgrade() -> Tuple[bool, str]:
         if exe_renamed and exe_renamed[1].exists() and not exe_renamed[0].exists():
             try:
                 exe_renamed[1].rename(exe_renamed[0])
-            except Exception:
+            except OSError:
                 pass
 def get_update_cache_path() -> Path:
     return Path.home() / ".guard" / "update_cache.json"
@@ -300,7 +301,7 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
             cache_age = time.time() - cached_data.get("timestamp", 0)
             if cache_age < 43200:  # 12 hours
                 return VersionCheckResult.model_validate(cached_data["result"])
-        except Exception:
+        except (OSError, AttributeError, ValueError, KeyError, TypeError, ValidationError):
             pass
 
     url = "https://raw.githubusercontent.com/okrath/banh-mi-guard/main/pyproject.toml"
@@ -355,12 +356,13 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
                     "result": result.model_dump(mode="json"),
                 }
                 cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
-            except Exception:
+            except (OSError, TypeError, ValueError):
                 pass
 
             return result
 
     except Exception as e:
+        # Best-effort update check: background daemon check must never crash CLI commands
         return VersionCheckResult(
             package_name=package_name,
             registry=registry,
@@ -386,7 +388,7 @@ def get_cached_update_notice() -> Optional[str]:
         latest = res.get("latest_version")
         if latest and is_version_newer(latest, __version__):
             return f"💡 A new version of guard is available: v{__version__} → v{latest} (Run 'guard update self' to upgrade)"
-    except Exception:
+    except (OSError, AttributeError, ValueError, KeyError, TypeError):
         pass
     return None
 
@@ -404,7 +406,7 @@ def maybe_trigger_background_update_check():
             cache_age = time.time() - cached_data.get("timestamp", 0)
             if cache_age < 86400:  # 24 hours
                 should_check = False
-        except Exception:
+        except (OSError, AttributeError, ValueError, KeyError, TypeError):
             should_check = True
 
     if should_check:
@@ -412,4 +414,5 @@ def maybe_trigger_background_update_check():
             t = threading.Thread(target=check_guard_self_update, kwargs={"timeout": 3.0, "force": True}, daemon=True)
             t.start()
         except Exception:
+            # Best-effort background update check: never crash CLI execution
             pass

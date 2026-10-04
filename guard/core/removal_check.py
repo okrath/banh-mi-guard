@@ -58,14 +58,13 @@ def _collect_removed(raw_diff: str) -> Dict[str, Tuple[str, str]]:
 
 
 def _repo_files(repo_path: Path) -> List[Path]:
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(repo_path), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-        )
-        names = [n for n in (res.stdout or "").split("\0") if n]
-    except Exception:
-        names = []
+    res = subprocess.run(
+        ["git", "-C", str(repo_path), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+    )
+    if res.returncode != 0:
+        raise OSError(f"git ls-files failed (exit code {res.returncode}): {res.stderr or ''}".strip())
+    names = [n for n in (res.stdout or "").split("\0") if n]
     return [repo_path / n for n in names if n.endswith(CODE_EXTS + STYLE_EXTS) and (repo_path / n).is_file()]
 
 
@@ -73,14 +72,30 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
     removed = _collect_removed(raw_diff)
     if not removed:
         return [], ""
+    try:
+        files = _repo_files(repo_path)
+    except (subprocess.SubprocessError, OSError) as e:
+        origin = next(iter(removed.values()))[1]
+        violation = RuleViolation(
+            rule_id="DEAD-REF",
+            severity="HIGH",
+            file_path=origin,
+            message=f"Removal check could not verify removed symbols: git ls-files failed ({e}).",
+        )
+        return [violation], f"Removed-symbol reference check failed: git ls-files failed ({e})."
+
     texts = {}
-    for f in _repo_files(repo_path):
+    violations: List[RuleViolation] = []
+    for f in files:
         try:
             texts[f.relative_to(repo_path).as_posix()] = f.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-
-    violations: List[RuleViolation] = []
+        except OSError as e:
+            violations.append(RuleViolation(
+                rule_id="DEAD-REF",
+                severity="HIGH",
+                file_path=f.relative_to(repo_path).as_posix(),
+                message=f"Removal check could not read `{f.relative_to(repo_path).as_posix()}` to verify references: {e}",
+            ))
     counts: Dict[str, int] = {}
     for name, (kind, origin) in sorted(removed.items()):
         counts[kind] = counts.get(kind, 0) + 1
@@ -116,9 +131,12 @@ def check_removed_symbols(repo_path: Path, raw_diff: str) -> Tuple[List[RuleViol
             ))
 
     kinds = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
-    broken = ", ".join(f"`{v.message.split('`')[1]}`" for v in violations) or "none"
+    dead_refs = [v for v in violations if "is no longer defined but still referenced" in v.message]
+    broken = ", ".join(f"`{v.message.split('`')[1]}`" for v in dead_refs if "`" in v.message) or "none"
+    read_errs = [v for v in violations if "could not read" in v.message]
+    err_note = f"; unreadable files: {len(read_errs)}" if read_errs else ""
     summary = (
         f"Removed-symbol reference check (deterministic, whole repository): removed {kinds}; "
-        f"removed and still referenced without a definition: {broken}."
+        f"removed and still referenced without a definition: {broken}{err_note}."
     )
     return violations, summary
