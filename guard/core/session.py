@@ -167,11 +167,21 @@ def get_approval_key() -> bytes:
             f.write(new_key)
         if os.name != "nt":
             os.chmod(tmp, 0o600)
-        os.replace(tmp, key_file)
-    except BaseException:
+        try:
+            os.link(tmp, key_file)
+        except (FileExistsError, OSError):
+            try:
+                if not key_file.is_file() or len(key_file.read_bytes()) != 32:
+                    os.replace(tmp, key_file)
+            except OSError:
+                pass
+    finally:
         Path(tmp).unlink(missing_ok=True)
-        raise
-    return key_file.read_bytes()
+    if key_file.is_file():
+        data = key_file.read_bytes()
+        if len(data) == 32:
+            return data
+    raise RuntimeError(f"Approval key file {key_file} is corrupt or invalid length")
 
 
 def compute_approval_signature(repo_path: str | Path, session_id: str, approved_fingerprints: Dict[str, str]) -> str:

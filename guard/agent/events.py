@@ -237,8 +237,9 @@ def _held_reason(session) -> str:
 
 # Executable patterns for guard: guard, guard.exe, python[3[.x]] -m guard, py [-3[.x]] -m guard
 GUARD_EXEC_RE = (
-    r"(?:(?:\S*[/\\])?guard(?:\.exe)?|"
-    r"(?:\S*[/\\])?(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?(?:\s+-(?:[3\w.]+|\"[^\"]*\"|'[^']*'))*\s+-m\s+guard(?:\.exe)?)"
+    r"(?:(?:\"[^\"]*[/\\]guard(?:\.exe)?\"|'[^']*[/\\]guard(?:\.exe)?'|(?:\S*[/\\])?guard(?:\.exe)?)|"
+    r"(?:\"[^\"]*[/\\](?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?\"|'[^']*[/\\](?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?'|(?:\S*[/\\])?(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?)"
+    r"(?:\s+-(?:[3\w.]+|\"[^\"]*\"|'[^']*'))*\s+-m\s+guard(?:\.exe)?)"
 )
 
 # `guard pre` as the command itself: at the start or after a shell separator, optionally behind
@@ -259,42 +260,79 @@ GUARD_SUSPECT_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+PYTHON_LAUNCHER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|py)$", re.IGNORECASE)
+ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
+
+
+def _tokenize(cmd_or_seg: str) -> List[str]:
+    cleaned = re.sub(r"\d*>&[0-2]|\d*>>?&\d+", " ", cmd_or_seg)
+    try:
+        lex = shlex.shlex(cleaned, posix=False, punctuation_chars=";&|\n><")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return list(lex)
+    except (ValueError, OSError):
+        return []
+
+
+def _prog_name(tok: str) -> str:
+    cleaned = tok.strip("\"'")
+    name = cleaned.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
+
+
+def _is_run_subcommand(tokens: List[str]) -> bool:
+    """Find the subcommand token (skipping flags and option arguments) and check if it is 'run'."""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].strip("\"'")
+        if tok == "--":
+            break
+        if tok in ("--repo", "-r", "-a", "--agent"):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok.lower() == "run"
+    return False
+
 
 def is_single_segment_guard(seg: str) -> bool:
-    m = GUARD_SEG_RE.match(seg.strip())
-    if not m:
+    tokens = _tokenize(seg)
+    while tokens and ASSIGN_RE.match(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
         return False
-    args_str = m.group(1) or ""
-    try:
-        tokens = shlex.split(args_str)
-    except ValueError:
-        tokens = args_str.split()
-    cmd_tokens = []
-    for t in tokens:
-        if t == "--":
-            break
-        cmd_tokens.append(t.lower())
-    for idx, tok in enumerate(cmd_tokens):
-        if tok == "run":
-            if idx > 0 and cmd_tokens[idx - 1] in ("--repo", "-r", "-a", "--agent"):
-                continue
-            return False
-    return True
+
+    prog = _prog_name(tokens[0])
+    if prog == "guard":
+        return not _is_run_subcommand(tokens[1:])
+
+    if PYTHON_LAUNCHER_RE.match(prog):
+        sub_tokens = tokens[1:]
+        for idx, tok in enumerate(sub_tokens):
+            if tok == "-m" and idx + 1 < len(sub_tokens):
+                target = _prog_name(sub_tokens[idx + 1])
+                if target == "guard":
+                    return not _is_run_subcommand(sub_tokens[idx + 2:])
+                break
+            if not tok.startswith("-"):
+                break
+    return False
 
 
 def _split_unquoted_segments(cmd: str) -> List[str]:
-    cleaned = re.sub(r"\d*>&[0-2]|\d*>>?&\d+", " ", cmd)
-    try:
-        lexer = shlex.shlex(cleaned, posix=True, punctuation_chars=";&|\n")
-        lexer.whitespace_split = False
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except (ValueError, OSError):
+    tokens = _tokenize(cmd)
+    if not tokens:
         return []
     segments: List[str] = []
     curr: List[str] = []
     for tok in tokens:
-        if tok in (";", "&&", "||", "|", "&", "\n"):
+        if tok in SEPARATORS:
             if curr:
                 segments.append(" ".join(curr))
                 curr = []
@@ -303,6 +341,20 @@ def _split_unquoted_segments(cmd: str) -> List[str]:
     if curr:
         segments.append(" ".join(curr))
     return segments
+
+
+def _is_benign_segment(seg: str) -> bool:
+    if is_read_only(seg):
+        return True
+    tokens = _tokenize(seg)
+    if not tokens:
+        return False
+    if any(t in (">", ">>", "<", "<<", ">|", "&>", "&>>", ">&") or t.startswith(">") or t.startswith("<") for t in tokens):
+        return False
+    words = [t for t in tokens if not ASSIGN_RE.match(t)]
+    if words and _prog_name(words[0]) in ("cd", "pushd", "popd"):
+        return True
+    return False
 
 
 def is_guard_command(cmd: str) -> bool:
@@ -318,7 +370,7 @@ def is_guard_command(cmd: str) -> bool:
     for seg in segments:
         if is_single_segment_guard(seg):
             has_guard = True
-        elif is_read_only(seg):
+        elif _is_benign_segment(seg):
             continue
         else:
             return False

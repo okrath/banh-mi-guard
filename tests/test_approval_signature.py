@@ -26,6 +26,10 @@ from guard.agent.events import (
     is_guard_command,
 )
 from guard.core.session import (
+    DomainType,
+    GuardSession,
+    PostTaskRecord,
+    PreTaskRecord,
     SessionManager,
     SessionStatus,
     compute_approval_signature,
@@ -166,26 +170,36 @@ def test_hook_path_refuses_forged_approval(tmp_path, fake_ocr_review, capsys):
     assert proceed is False and result is False
 
 
-def test_session_without_signature_is_treated_as_not_approved(tmp_path, fake_ocr_review):
+def test_session_without_signature_is_treated_as_not_approved(tmp_path):
     repo = _make_repo(tmp_path)
-    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
-    assert execute_post_task(repo_path=repo) is True
-
-    # Remove signature as an older version would have
-    session_file = repo / ".guard" / "session.json"
-    data = json.loads(session_file.read_text(encoding="utf-8"))
-    data["post"]["approval_signature"] = None
-    session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
+    (repo / ".guard").mkdir(parents=True, exist_ok=True)
     mgr = SessionManager(repo)
-    session = mgr.load_local_session()
-    assert session is not None
-    assert mgr.is_approval_verified(session) is False
-    assert mgr.verified_approval(session) == {}
+    # Build an unsigned approved session (as older guard versions wrote)
+    session = GuardSession(
+        session_id="unsigned_test_session",
+        repo_path=str(repo),
+        status=SessionStatus.COMPLETED,
+        pre=PreTaskRecord(
+            prompt="Fix src/chat.ts",
+            domain=DomainType.BACKEND,
+            base_ref="HEAD",
+        ),
+        post=PostTaskRecord(
+            all_passed=True,
+            approved_fingerprints={"src/chat.ts": content_hash(repo / "src" / "chat.ts")},
+            approval_signature=None,
+        ),
+    )
+    mgr._save(session)
+
+    loaded = mgr.load_local_session()
+    assert loaded is not None
+    assert mgr.is_approval_verified(loaded) is False
+    assert mgr.verified_approval(loaded) == {}
 
     # Calling _save on unsigned loaded session does NOT mint a signature
-    mgr._save(session)
+    mgr._save(loaded)
     reloaded = SessionManager(repo).load_local_session()
     assert reloaded.post.approval_signature is None
 
@@ -302,7 +316,10 @@ def test_guard_path_and_uncovered_logic(tmp_path):
     assert is_guard_command("python -c 'pass'") is False
 
 
-def test_guard_accept_write_path_produces_verifiable_signature(tmp_path, fake_ocr_review):
+def test_guard_accept_write_path_produces_verifiable_signature(tmp_path, fake_ocr_review, monkeypatch):
+    import sys
+    from guard.commands.review import accept_cmd, Prompt
+
     repo = _make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
@@ -312,23 +329,28 @@ def test_guard_accept_write_path_produces_verifiable_signature(tmp_path, fake_oc
     session = mgr.load_local_session()
     assert session is not None
 
-    # Emulate guard accept write path
-    reviewed = dict(session.post.approved_fingerprints)
-    session.status = SessionStatus.COMPLETED
-    session.post.approved_fingerprints = dict(reviewed)
-    session.post.all_passed = True
-    session.post.accepted_by_user = True
-    session.post.approval_signature = compute_approval_signature(
-        mgr.repo_path,
-        session.session_id,
-        session.post.approved_fingerprints,
-    )
+    # Set up session in NEEDS_USER state for guard accept
+    session.status = SessionStatus.NEEDS_USER
+    session.post.review_mode = "llm_deep"
+    session.post.needs_user = True
+    session.post.approval_signature = None
+    session.post.all_passed = False
+    session.post.accepted_by_user = False
     mgr._save(session)
+
+    # Call the real guard accept command path (monkeypatch isatty and the prompt)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(Prompt, "ask", lambda *a, **k: "a")
+    accept_cmd(repo=str(repo))
 
     reloaded = mgr.load_local_session()
     assert reloaded is not None
+    assert reloaded.status == SessionStatus.COMPLETED
+    assert reloaded.post.accepted_by_user is True
+    assert reloaded.post.approval_signature is not None
     assert mgr.is_approval_verified(reloaded) is True
-    assert mgr.verified_approval(reloaded) == reviewed
+    assert mgr.verified_approval(reloaded) == session.post.reviewed_fingerprints
     assert decide(AgentEvent(event="before-commit", cwd=str(repo))).action == "allow"
 
 
@@ -371,6 +393,10 @@ def test_unsigned_completed_session_with_clean_tree_allows_stop_but_blocks_commi
     (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
     assert execute_post_task(repo_path=repo) is True
 
+    # Commit the changes while approved so the working tree is clean
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete task"], check=True)
+
     # Strip signature to simulate an old session
     mgr = SessionManager(repo)
     session = mgr.load_local_session()
@@ -378,9 +404,6 @@ def test_unsigned_completed_session_with_clean_tree_allows_stop_but_blocks_commi
     session.post.approval_signature = None
     session_file = repo / ".guard" / "session.json"
     session_file.write_text(session.model_dump_json(indent=2), encoding="utf-8")
-    # Commit the changes so the working tree is clean
-    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete task"], check=True)
 
     # Clean tree: stop is allowed
     stop_dec = decide(AgentEvent(event="stop", cwd=str(repo)))
@@ -390,7 +413,6 @@ def test_unsigned_completed_session_with_clean_tree_allows_stop_but_blocks_commi
     commit_dec = decide(AgentEvent(event="before-commit", cwd=str(repo)))
     assert commit_dec.action == "block"
     assert "signature" in commit_dec.reason.lower() or "guard post" in commit_dec.reason.lower()
-
 
 def test_signed_session_copied_to_another_repo_does_not_verify(tmp_path, fake_ocr_review):
     repo_a = _make_repo(tmp_path / "repo_a")
@@ -411,6 +433,54 @@ def test_signed_session_copied_to_another_repo_does_not_verify(tmp_path, fake_oc
 
     commit_dec = decide(AgentEvent(event="before-commit", cwd=str(repo_b)))
     assert commit_dec.action == "block"
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        # Windows paths and launchers that must count as guard commands
+        (r"C:\Python311\python.exe -m guard post", True),
+        (r'"C:\Program Files\Python311\python.exe" -m guard post', True),
+        (r"C:\Users\x\Scripts\guard.exe post", True),
+        ("cd sub && guard post", True),
+        ('guard finding X --defer "run later"', True),
+        ('guard pre "fix run tests" --scope a.py', True),
+        ("python3.11 -m guard post", True),
+        ("py -3 -m guard post", True),
+        # Commands that must NOT count as guard commands
+        ('guard run "x" -- python forge.py', False),
+        ("python forge.py && guard post", False),
+        ("echo guard post > x", False),
+        ("python script.py -m guard", False),
+        ("cd x>file", False),
+        ("guard post>.guard/session.json", False),
+        # Existing variants and edge cases
+        ("guard pre 'Fix'", True),
+        ("guard.exe pre 'Fix'", True),
+        ("python -m guard pre 'Fix'", True),
+        ("python3 -m guard pre 'Fix'", True),
+        ("python3.11 -m guard pre 'Fix'", True),
+        ("python3.12.exe -m guard pre 'Fix'", True),
+        ("py -3 -m guard pre 'Fix'", True),
+        ("py -3.11 -m guard pre 'Fix'", True),
+        ("guard post", True),
+        ("guard post --full", True),
+        ("guard pre 'x' && echo done", True),
+        ("guard pre 'x'; cat .guard/session.json", True),
+        ("echo start | guard post", True),
+        ("guard pre 'x' && echo 1 > .guard/session.json", False),
+        ("guard status > .guard/session.json", False),
+        ("guard run 'x' -- echo hi", False),
+        ("python3.11 -m guard run 'x' -- echo hi", False),
+        ('guard --repo X run "x"', False),
+        ('python -m guard --repo X run "x"', False),
+        ("guard --repo X post", True),
+        ("python -m guard --repo X post", True),
+        ("python -c 'pass'", False),
+    ],
+)
+def test_guard_command_detection_table(cmd, expected):
+    assert is_guard_command(cmd) is expected
 
 
 def test_guard_command_detection_variants():
