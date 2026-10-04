@@ -645,13 +645,15 @@ def agent_event_cmd(
         ev.agent = agent or ""
         if event != "stop" and not (ev.prompt or ev.tool or ev.file_paths or ev.command):
             log(f"INCOMPLETE payload without the fields this event needs (keys: {sorted(payload)[:12]})")
-    except Exception as e:  # a payload guard cannot read: never break the agent because of guard
+    except Exception as e:
+        # Hook boundary: never crash the external agent process on unreadable or unexpected payload
         ev, decision = None, Decision()
         log(f"UNREADABLE {type(e).__name__}: {e}")
     if ev is not None:
         try:
             decision = decide(ev)
-        except Exception as e:  # guard's own failure: allowed, but the agent is told it was not checked
+        except Exception as e:
+            # Hook boundary: guard decision failure must notify agent instead of crashing it
             decision = Decision(action="notify", reason=f"Guard could not check this action ({type(e).__name__}: {e}); it was allowed. Tell the user.")
             log(f"ERROR {type(e).__name__}: {e}")
     harness = harness_event(adapter, event, payload if isinstance(payload, dict) else {})

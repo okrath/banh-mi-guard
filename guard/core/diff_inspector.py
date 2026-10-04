@@ -31,6 +31,7 @@ class DiffSummary(BaseModel):
     out_of_scope_files: List[str] = Field(default_factory=list)
     raw_diff: str = ""
     is_clean: bool = True
+    error: Optional[str] = None
 
 
 class GitDiffInspector:
@@ -40,6 +41,7 @@ class GitDiffInspector:
 
     def __init__(self, repo_path: Optional[Path] = None):
         self.repo_path = repo_path or Path.cwd()
+        self.last_error: Optional[str] = None
 
     def is_git_repo(self) -> bool:
         git_dir = self.repo_path / ".git"
@@ -51,6 +53,7 @@ class GitDiffInspector:
         Always returns a valid string (never None).
         Safely decodes UTF-8 to prevent charmap/UnicodeDecodeError on Windows.
         """
+        self.last_error = None
         if not self.is_git_repo():
             return ""
 
@@ -73,20 +76,34 @@ class GitDiffInspector:
                 errors="replace",
                 check=False,
             )
-            if res.returncode == 0 and res.stdout:
-                diff_output = res.stdout
+            if res.returncode == 0:
+                diff_output = res.stdout or ""
+                self.last_error = None
             else:
-                res2 = subprocess.run(
-                    ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                diff_output = res2.stdout or ""
-        except Exception:
-            diff_output = ""
+                # Diff command failed
+                # Keep fallback to unstaged-only `git diff` only when there is no base_ref
+                # and the repository has no commits.
+                if not base_ref and not staged_only and self.get_head() is None:
+                    res2 = subprocess.run(
+                        ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                    if res2.returncode == 0:
+                        diff_output = res2.stdout or ""
+                        self.last_error = None
+                    else:
+                        self.last_error = f"git diff failed (exit code {res2.returncode}): {res2.stderr or ''}".strip()
+                        diff_output = f"# [ERROR: {self.last_error}]\n"
+                else:
+                    self.last_error = f"git diff failed (exit code {res.returncode}): {res.stderr or ''}".strip()
+                    diff_output = f"# [ERROR: {self.last_error}]\n"
+        except (subprocess.SubprocessError, OSError) as e:
+            self.last_error = f"git diff error: {e}"
+            diff_output = f"# [ERROR: {self.last_error}]\n"
 
         diff_output = diff_output or ""
 
@@ -111,8 +128,17 @@ class GitDiffInspector:
                     for l in lines:
                         synth.append(f"+{l}")
                     synthetic_diffs.append("\n".join(synth))
-                except Exception:
-                    pass
+                except OSError as e:
+                    self.last_error = f"untracked file {uf} could not be read: {e}"
+                    synth = [
+                        f"diff --git a/{uf} b/{uf}",
+                        "new file mode 100644",
+                        "--- /dev/null",
+                        f"+++ b/{uf}",
+                        "@@ -0,0 +1,1 @@",
+                        f"+# [ERROR: unreadable untracked file: {e}]",
+                    ]
+                    synthetic_diffs.append("\n".join(synth))
 
         if synthetic_diffs:
             if diff_output:
@@ -138,7 +164,11 @@ class GitDiffInspector:
                 errors="replace",
                 check=False,
             )
-        except Exception:
+            if res.returncode != 0:
+                self.last_error = f"git status failed (exit code {res.returncode}): {res.stderr or ''}".strip()
+                return []
+        except (subprocess.SubprocessError, OSError) as e:
+            self.last_error = f"git status error: {e}"
             return []
         parts = (res.stdout or "").split("\0")
         entries = []
@@ -180,13 +210,19 @@ class GitDiffInspector:
             )
             sha = (res.stdout or "").strip()
             if not sha:
+                if res.returncode != 0:
+                    self.last_error = f"git stash create failed (exit code {res.returncode}): {res.stderr or ''}".strip()
                 return None
-            subprocess.run(
+            res_ref = subprocess.run(
                 ["git", "-C", str(self.repo_path), "update-ref", "refs/guard/baseline", sha],
                 capture_output=True, check=False,
             )
+            if res_ref.returncode != 0:
+                self.last_error = f"git update-ref failed (exit code {res_ref.returncode})"
+                return None
             return sha
-        except Exception:
+        except (subprocess.SubprocessError, OSError) as e:
+            self.last_error = f"create_baseline_snapshot error: {e}"
             return None
 
     def snapshot_worktree(self) -> Optional[str]:
@@ -224,7 +260,7 @@ class GitDiffInspector:
                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             return res.stdout.strip() or None
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             return None
 
     def parse_diff(self, raw_diff: Optional[str], expected_files: Optional[List[str]] = None) -> DiffSummary:
@@ -232,8 +268,16 @@ class GitDiffInspector:
         Parse raw git diff string into structured FileDiffStat and detect out-of-scope changes.
         """
         diff_text = raw_diff or ""
+        error_msg = None
+        for line in diff_text.splitlines():
+            if line.startswith("# [ERROR:"):
+                error_msg = line.removeprefix("# [ERROR:").removesuffix("]").strip()
+                break
+        if not error_msg and self.last_error:
+            error_msg = self.last_error
+
         if not diff_text.strip():
-            return DiffSummary(files=[], raw_diff="", is_clean=True)
+            return DiffSummary(files=[], raw_diff="", is_clean=not bool(error_msg), error=error_msg)
 
         files_map: Dict[str, FileDiffStat] = {}
         current_file: Optional[str] = None
@@ -272,7 +316,8 @@ class GitDiffInspector:
             total_deletions=tot_del,
             out_of_scope_files=out_of_scope,
             raw_diff=diff_text,
-            is_clean=len(stats_list) == 0,
+            is_clean=len(stats_list) == 0 and not bool(error_msg),
+            error=error_msg,
         )
 
     def _is_expected(self, file_path: str, expected_files: List[str]) -> bool:

@@ -162,7 +162,7 @@ def doctor_cmd(
                 errors="replace",
             ).stdout or ""
             table.add_row("Git VCS", "✅ OK", gv.strip())
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             table.add_row("Git VCS", "⚠️ Warn", "Git installed but version query failed")
     else:
         table.add_row("Git VCS", "❌ Missing", "git not found in PATH")
@@ -179,7 +179,7 @@ def doctor_cmd(
                 errors="replace",
             ).stdout or ""
             table.add_row("Node.js Runtime", "✅ OK", f"Node {nv.strip()}")
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             table.add_row("Node.js Runtime", "⚠️ Warn", "Node installed but query failed")
     else:
         table.add_row("Node.js Runtime", "❌ Missing", "node not found in PATH")
@@ -282,6 +282,6 @@ def _refresh_with_new_version() -> None:
         )
         if proc.returncode == 0:
             return
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         pass
     console.print("[yellow]Automatic refresh did not complete. Run `guard hook refresh` to update hooks and directives.[/yellow]")

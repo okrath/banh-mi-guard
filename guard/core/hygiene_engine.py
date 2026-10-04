@@ -141,7 +141,7 @@ class HygieneEngine:
                     if norm_target.endswith(".go") and f.endswith(".go") and p.parent.name \
                             and f'/{p.parent.name}"' in content:
                         return True
-                except Exception:
+                except (OSError, UnicodeDecodeError):
                     continue
         return False
 
