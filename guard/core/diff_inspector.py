@@ -47,16 +47,7 @@ class GitDiffInspector:
         git_dir = self.repo_path / ".git"
         return git_dir.exists()
 
-    def get_diff(self, staged_only: bool = False, base_ref: Optional[str] = None) -> str:
-        """
-        Extract raw diff from Git, including synthetic diffs for untracked files.
-        Always returns a valid string (never None).
-        Safely decodes UTF-8 to prevent charmap/UnicodeDecodeError on Windows.
-        """
-        self.last_error = None
-        if not self.is_git_repo():
-            return ""
-
+    def _run_git_diff(self, staged_only: bool, base_ref: Optional[str]) -> str:
         cmd = ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"]
         if staged_only:
             cmd.append("--staged")
@@ -66,7 +57,6 @@ class GitDiffInspector:
             # Include both staged and unstaged (against HEAD if exists)
             cmd.append("HEAD")
 
-        diff_output = ""
         try:
             res = subprocess.run(
                 cmd,
@@ -77,68 +67,84 @@ class GitDiffInspector:
                 check=False,
             )
             if res.returncode == 0:
-                diff_output = res.stdout or ""
                 self.last_error = None
-            else:
-                # Diff command failed
-                # Keep fallback to unstaged-only `git diff` only when there is no base_ref
-                # and the repository has no commits.
-                if not base_ref and not staged_only and self.get_head() is None:
-                    res2 = subprocess.run(
-                        ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        check=False,
-                    )
-                    if res2.returncode == 0:
-                        diff_output = res2.stdout or ""
-                        self.last_error = None
-                    else:
-                        self.last_error = f"git diff failed (exit code {res2.returncode}): {res2.stderr or ''}".strip()
-                        diff_output = f"# [ERROR: {self.last_error}]\n"
-                else:
-                    self.last_error = f"git diff failed (exit code {res.returncode}): {res.stderr or ''}".strip()
-                    diff_output = f"# [ERROR: {self.last_error}]\n"
+                return res.stdout or ""
+            # Diff command failed
+            # Keep fallback to unstaged-only `git diff` only when there is no base_ref
+            # and the repository has no commits.
+            if not base_ref and not staged_only and self.get_head() is None:
+                res2 = subprocess.run(
+                    ["git", "-C", str(self.repo_path), "-c", "core.quotepath=false", "diff"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                if res2.returncode == 0:
+                    self.last_error = None
+                    return res2.stdout or ""
+                self.last_error = f"git diff failed (exit code {res2.returncode}): {res2.stderr or ''}".strip()
+                return f"# [ERROR: {self.last_error}]\n"
+            self.last_error = f"git diff failed (exit code {res.returncode}): {res.stderr or ''}".strip()
+            return f"# [ERROR: {self.last_error}]\n"
         except (subprocess.SubprocessError, OSError) as e:
             self.last_error = f"git diff error: {e}"
-            diff_output = f"# [ERROR: {self.last_error}]\n"
+            return f"# [ERROR: {self.last_error}]\n"
 
-        diff_output = diff_output or ""
+    def _synthetic_file_diff(self, uf: str) -> Optional[str]:
+        if uf in [".gitignore", ".guard/session.json"] or uf.startswith(".guard/"):
+            return None
+        uf_path = self.repo_path / uf
+        if not uf_path.is_file():
+            return None
+        try:
+            content = uf_path.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines()
+            synth = [
+                f"diff --git a/{uf} b/{uf}",
+                "new file mode 100644",
+                "--- /dev/null",
+                f"+++ b/{uf}",
+                f"@@ -0,0 +1,{max(1, len(lines))} @@",
+            ]
+            for line in lines:
+                synth.append(f"+{line}")
+            return "\n".join(synth)
+        except OSError as e:
+            self.last_error = f"untracked file {uf} could not be read: {e}"
+            synth = [
+                f"diff --git a/{uf} b/{uf}",
+                "new file mode 100644",
+                "--- /dev/null",
+                f"+++ b/{uf}",
+                "@@ -0,0 +1,1 @@",
+                f"+# [ERROR: unreadable untracked file: {e}]",
+            ]
+            return "\n".join(synth)
 
+    def _collect_untracked_diffs(self) -> List[str]:
         # Append synthetic diffs for untracked files (so rules engine can inspect secrets/NPE)
         untracked = self.get_untracked_files()
         synthetic_diffs = []
         for uf in untracked:
-            if uf in [".gitignore", ".guard/session.json"] or uf.startswith(".guard/"):
-                continue
-            uf_path = self.repo_path / uf
-            if uf_path.is_file():
-                try:
-                    content = uf_path.read_text(encoding="utf-8", errors="ignore")
-                    lines = content.splitlines()
-                    synth = [
-                        f"diff --git a/{uf} b/{uf}",
-                        "new file mode 100644",
-                        "--- /dev/null",
-                        f"+++ b/{uf}",
-                        f"@@ -0,0 +1,{max(1, len(lines))} @@",
-                    ]
-                    for line in lines:
-                        synth.append(f"+{line}")
-                    synthetic_diffs.append("\n".join(synth))
-                except OSError as e:
-                    self.last_error = f"untracked file {uf} could not be read: {e}"
-                    synth = [
-                        f"diff --git a/{uf} b/{uf}",
-                        "new file mode 100644",
-                        "--- /dev/null",
-                        f"+++ b/{uf}",
-                        "@@ -0,0 +1,1 @@",
-                        f"+# [ERROR: unreadable untracked file: {e}]",
-                    ]
-                    synthetic_diffs.append("\n".join(synth))
+            synth = self._synthetic_file_diff(uf)
+            if synth is not None:
+                synthetic_diffs.append(synth)
+        return synthetic_diffs
+
+    def get_diff(self, staged_only: bool = False, base_ref: Optional[str] = None) -> str:
+        """
+        Extract raw diff from Git, including synthetic diffs for untracked files.
+        Always returns a valid string (never None).
+        Safely decodes UTF-8 to prevent charmap/UnicodeDecodeError on Windows.
+        """
+        self.last_error = None
+        if not self.is_git_repo():
+            return ""
+
+        diff_output = self._run_git_diff(staged_only=staged_only, base_ref=base_ref)
+        synthetic_diffs = self._collect_untracked_diffs()
 
         if synthetic_diffs:
             if diff_output:
