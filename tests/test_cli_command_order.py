@@ -2,6 +2,11 @@
 Pin top-level CLI command order to prevent silent reordering from import sorting.
 """
 
+from typing import cast
+
+import typer
+import typer.core
+import typer.main
 from typer.testing import CliRunner
 
 import guard.cli
@@ -67,17 +72,11 @@ def test_help_command_order():
     res = runner.invoke(guard.cli.app, ["--help"])
     assert res.exit_code == 0
 
-    visible_commands = []
-    in_commands_section = False
-    for line in res.stdout.splitlines():
-        if "Commands" in line:
-            in_commands_section = True
-            continue
-        if in_commands_section and "│" in line:
-            parts = line.split("│")
-            if len(parts) >= 3:
-                name = parts[1][:14].strip()
-                if name and not name.startswith("─"):
-                    visible_commands.append(name)
-
+    group = cast(typer.core.TyperGroup, typer.main.get_command(guard.cli.app))
+    ctx = typer.Context(group)
+    visible_commands = [
+        name
+        for name in group.list_commands(ctx)
+        if not getattr(group.get_command(ctx, name), "hidden", False)
+    ]
     assert visible_commands == EXPECTED_HELP_COMMAND_ORDER
