@@ -148,6 +148,65 @@ def _carry_comment(open_comments: dict, path_lower: str, code: str) -> Optional[
 
 _HEREDOC = re.compile(r"<<[-~]?(['\"`]?)([A-Za-z_]\w*)\1")
 
+def _resume_open_string(open_strings: dict, path_lower: str, code: str, current: object) -> tuple[bool, int]:
+    """Handles an open heredoc or multiline quote from previous lines.
+    Returns (done, start_or_len):
+    - When (True, len(code)): the line is consumed by heredoc or unclosed quote; do not scan further.
+    - When (False, start_idx): the quote closed or none was open; continue scanning from start_idx."""
+    if isinstance(current, tuple) and current[0] == "HEREDOC":
+        heredoc_id = current[1]
+        if code.strip() != heredoc_id:
+            open_strings[path_lower] = current
+        return True, len(code)
+
+    if current in ('"', "'"):
+        q = current
+        escaped = False
+        close_idx = -1
+        for i, ch in enumerate(code):
+            if ch == q and not escaped:
+                close_idx = i
+                break
+            escaped = (ch == "\\") and not escaped
+
+        if close_idx < 0:
+            open_strings[path_lower] = q
+            return True, len(code)
+
+        return False, close_idx + 1
+
+    return False, 0
+
+
+def _blank_comments(path_lower: str, code: str, start_idx: int, open_comments: Optional[dict | str], is_php: bool) -> Optional[str]:
+    """Blanks out comments in code after start_idx so string scanning ignores them.
+    Returns the blanked string, or None if the rest of the line is inside an open comment."""
+    clean_code = " " * start_idx + code[start_idx:]
+    open_comment = open_comments.get(path_lower) if isinstance(open_comments, dict) else open_comments
+    if open_comment:
+        end = clean_code.find(open_comment, start_idx)
+        if end < 0:
+            return None
+        clean_code = " " * (end + len(open_comment)) + clean_code[end + len(open_comment):]
+
+    blocks = _block_comments(path_lower)
+    is_hash = _hash_comments(path_lower)
+    spans: list = []
+    cut = _comment_start(clean_code, is_hash, spans, blocks)
+    if is_php:
+        spans_hash: list = []
+        cut_hash = _comment_start(clean_code, True, spans_hash, blocks)
+        if cut < 0 or (0 <= cut_hash < cut):
+            cut = cut_hash
+            spans = spans_hash
+
+    body = clean_code[:cut] if cut >= 0 else clean_code
+    s = list(body)
+    for a, b in spans:
+        s[a:b] = " " * (b - a)
+    return "".join(s)
+
+
 def _carry_string(open_strings: dict, path_lower: str, code: str, open_comments: Optional[dict] = None) -> int:
     """
     Tracks multi-line string or heredoc state across lines for PHP and Ruby.
@@ -160,56 +219,14 @@ def _carry_string(open_strings: dict, path_lower: str, code: str, open_comments:
         return 0
 
     current = open_strings.pop(path_lower, None)
+    done, cutoff = _resume_open_string(open_strings, path_lower, code, current)
+    if done:
+        return cutoff
+    start_idx = cutoff
 
-    if isinstance(current, tuple) and current[0] == "HEREDOC":
-        heredoc_id = current[1]
-        if code.strip() == heredoc_id:
-            return len(code)
-        open_strings[path_lower] = current
-        return len(code)
-
-    start_idx = 0
-    if current in ('"', "'"):
-        q = current
-        escaped = False
-        close_idx = -1
-        for i in range(len(code)):
-            ch = code[i]
-            if ch == q and not escaped:
-                close_idx = i
-                break
-            escaped = (ch == "\\") and not escaped
-
-        if close_idx < 0:
-            open_strings[path_lower] = q
-            return len(code)
-
-        start_idx = close_idx + 1
-
-    clean_code = " " * start_idx + code[start_idx:]
-    open_comment = open_comments.get(path_lower) if isinstance(open_comments, dict) else open_comments
-    if open_comment:
-        end = clean_code.find(open_comment, start_idx)
-        if end < 0:
-            return start_idx
-        clean_code = " " * (end + len(open_comment)) + clean_code[end + len(open_comment):]
-
-    blocks = _block_comments(path_lower)
-    is_hash = _hash_comments(path_lower)
-    spans = []
-    cut = _comment_start(clean_code, is_hash, spans, blocks)
-    if is_php:
-        spans_hash = []
-        cut_hash = _comment_start(clean_code, True, spans_hash, blocks)
-        if cut < 0 or (0 <= cut_hash < cut):
-            cut = cut_hash
-            spans = spans_hash
-
-    body = clean_code[:cut] if cut >= 0 else clean_code
-    s = list(body)
-    for a, b in spans:
-        s[a:b] = " " * (b - a)
-    clean_code = "".join(s)
+    clean_code = _blank_comments(path_lower, code, start_idx, open_comments, is_php)
+    if clean_code is None:
+        return start_idx
 
     k = start_idx
     n = len(clean_code)
@@ -227,15 +244,15 @@ def _carry_string(open_strings: dict, path_lower: str, code: str, open_comments:
             q = ch
             k += 1
             escaped = False
-            closed = False
+            closed_quote = False
             while k < n:
                 if clean_code[k] == q and not escaped:
-                    closed = True
+                    closed_quote = True
                     k += 1
                     break
                 escaped = (clean_code[k] == "\\") and not escaped
                 k += 1
-            if not closed:
+            if not closed_quote:
                 open_strings[path_lower] = q
                 return start_idx
             continue

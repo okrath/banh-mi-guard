@@ -266,15 +266,8 @@ def _cli_wizard(current_cfg: GuardConfig, found: List[str], local: bool, repo_pa
     return current_cfg
 
 
-def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> GuardConfig:
-    current_cfg = load_config(repo_path)
-    console.print(Panel(
-        "[bold cyan]🤖 BANH-MI-GUARD — LLM CONFIGURATION WIZARD[/bold cyan]\n"
-        "[dim]Press Enter to accept default values in brackets [ ].[/dim]",
-        border_style="cyan"
-    ))
-
-    # Step 1: Select Protocol
+def _wizard_prompt_protocol(current_cfg: GuardConfig) -> tuple[str, List[str]]:
+    """Prompt the user to select an LLM protocol (Step 1)."""
     console.print("\n[bold yellow]Step 1: Select API Protocol[/bold yellow]")
     console.print("  [1] [bold green]OpenAI / OpenAI-Compatible[/bold green] (OpenAI, Ollama, DeepSeek, OpenRouter, vLLM, Local Gateway...)")
     console.print("  [2] [bold magenta]Anthropic[/bold magenta] (Claude API)")
@@ -289,15 +282,15 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
         default={LLMProtocol.OPENAI: "1", LLMProtocol.ANTHROPIC: "2"}.get(current_cfg.llm.protocol, "3"),
         show_choices=False,
     )
-    if choice == "3":
-        return _cli_wizard(current_cfg, found, local, repo_path)
+    return choice, found
 
-    if choice == "1":
-        protocol = LLMProtocol.OPENAI
+
+def _wizard_prompt_api_config(current_cfg: GuardConfig, protocol: LLMProtocol) -> LLMConfig:
+    """Prompt for API base URL, key, model, and timeout (Steps 2-5)."""
+    if protocol == LLMProtocol.OPENAI:
         default_url = current_cfg.llm.base_url if current_cfg.llm.base_url != "https://api.anthropic.com/v1" else "https://api.openai.com/v1"
         default_model = current_cfg.llm.model if current_cfg.llm.model not in ["claude-3-7-sonnet", "claude-3-5-sonnet"] else "gpt-4o"
     else:
-        protocol = LLMProtocol.ANTHROPIC
         default_url = current_cfg.llm.base_url if current_cfg.llm.base_url != "https://api.openai.com/v1" else "https://api.anthropic.com/v1"
         default_model = current_cfg.llm.model if current_cfg.llm.model not in ["gpt-4o", "gpt-4o-mini"] else "claude-3-7-sonnet"
 
@@ -307,14 +300,14 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
         console.print("[dim]• OpenAI: https://api.openai.com/v1\n• Ollama: http://localhost:11434/v1\n• DeepSeek: https://api.deepseek.com/v1\n• Local Gateway: http://127.0.0.1:8090/v1[/dim]")
     else:
         console.print("[dim]• Anthropic: https://api.anthropic.com/v1[/dim]")
-        
+
     base_url = Prompt.ask("Base URL", default=default_url)
 
     # Step 3: API Key
     console.print("\n[bold yellow]Step 3: API Key[/bold yellow]")
     env_key = os.environ.get("OPENAI_API_KEY" if protocol == LLMProtocol.OPENAI else "ANTHROPIC_API_KEY", "")
     key_default = current_cfg.llm.api_key or env_key
-    
+
     if protocol == LLMProtocol.OPENAI and ("localhost" in base_url or "127.0.0.1" in base_url) and not key_default:
         console.print("[dim]Local model detected (Ollama/Gateway). You can press Enter to leave blank if unauthenticated.[/dim]")
         api_key = Prompt.ask("API Key (or Enter to skip)", default="", password=True)
@@ -327,7 +320,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
         console.print("[dim]Examples: gpt-4o, deepseek-chat, muse, qwen2.5-coder:latest[/dim]")
     else:
         console.print("[dim]Examples: claude-3-7-sonnet, claude-3-5-sonnet, claude-3-5-haiku[/dim]")
-        
+
     model = Prompt.ask("Model Name", default=default_model)
 
     # Step 5: Timeout
@@ -339,16 +332,17 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     except ValueError:
         timeout_val = 60.0
 
-    new_llm = LLMConfig(
+    return LLMConfig(
         protocol=protocol,
         base_url=base_url.rstrip("/"),
         api_key=api_key,
         model=model,
         timeout=timeout_val,
     )
-    current_cfg.llm = new_llm
 
-    # Step 6: Test Ping
+
+def _wizard_test_ping(new_llm: LLMConfig) -> bool:
+    """Run connection ping test if user confirms (Step 6). Returns False if discarded."""
     console.print("\n[bold yellow]Step 6: Connection Test (Ping Test)[/bold yellow]")
     do_ping = Confirm.ask("Do you want to test the connection now?", default=True)
     if do_ping:
@@ -361,9 +355,12 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
             console.print(f"[bold red]❌ Connection Failed:[/bold red] {msg}")
             if not Confirm.ask("Do you still want to save this configuration?", default=True):
                 console.print("[yellow]Configuration discarded.[/yellow]")
-                return current_cfg
+                return False
+    return True
 
-    # Step 7: Save & Auto-sync
+
+def _wizard_save_and_sync(current_cfg: GuardConfig, local: bool, repo_path: Optional[Path]) -> None:
+    """Persist wizard configuration and sync to Alibaba OCR if enabled (Step 7)."""
     target_path = save_config(current_cfg, local=local, repo_path=repo_path)
     scope_str = "Local (Repo)" if local else "Global"
     console.print(f"[bold green]💾 Saved {scope_str} configuration at:[/bold green] [dim]{target_path}[/dim]")
@@ -375,14 +372,34 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
             "Run `guard config sync --repo <this repository>` to use this LLM for every OCR review.[/dim yellow]"
         )
     elif current_cfg.ocr.auto_sync:
-        synced, ocr_msg = sync_to_alibaba_ocr(new_llm, current_cfg.ocr.binary_path)
+        synced, ocr_msg = sync_to_alibaba_ocr(current_cfg.llm, current_cfg.ocr.binary_path)
         if synced:
             console.print(f"[bold cyan]🔗 {ocr_msg}[/bold cyan]")
         else:
             console.print(f"[dim yellow]ℹ️  Alibaba OCR Sync: {ocr_msg}[/dim yellow]")
 
-    return current_cfg
 
+def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> GuardConfig:
+    current_cfg = load_config(repo_path)
+    console.print(Panel(
+        "[bold cyan]🤖 BANH-MI-GUARD — LLM CONFIGURATION WIZARD[/bold cyan]\n"
+        "[dim]Press Enter to accept default values in brackets [ ].[/dim]",
+        border_style="cyan"
+    ))
+
+    choice, found = _wizard_prompt_protocol(current_cfg)
+    if choice == "3":
+        return _cli_wizard(current_cfg, found, local, repo_path)
+
+    protocol = LLMProtocol.OPENAI if choice == "1" else LLMProtocol.ANTHROPIC
+    new_llm = _wizard_prompt_api_config(current_cfg, protocol)
+    current_cfg.llm = new_llm
+
+    if not _wizard_test_ping(new_llm):
+        return current_cfg
+
+    _wizard_save_and_sync(current_cfg, local, repo_path)
+    return current_cfg
 
 def print_config_table(config: GuardConfig, path_info: str):
     table = Table(title=f"🛡️ Guard Configuration ({path_info})", show_header=True, header_style="bold cyan")
