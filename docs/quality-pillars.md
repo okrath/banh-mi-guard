@@ -14,6 +14,24 @@ When a repository has no project invariants, guard adds a few generic **template
 
 ---
 
+## Multi-Domain Coverage (FE, BE, Fullstack, Infra, MB)
+
+`guard` detects the repository's domain from the repository itself, scoring several signals instead of taking the first marker file: Node dependencies of every `package.json` (monorepos included), web framework configs, `index.html`, UI component files, `server/`/`api/` directories, Python/Go/Rust/Java manifests, Terraform/Helm/Kubernetes and container files. A Node backend is not reported as frontend, an app with a `Dockerfile` is not infra, and a repository with both a web client and a server is `fullstack`.
+
+The domain selects the **template invariants** used when the repository has no project invariants (most of them are diff heuristics and show as `UNVERIFIED`). The build command is chosen per ecosystem, not per domain:
+
+| Domain | Typical stacks | Template invariants (only without project invariants) | Build / test command guard runs |
+| :--- | :--- | :--- | :--- |
+| **FE** (Frontend) | React, Next.js, Vue, Svelte, Vite | loading / disabled states, keyboard shortcuts (`Escape`, `Enter`), responsive layout | `<pm> run build` (or `check`, else `<pm> test`) |
+| **BE** (Backend) | Go, Python, Node APIs (Fastify, Express, NestJS), Rust | JSON schema compatibility, parameterized SQL, atomic DB transactions | `go test ./...`, `cargo test`, `pytest`, or the package script for Node |
+| **Fullstack** | web client + server in one repository or monorepo | frontend templates | the package script |
+| **Infra** (DevOps) | Terraform, Helm, Kubernetes (IaC-only repositories) | no hardcoded secrets, no 0.0.0.0 DB binding, health checks | `terraform validate`, `docker compose config` |
+| **MB** (Mobile) | Flutter, React Native, iOS, Android | permission flows, SafeArea, offline fallback | `flutter analyze`, `./gradlew test` |
+
+`<pm>` is `pnpm`, `yarn`, `bun` or `npm`, from the lockfile.
+
+---
+
 ## 1. 🛡️ Security & Secrets
 
 | Concern | How | ID |
@@ -36,6 +54,8 @@ When a repository has no project invariants, guard adds a few generic **template
 
 These line rules read added lines only, and skip docs (Markdown and text files, and anything in a `docs/` or `doc/` folder), test files (in a `tests/`, `test/` or `__tests__/` folder, or named `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`), comment lines, trailing comments (`#` in Python, YAML and Dockerfiles, `//` elsewhere, and a `/*` or `<!--` left open, found outside strings; code after a block comment closed on the line is still read), names quoted in prose (``eval()``), lines over 2,000 characters (minified or generated), and in a Dockerfile a `FROM` that names an earlier stage. Text inside strings and docstrings is read like code: a string can hold code that runs, and a security rule would rather report a sentence that mentions `eval(` than miss a call (mark such a line with `guard-allow`). A line that is intended keeps the finding as a LOW note with `guard-allow <RULE>: <reason>` in a comment on it (in a string it counts for nothing) (for example `# guard-allow SEC-005: fixed command, no user input`).
 
+---
+
 ## 2. 🧠 Memory Safety & Resource Leaks
 
 | Concern | How | ID |
@@ -43,11 +63,15 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Resources opened without a guaranteed close (files, sockets, DB connections, child processes); listeners, timers and subscriptions never removed on teardown; caches and collections that only grow; closures that hold large objects (any language) | LLM review | — |
 | A new Kubernetes workload without `resources.limits` | LLM review (`--focus memory`) | — |
 
+---
+
 ## 3. ⚡ Performance & Latency
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
 | Blocking calls inside async or event-loop code; N+1 queries, excessive re-renders, thread lockups (any language) | LLM review | — |
+
+---
 
 ## 4. 🧱 Integrity, Scope & Contracts
 
@@ -63,6 +87,9 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Image without a pinned tag or digest, or `:latest` (YAML `image:`, Dockerfile `FROM`; in an edited Dockerfile a stage defined outside the diff looks like an image: mark that line with `guard-allow`) | Rule | `INFRA-002` (MEDIUM) |
 | API schema compatibility, atomic multi-table writes | LLM review; backend template invariants (UNVERIFIED) | — |
 | The project still builds / tests pass | Build command (`pnpm run build`, `pytest`, `go test ./...`, ...) | build check (blocks on failure) |
+| Diff & baseline snapshot inspection integrity | Git diff inspection | blocks on diff error |
+
+---
 
 ## 5. ♿ Ergonomics & UX
 
@@ -73,6 +100,8 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Image without alt text (an `<img>` tag on one line with no `alt`, `[alt]` or `{alt}`, props not spread) | Rule | `UX-002` (MEDIUM) |
 | A long-running Kubernetes workload with no liveness or readiness probe | LLM review | — |
 | Responsive layout, focus handling, visual feedback, modal dismissal | LLM review (`--focus ux`) | — |
+
+---
 
 ## 6. 🧹 Code & Asset Hygiene (Dead Code Gate)
 
@@ -111,8 +140,8 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 
 ## Scoring and the final verdict
 
-- **Blocks outright** (no LLM can approve): a failed build, a violated invariant, a CRITICAL rule, a file out of scope, and in `--focus dead-code` / `--focus simplicity` any finding of that pillar.
-- Otherwise the heuristic score starts at 10 and loses points for HIGH findings (and, lightly, for hygiene and simplicity findings); below 7.5 the heuristic verdict is REVISE.
+- **Blocks outright** (no LLM can approve): a failed build, a violated invariant, a CRITICAL rule, a file out of scope, a Git diff inspection or snapshot error (surfaced in `diff_summary.error`), with `--full` an OCR review that did not run or a high/critical OCR finding, and in `--focus dead-code` / `--focus simplicity` any finding of that pillar.
+- Otherwise the heuristic score starts at 10 and loses points for HIGH and MEDIUM findings (and for diff inspection errors); below 7.5 the heuristic verdict is REVISE.
 - The configured LLM then reviews the report, the verified evidence and the diff (in parts when it is large) and gives the final `APPROVED` / `REVISE`. If it does not answer, the report says "Heuristic Gate (no LLM review)" and why.
 
 ## Focus flag (`--focus`)
@@ -128,6 +157,12 @@ guard post --focus dead-code     # orphans, commented code, unused symbols (full
 guard post --focus simplicity    # over-engineering, bloat, reinvented wheels
 ```
 The same `--focus` values work with `guard review`.
+
+---
+
+## Releasing (maintainers)
+
+Every version bump updates `pyproject.toml`, `guard/__init__.py` and `docs/index.html` (badge and footer) together (`REL-VERSION-SYNC`). Merge it, then publish a GitHub Release whose tag is the version with a leading `v` (for example `v0.15.0`). The `Publish to PyPI` workflow builds the sdist and wheel and uploads them with PyPI trusted publishing, so no token is stored; it verifies that the release tag matches the package version strings (`pyproject.toml` and `guard/__init__.py`). One-time setup on pypi.org: add a (pending) trusted publisher for project `banh-mi-guard`, owner `okrath`, repository `banh-mi-guard`, workflow `publish.yml`, environment `pypi`, and create the `pypi` environment in the repository settings. A version on PyPI cannot be changed or reused: a mistake is fixed by the next version.
 
 ---
 *Created and maintained by [@okrath](https://github.com/okrath) &mdash; Source code available at [github.com/okrath/banh-mi-guard](https://github.com/okrath/banh-mi-guard).*
