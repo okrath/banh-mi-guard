@@ -125,11 +125,12 @@ def _pre_check_session_and_owner(
     from guard.agent.events import fresh_claim, load_state
     from guard.core.session import describe_owner
     claim = fresh_claim(load_state(target_repo))
-    held_by = superseded.pre.owner if superseded and superseded.pre and isinstance(superseded.pre.owner, dict) else None
-    if held_by and claim and claim["session"] != held_by.get("session"):
+    pre = superseded.pre if superseded else None
+    held_by = pre.owner if pre and isinstance(pre.owner, dict) else None
+    if pre and held_by and claim and claim["session"] != held_by.get("session"):
         console.print(
             f"[bold red]❌ This working tree is held by another agent's guard session[/bold red] "
-            f"({escape(describe_owner(held_by))}, task: {escape(' '.join(superseded.pre.prompt.split())[:80]) if superseded and superseded.pre else ''}).\n"
+            f"({escape(describe_owner(held_by))}, task: {escape(' '.join(pre.prompt.split())[:80])}).\n"
             "Do parallel work in a separate [bold]git worktree add[/bold], or wait until that task is committed. "
             "The user can release it with [bold]guard reset[/bold].")
         return None

@@ -274,9 +274,8 @@ def clean_legacy(repo: Path) -> List[str]:
         if chained is None or not chained.is_file():
             continue
         text = chained.read_text(encoding="utf-8", errors="ignore")
-        assert local is not None
         if is_legacy_whole_file(text):
-            copy = _backup_legacy(local / name, text)
+            copy = _backup_legacy(chained.with_name(name), text)
             chained.unlink()
             messages.append(f"removed the old laya-ocr-guard hook {chained} (copy in {copy})")
         elif strip_legacy_parts(text) != text:

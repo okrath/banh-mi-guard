@@ -258,8 +258,6 @@ def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_
             return failed("OCR returned a result guard cannot read (unexpected JSON shape)")
         if _complete(data, res.returncode):
             break
-    if data is None:
-        return failed("no output from OCR")
     skip = set(skip_files or [])
     violations = []
     dropped = 0

@@ -170,12 +170,14 @@ def run_cmd(
 # the names imported are what the pipeline above looks up here at call time. Run as `python -m guard.cli`,
 # this file is __main__ and registers nothing: its end runs the guard.cli module's main instead.
 if __name__ != "__main__":
-    import guard.commands.agent  # noqa: E402,F401
-    import guard.commands.config  # noqa: E402,F401
+    # isort: off
     import guard.commands.invariants  # noqa: E402,F401
-    import guard.commands.maintenance  # noqa: E402,F401
-    import guard.commands.review  # noqa: E402,F401
+    import guard.commands.config  # noqa: E402,F401
     from guard.commands.setup import print_setup_health  # noqa: E402
+    import guard.commands.review  # noqa: E402,F401
+    import guard.commands.agent  # noqa: E402,F401
+    import guard.commands.maintenance  # noqa: E402,F401
+    # isort: on
 
 
 def _force_utf8_console():
