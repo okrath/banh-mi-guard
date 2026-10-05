@@ -249,6 +249,8 @@ def command_line(command: List[str]) -> str:
 
 def _short_path(path: str) -> Optional[str]:
     """The Windows 8.3 short name of an existing path (no spaces), or None when there is none."""
+    if sys.platform != "win32":
+        return None
     try:
         import ctypes
         buffer = ctypes.create_unicode_buffer(1024)
