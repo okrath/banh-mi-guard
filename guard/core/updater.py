@@ -72,6 +72,81 @@ def get_installed_ocr_version() -> Optional[str]:
         return "installed"
 
 
+def _parse_npm_release_info(data: dict) -> tuple[str, str, Optional[float]]:
+    """Extract latest version, date_display, and age_days from npm registry payload."""
+    latest = data.get("dist-tags", {}).get("latest", "")
+    times = data.get("time", {})
+    upload_iso = times.get(latest)
+
+    age_days: Optional[float] = None
+    date_display = "Unknown"
+    if upload_iso:
+        rel_dt = datetime.fromisoformat(upload_iso.replace("Z", "+00:00"))
+        now_dt = datetime.now(timezone.utc)
+        age_days = (now_dt - rel_dt).total_seconds() / 86400.0
+        date_display = rel_dt.strftime("%Y-%m-%d %H:%M UTC")
+    return latest, date_display, age_days
+
+
+def _evaluate_ocr_update_status(
+    package_name: str,
+    registry: str,
+    installed: Optional[str],
+    latest: str,
+    date_display: str,
+    age_days: Optional[float],
+    quarantine_days: float,
+) -> VersionCheckResult:
+    """Determine the security and update status for an OCR release."""
+    if not installed:
+        return VersionCheckResult(
+            package_name=package_name,
+            registry=registry,
+            installed_version=None,
+            latest_version=latest,
+            release_date=date_display,
+            age_days=age_days,
+            status=UpdateSecurityStatus.NOT_INSTALLED,
+            recommendation="Optional: install via `npm install -g @alibaba-group/open-code-review`",
+        )
+
+    if installed == "installed" or not is_version_newer(latest, installed):
+        return VersionCheckResult(
+            package_name=package_name,
+            registry=registry,
+            installed_version=installed,
+            latest_version=latest,
+            release_date=date_display,
+            age_days=age_days,
+            status=UpdateSecurityStatus.UP_TO_DATE,
+            recommendation="Up-to-date with latest stable release.",
+        )
+
+    # Newer version on npm! Check quarantine period
+    if age_days is not None and age_days < quarantine_days:
+        return VersionCheckResult(
+            package_name=package_name,
+            registry=registry,
+            installed_version=installed,
+            latest_version=latest,
+            release_date=date_display,
+            age_days=age_days,
+            status=UpdateSecurityStatus.QUARANTINE_HOLD,
+            recommendation=f"🛡️ QUARANTINE HOLD: v{latest} released {age_days:.1f}d ago (< {quarantine_days:.0f}d). Retain v{installed} to prevent supply-chain backdoors.",
+        )
+
+    return VersionCheckResult(
+        package_name=package_name,
+        registry=registry,
+        installed_version=installed,
+        latest_version=latest,
+        release_date=date_display,
+        age_days=age_days,
+        status=UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE,
+        recommendation=f"⬆️ Safe upgrade available (Released {age_days:.1f}d ago): `npm install -g {package_name}`",
+    )
+
+
 def check_ocr_update(quarantine_days: float = 3.0, timeout: float = 4.0) -> VersionCheckResult:
     """
     Check npm registry for `@alibaba-group/open-code-review` and verify against quarantine period.
@@ -91,65 +166,9 @@ def check_ocr_update(quarantine_days: float = 3.0, timeout: float = 4.0) -> Vers
                     status=UpdateSecurityStatus.CHECK_FAILED,
                     recommendation=f"HTTP {res.status_code} while querying npm registry",
                 )
-            data = res.json()
-            latest = data.get("dist-tags", {}).get("latest", "")
-            times = data.get("time", {})
-            upload_iso = times.get(latest)
-
-            age_days: Optional[float] = None
-            date_display = "Unknown"
-            if upload_iso:
-                rel_dt = datetime.fromisoformat(upload_iso.replace("Z", "+00:00"))
-                now_dt = datetime.now(timezone.utc)
-                age_days = (now_dt - rel_dt).total_seconds() / 86400.0
-                date_display = rel_dt.strftime("%Y-%m-%d %H:%M UTC")
-
-            if not installed:
-                return VersionCheckResult(
-                    package_name=package_name,
-                    registry=registry,
-                    installed_version=None,
-                    latest_version=latest,
-                    release_date=date_display,
-                    age_days=age_days,
-                    status=UpdateSecurityStatus.NOT_INSTALLED,
-                    recommendation="Optional: install via `npm install -g @alibaba-group/open-code-review`",
-                )
-
-            if installed == "installed" or not is_version_newer(latest, installed):
-                return VersionCheckResult(
-                    package_name=package_name,
-                    registry=registry,
-                    installed_version=installed,
-                    latest_version=latest,
-                    release_date=date_display,
-                    age_days=age_days,
-                    status=UpdateSecurityStatus.UP_TO_DATE,
-                    recommendation="Up-to-date with latest stable release.",
-                )
-
-            # Newer version on npm! Check quarantine period
-            if age_days is not None and age_days < quarantine_days:
-                return VersionCheckResult(
-                    package_name=package_name,
-                    registry=registry,
-                    installed_version=installed,
-                    latest_version=latest,
-                    release_date=date_display,
-                    age_days=age_days,
-                    status=UpdateSecurityStatus.QUARANTINE_HOLD,
-                    recommendation=f"🛡️ QUARANTINE HOLD: v{latest} released {age_days:.1f}d ago (< {quarantine_days:.0f}d). Retain v{installed} to prevent supply-chain backdoors.",
-                )
-
-            return VersionCheckResult(
-                package_name=package_name,
-                registry=registry,
-                installed_version=installed,
-                latest_version=latest,
-                release_date=date_display,
-                age_days=age_days,
-                status=UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE,
-                recommendation=f"⬆️ Safe upgrade available (Released {age_days:.1f}d ago): `npm install -g {package_name}`",
+            latest, date_display, age_days = _parse_npm_release_info(res.json())
+            return _evaluate_ocr_update_status(
+                package_name, registry, installed, latest, date_display, age_days, quarantine_days
             )
 
     except Exception as e:
@@ -161,7 +180,6 @@ def check_ocr_update(quarantine_days: float = 3.0, timeout: float = 4.0) -> Vers
             status=UpdateSecurityStatus.CHECK_FAILED,
             recommendation=f"Failed to query npm registry ({str(e)[:60]})",
         )
-
 
 def perform_ocr_upgrade(force: bool = False, quarantine_days: float = 3.0) -> Tuple[bool, str]:
     """
@@ -194,14 +212,8 @@ def perform_ocr_upgrade(force: bool = False, quarantine_days: float = 3.0) -> Tu
         return False, f"Error running npm install: {str(e)}"
 
 
-def perform_self_upgrade() -> Tuple[bool, str]:
-    """
-    Upgrades banh-mi-guard itself from GitHub.
-    Intelligently detects if installed via pipx or standard pip,
-    uses --force/--force-reinstall to bypass cached builds, and handles
-    Windows file locking on guard.exe with atomic fallback.
-    """
-    repo_url = "git+https://github.com/okrath/banh-mi-guard.git"
+def _upgrade_via_pipx(repo_url: str) -> Optional[Tuple[bool, str]]:
+    """Attempt upgrading via pipx if installed in a pipx environment."""
     is_pipx = (
         "pipx" in sys.prefix.lower()
         or "pipx" in sys.executable.lower()
@@ -209,19 +221,45 @@ def perform_self_upgrade() -> Tuple[bool, str]:
         or bool(os.environ.get("PIPX_BIN_DIR"))
     )
     pipx_bin = shutil.which("pipx")
+    if not (is_pipx and pipx_bin):
+        return None
 
-    if is_pipx and pipx_bin:
-        cmd = [pipx_bin, "install", repo_url, "--force"]
+    cmd = [pipx_bin, "install", repo_url, "--force"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        if proc.returncode == 0:
+            return True, "✅ Successfully upgraded Banh-Mi-Guard via pipx!"
+        err_out = (proc.stderr or "") + (proc.stdout or "")
+        return False, f"pipx upgrade failed: {err_out}"
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"Error upgrading guard via pipx: {str(e)}"
+
+
+def _prepare_windows_exe_backup() -> Optional[Tuple[Path, Path]]:
+    """Rename current guard.exe on Windows to avoid binary locking during pip install."""
+    if sys.platform != "win32":
+        return None
+    guard_bin = shutil.which("guard")
+    if not guard_bin:
+        return None
+    guard_path = Path(guard_bin)
+    if guard_path.suffix.lower() == ".exe" and guard_path.exists():
+        bak_path = guard_path.with_name(f"{guard_path.stem}.old.exe")
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
-            if proc.returncode == 0:
-                return True, "✅ Successfully upgraded Banh-Mi-Guard via pipx!"
-            err_out = (proc.stderr or "") + (proc.stdout or "")
-            return False, f"pipx upgrade failed: {err_out}"
-        except (subprocess.SubprocessError, OSError) as e:
-            return False, f"Error upgrading guard via pipx: {str(e)}"
+            if bak_path.exists():
+                try:
+                    bak_path.unlink()
+                except OSError:
+                    pass
+            guard_path.rename(bak_path)
+            return (guard_path, bak_path)
+        except OSError:
+            pass
+    return None
 
-    # Standard pip fallback with --force-reinstall and Windows binary lock mitigation
+
+def _upgrade_via_pip(repo_url: str) -> Tuple[bool, str]:
+    """Standard pip fallback with --force-reinstall and Windows binary lock mitigation."""
     pip_cmd = [
         sys.executable,
         "-m",
@@ -232,25 +270,7 @@ def perform_self_upgrade() -> Tuple[bool, str]:
         "--no-cache-dir",
         repo_url,
     ]
-
-    exe_renamed: Optional[Tuple[Path, Path]] = None
-    if sys.platform == "win32":
-        guard_bin = shutil.which("guard")
-        if guard_bin:
-            guard_path = Path(guard_bin)
-            if guard_path.suffix.lower() == ".exe" and guard_path.exists():
-                bak_path = guard_path.with_name(f"{guard_path.stem}.old.exe")
-                try:
-                    if bak_path.exists():
-                        try:
-                            bak_path.unlink()
-                        except OSError:
-                            pass
-                    guard_path.rename(bak_path)
-                    exe_renamed = (guard_path, bak_path)
-                except OSError:
-                    pass
-
+    exe_renamed = _prepare_windows_exe_backup()
     try:
         proc = subprocess.run(pip_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if proc.returncode == 0:
@@ -280,8 +300,55 @@ def perform_self_upgrade() -> Tuple[bool, str]:
                 exe_renamed[1].rename(exe_renamed[0])
             except OSError:
                 pass
+
+
+def perform_self_upgrade() -> Tuple[bool, str]:
+    """
+    Upgrades banh-mi-guard itself from GitHub.
+    Intelligently detects if installed via pipx or standard pip,
+    uses --force/--force-reinstall to bypass cached builds, and handles
+    Windows file locking on guard.exe with atomic fallback.
+    """
+    repo_url = "git+https://github.com/okrath/banh-mi-guard.git"
+    pipx_res = _upgrade_via_pipx(repo_url)
+    if pipx_res is not None:
+        return pipx_res
+    return _upgrade_via_pip(repo_url)
 def get_update_cache_path() -> Path:
     return Path.home() / ".guard" / "update_cache.json"
+
+
+def _read_cached_guard_update(cache_path: Path) -> Optional[VersionCheckResult]:
+    """Read update check result from disk cache if younger than 12 hours."""
+    if not cache_path.is_file():
+        return None
+    try:
+        cached_data = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_age = time.time() - cached_data.get("timestamp", 0)
+        if cache_age < 43200:  # 12 hours
+            return VersionCheckResult.model_validate(cached_data["result"])
+    except (OSError, AttributeError, ValueError, KeyError, TypeError, ValidationError):
+        pass
+    return None
+
+
+def _save_cached_guard_update(cache_path: Path, result: VersionCheckResult) -> None:
+    """Save update check result to disk cache."""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_payload = {
+            "timestamp": time.time(),
+            "result": result.model_dump(mode="json"),
+        }
+        cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _parse_github_pyproject_version(text: str) -> Optional[str]:
+    """Extract version string from pyproject.toml content."""
+    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', text)
+    return m.group(1).strip() if m else None
 
 
 def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> VersionCheckResult:
@@ -296,14 +363,10 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
     registry = "github"
     cache_path = get_update_cache_path()
 
-    if not force and cache_path.is_file():
-        try:
-            cached_data = json.loads(cache_path.read_text(encoding="utf-8"))
-            cache_age = time.time() - cached_data.get("timestamp", 0)
-            if cache_age < 43200:  # 12 hours
-                return VersionCheckResult.model_validate(cached_data["result"])
-        except (OSError, AttributeError, ValueError, KeyError, TypeError, ValidationError):
-            pass
+    if not force:
+        cached = _read_cached_guard_update(cache_path)
+        if cached is not None:
+            return cached
 
     url = "https://raw.githubusercontent.com/okrath/banh-mi-guard/main/pyproject.toml"
     headers = {"User-Agent": f"guard-cli/{installed}"}
@@ -323,8 +386,8 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
                     recommendation=f"HTTP {res.status_code} while querying GitHub",
                 )
 
-            m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', res.text)
-            if not m:
+            latest = _parse_github_pyproject_version(res.text)
+            if not latest:
                 return VersionCheckResult(
                     package_name=package_name,
                     registry=registry,
@@ -333,7 +396,6 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
                     recommendation="Could not parse remote version from GitHub",
                 )
 
-            latest = m.group(1).strip()
             if is_version_newer(latest, installed):
                 status = UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE
                 rec = f"New version v{latest} available! Run 'guard update self' to upgrade."
@@ -349,17 +411,7 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
                 status=status,
                 recommendation=rec,
             )
-
-            try:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_payload = {
-                    "timestamp": time.time(),
-                    "result": result.model_dump(mode="json"),
-                }
-                cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
-            except (OSError, TypeError, ValueError):
-                pass
-
+            _save_cached_guard_update(cache_path, result)
             return result
 
     except Exception as e:
@@ -371,7 +423,6 @@ def check_guard_self_update(timeout: float = 3.0, force: bool = False) -> Versio
             status=UpdateSecurityStatus.CHECK_FAILED,
             recommendation=f"Network notice ({str(e)[:50]})",
         )
-
 
 def get_cached_update_notice() -> Optional[str]:
     """

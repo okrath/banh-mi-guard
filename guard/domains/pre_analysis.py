@@ -186,6 +186,67 @@ def _scoped_files(repo: Path, scope: List[str]) -> Tuple[List[str], set]:
     return sorted(listed | set(literal)), listed
 
 
+def _validate_scoped_path(repo: Path, resolved_repo: Path, rel_path: str, listed: set) -> tuple[Optional[Path], Optional[str]]:
+    """Validate a candidate scoped path. Returns (resolved_path_or_none, skip_note_or_none)."""
+    p_raw = Path(rel_path)
+    if p_raw.is_absolute() or rel_path.startswith(("/", "\\")):
+        return None, f"{rel_path} skipped: absolute path"
+
+    p = repo / rel_path
+
+    is_sym = False
+    try:
+        is_sym = p.is_symlink()
+    except OSError:
+        pass
+
+    try:
+        resolved_p = p.resolve()
+        is_outside = not resolved_p.is_relative_to(resolved_repo)
+    except (ValueError, OSError, AttributeError):
+        is_outside = True
+
+    if is_sym:
+        if is_outside:
+            return None, f"{rel_path} skipped: symlink pointing outside repository"
+        return None, f"{rel_path} skipped: symlink"
+
+    if is_outside:
+        return None, f"{rel_path} skipped: outside repository"
+
+    if not p.is_file():
+        return None, None
+    if rel_path.replace("\\", "/") not in listed:
+        return None, f"{rel_path} skipped: ignored by Git or not in the repository"
+
+    return p, None
+
+
+def _read_file_capped(p: Path, rel_path: str, allowed: int) -> tuple[Optional[str], Optional[str]]:
+    """Read file content capped by allowed characters. Returns (content, cut_or_skip_note)."""
+    try:
+        with open(p, "rb") as f_bin:
+            first_chunk = f_bin.read(4096)
+        if b"\x00" in first_chunk:
+            return None, f"{rel_path} skipped: binary"
+    except OSError:
+        return None, None
+
+    try:
+        file_size = p.stat().st_size
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(allowed + 1)
+    except OSError:
+        return None, None
+
+    note = None
+    if len(content) > allowed:
+        content = content[:allowed]
+        note = f"{rel_path} cut to {allowed} of {file_size} bytes"
+
+    return content, note
+
+
 def _read_scoped_files(repo: Path, scope: List[str]) -> Tuple[str, List[str]]:
     """
     Read scoped files capped at MAX_TOTAL_FILE_CHARS total and MAX_PER_FILE_CHARS per file.
@@ -203,63 +264,20 @@ def _read_scoped_files(repo: Path, scope: List[str]) -> Tuple[str, List[str]]:
             notes.append(f"{rel_path} omitted: overall {MAX_TOTAL_FILE_CHARS} character budget reached")
             continue
 
-        p_raw = Path(rel_path)
-        if p_raw.is_absolute() or rel_path.startswith(("/", "\\")):
-            notes.append(f"{rel_path} skipped: absolute path")
+        p, skip_note = _validate_scoped_path(repo, resolved_repo, rel_path, listed)
+        if skip_note:
+            notes.append(skip_note)
             continue
-
-        p = repo / rel_path
-
-        is_sym = False
-        try:
-            is_sym = p.is_symlink()
-        except OSError:
-            pass
-
-        try:
-            resolved_p = p.resolve()
-            is_outside = not resolved_p.is_relative_to(resolved_repo)
-        except (ValueError, OSError, AttributeError):
-            is_outside = True
-
-        if is_sym:
-            if is_outside:
-                notes.append(f"{rel_path} skipped: symlink pointing outside repository")
-            else:
-                notes.append(f"{rel_path} skipped: symlink")
-            continue
-
-        if is_outside:
-            notes.append(f"{rel_path} skipped: outside repository")
-            continue
-
-        if not p.is_file():
-            continue
-        if rel_path.replace("\\", "/") not in listed:
-            notes.append(f"{rel_path} skipped: ignored by Git or not in the repository")
-            continue
-
-        try:
-            with open(p, "rb") as f_bin:
-                first_chunk = f_bin.read(4096)
-            if b"\x00" in first_chunk:
-                notes.append(f"{rel_path} skipped: binary")
-                continue
-        except OSError:
+        if p is None:
             continue
 
         remaining_budget = MAX_TOTAL_FILE_CHARS - total_chars
         allowed = min(MAX_PER_FILE_CHARS, remaining_budget)
-        try:
-            file_size = p.stat().st_size
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(allowed + 1)
-        except OSError:
+        content, cut_note = _read_file_capped(p, rel_path, allowed)
+        if cut_note:
+            notes.append(cut_note)
+        if content is None:
             continue
-
-        if len(content) > allowed:
-            content = content[:allowed]
-            notes.append(f"{rel_path} cut to {allowed} of {file_size} bytes")
 
         total_chars += len(content)
         sections.append(f"--- File: {rel_path} ---\n{content}\n")
@@ -394,22 +412,87 @@ def _save_cache(guard_dir: Path, key: str, raw_response: str) -> None:
         pass
 
 
+def _parse_llm_header_line(
+    line: str,
+    upper: str,
+    counts: dict[str, int],
+    state: dict[str, Any],
+) -> tuple[bool, int]:
+    """Parses one line before CONTRACTS, mutating counts and state in place.
+    Returns (entered_contracts, malformed_delta)."""
+    if upper.startswith("TASK_DOMAIN:"):
+        counts["task"] += 1
+        malformed = 1 if counts["task"] > 1 else 0
+        dom = VALID_DOMAINS.get(line.split(":", 1)[1].strip().lower())
+        state["task_domain"] = dom
+        return False, malformed + (1 if dom is None else 0)
+
+    if upper.startswith("REPO_DOMAIN:"):
+        counts["repo"] += 1
+        malformed = 1 if counts["repo"] > 1 else 0
+        dom = VALID_DOMAINS.get(line.split(":", 1)[1].strip().lower())
+        state["repo_domain"] = dom
+        return False, malformed + (1 if dom is None else 0)
+
+    if upper.startswith("REASON:"):
+        counts["reason"] += 1
+        malformed = 1 if counts["reason"] > 1 else 0
+        r_val = line.split(":", 1)[1].strip()
+        if r_val:
+            state["reason"] = r_val
+        return False, malformed + (1 if not r_val else 0)
+
+    if upper.startswith("CONTRACTS:"):
+        counts["contracts"] += 1
+        malformed = 1 if upper != "CONTRACTS:" else 0
+        if counts["task"] != 1 or counts["repo"] != 1 or counts["reason"] != 1:
+            malformed += 1
+        return True, malformed
+
+    return False, 1
+
+
+def _parse_contract_line(
+    line: str,
+    headers: tuple[str, ...],
+    contracts: List[DomainContract],
+    counts: dict[str, int],
+) -> int:
+    """Parse one line in the CONTRACTS section, mutating contracts and counts.
+    Returns malformed_delta."""
+    check_line = line[1:].strip() if line.startswith("-") else line
+    if any(check_line.upper().startswith(h) for h in headers):
+        return 1
+
+    counts["contract_lines"] += 1
+    if not line.startswith("-"):
+        return 1
+
+    item = line[1:].strip()
+    if item.lower() == "none":
+        counts["none"] += 1
+        return 0
+
+    parts = [p.strip() for p in item.split("|", 3)]
+    if len(parts) == 4 and all(parts):
+        cat, name, file_sym, desc = parts
+        contracts.append(DomainContract(
+            category=cat,
+            name=name,
+            description=f"[{file_sym}] {desc}",
+        ))
+        return 0
+
+    return 1
+
+
 def _parse_llm_response(text: str) -> Tuple[Optional[DomainType], Optional[DomainType], Optional[str], List[DomainContract], int, bool]:
-    task_domain: Optional[DomainType] = None
-    repo_domain: Optional[DomainType] = None
-    reason: Optional[str] = None
     contracts: List[DomainContract] = []
     malformed_count = 0
     in_contracts = False
     has_contracts_section = False
-    contract_lines_count = 0
-    none_count = 0
-
-    task_domain_count = 0
-    repo_domain_count = 0
-    reason_count = 0
-    contracts_count = 0
-
+    counts = {"task": 0, "repo": 0, "reason": 0, "contracts": 0, "contract_lines": 0, "none": 0}
+    state: dict[str, Any] = {"task_domain": None, "repo_domain": None, "reason": None}
     headers = ("TASK_DOMAIN:", "REPO_DOMAIN:", "REASON:", "CONTRACTS:")
 
     for raw_line in text.splitlines():
@@ -418,82 +501,29 @@ def _parse_llm_response(text: str) -> Tuple[Optional[DomainType], Optional[Domai
             continue
         upper = line.upper()
         if not in_contracts:
-            if upper.startswith("TASK_DOMAIN:"):
-                task_domain_count += 1
-                if task_domain_count > 1:
-                    malformed_count += 1
-                val = line.split(":", 1)[1].strip().lower()
-                task_domain = VALID_DOMAINS.get(val)
-                if task_domain is None:
-                    malformed_count += 1
-            elif upper.startswith("REPO_DOMAIN:"):
-                repo_domain_count += 1
-                if repo_domain_count > 1:
-                    malformed_count += 1
-                val = line.split(":", 1)[1].strip().lower()
-                repo_domain = VALID_DOMAINS.get(val)
-                if repo_domain is None:
-                    malformed_count += 1
-            elif upper.startswith("REASON:"):
-                reason_count += 1
-                if reason_count > 1:
-                    malformed_count += 1
-                r_val = line.split(":", 1)[1].strip()
-                if r_val:
-                    reason = r_val
-                else:
-                    malformed_count += 1
-            elif upper.startswith("CONTRACTS:"):
-                contracts_count += 1
-                if upper != "CONTRACTS:":
-                    malformed_count += 1  # text after the header: not the format asked for
+            entered, delta = _parse_llm_header_line(line, upper, counts, state)
+            malformed_count += delta
+            if entered:
                 in_contracts = True
                 has_contracts_section = True
-                if task_domain_count != 1 or repo_domain_count != 1 or reason_count != 1:
-                    malformed_count += 1
-            else:
-                malformed_count += 1
         else:
-            check_line = line[1:].strip() if line.startswith("-") else line
-            check_upper = check_line.upper()
-            if any(check_upper.startswith(h) for h in headers):
-                malformed_count += 1
-                continue
-            contract_lines_count += 1
-            if not line.startswith("-"):
-                malformed_count += 1
-                continue
-            item = line[1:].strip()
-            if item.lower() == "none":
-                none_count += 1
-                continue
-            parts = [p.strip() for p in item.split("|", 3)]
-            if len(parts) == 4 and all(parts):
-                cat, name, file_sym, desc = parts
-                full_desc = f"[{file_sym}] {desc}"
-                contracts.append(DomainContract(
-                    category=cat,
-                    name=name,
-                    description=full_desc,
-                ))
-            else:
-                malformed_count += 1
+            malformed_count += _parse_contract_line(line, headers, contracts, counts)
 
     if (
         not has_contracts_section
-        or task_domain_count != 1
-        or repo_domain_count != 1
-        or reason_count != 1
-        or contracts_count != 1
+        or counts["task"] != 1
+        or counts["repo"] != 1
+        or counts["reason"] != 1
+        or counts["contracts"] != 1
     ):
         malformed_count += 1
 
-    if in_contracts and contract_lines_count == 0:
+    if in_contracts and counts["contract_lines"] == 0:
         malformed_count += 1
-    if none_count > 0 and contract_lines_count != 1:
+    if counts["none"] > 0 and counts["contract_lines"] != 1:
         malformed_count += 1
 
-    return task_domain, repo_domain, reason, contracts, malformed_count, has_contracts_section
+    return state["task_domain"], state["repo_domain"], state["reason"], contracts, malformed_count, has_contracts_section
 
 
 def _heuristic_fallback(repo: Path, reason: str) -> PreAnalysis:

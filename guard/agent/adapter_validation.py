@@ -190,14 +190,8 @@ def _rule_ok(rule: Any) -> bool:
             and len(json.dumps(rule)) <= 2000)
 
 
-def validate_adapter(adapter: Any) -> List[str]:
-    """
-    Why a proposed adapter cannot be installed (empty: it can). An adapter is data only: it maps a
-    harness's events, fields and answers onto guard's; it never decides what runs or what is allowed.
-    """
-    from guard.agent.events import DEFAULT_FIELDS
-    if not isinstance(adapter, dict):
-        return ["the adapter is not a JSON object"]
+def _validate_adapter_metadata(adapter: dict) -> List[str]:
+    """Validate top-level metadata: special keys, name, title, config path, and detect path."""
     errors: List[str] = []
     for key in ("kind", "install", "source", "protection_note"):  # only an adapter shipped with guard installs a file
         if key in adapter:
@@ -216,11 +210,15 @@ def validate_adapter(adapter: Any) -> List[str]:
         errors.append(NOT_JSON)
     if "detect" in adapter and (not isinstance(adapter["detect"], str) or not _inside_home(adapter["detect"])):
         errors.append("detect: a path inside your home folder")
+    return errors
 
-    hooks = adapter.get("hooks")
+
+def _validate_hooks_list(hooks: Any) -> tuple[List[str], list]:
+    """Validate the hooks array and its individual hook entries."""
+    errors: List[str] = []
     if not isinstance(hooks, list) or not hooks:
         errors.append("hooks: a non-empty list")
-        hooks = []
+        return errors, []
     for i, hook in enumerate(hooks):
         if not isinstance(hook, dict) or not isinstance(hook.get("harness_event"), str) or not WORD.match(hook["harness_event"]):
             errors.append(f"hooks[{i}].harness_event: the harness's event name")
@@ -232,21 +230,12 @@ def validate_adapter(adapter: Any) -> List[str]:
             problem = _entry_problem(hook["entry"], f"hooks[{i}].entry")
             if problem or not _runs_guard(hook["entry"]):
                 errors.append(problem or f'hooks[{i}].entry: needs "command": "{{command_line}}" or "{{program}}"')
-    if adapter.get("hooks_path", "hooks") not in HOOKS_PATHS:
-        errors.append(f"hooks_path: one of {', '.join(HOOKS_PATHS)}")
-    # only text values reach the sets below: a list or object in the proposal is an error, not a crash
-    events = {h["event"] for h in hooks if isinstance(h, dict) and isinstance(h.get("event"), str)}
-    can_block = adapter.get("can_block", [])
-    if not isinstance(can_block, list) or not all(isinstance(e, str) for e in can_block) or not set(can_block) <= events:
-        errors.append("can_block: events the adapter hooks")
+    return errors, hooks
 
-    fields = adapter.get("fields", {})
-    if not isinstance(fields, dict) or any(
-        k not in DEFAULT_FIELDS or not isinstance(v, list) or not all(isinstance(p, str) and len(p) <= 100 for p in v)
-        for k, v in fields.items()
-    ):
-        errors.append(f"fields: lists of payload paths for {', '.join(DEFAULT_FIELDS)}")
 
+def _validate_output_rules(adapter: dict, hooks: list, can_block: list) -> List[str]:
+    """Validate the output action mapping and block rules."""
+    errors: List[str] = []
     output = adapter.get("output")
     if not isinstance(output, dict) or not output or not set(output) <= {"allow", "notify", "block"}:
         errors.append("output: rules for allow, notify and block")
@@ -255,7 +244,12 @@ def validate_adapter(adapter: Any) -> List[str]:
             if not isinstance(rules, dict) or not all(isinstance(k, str) and _rule_ok(r) for k, r in rules.items()):
                 errors.append(f"output.{action}: harness events mapped to {{stdout, stderr, exit}}")
         errors.extend(_block_problems(hooks, can_block, output.get("block")))
+    return errors
 
+
+def _validate_entry_limits_defaults(adapter: dict) -> List[str]:
+    """Validate adapter entry template, limits, and defaults sections."""
+    errors: List[str] = []
     if "entry" not in adapter:  # only a built-in adapter may use Claude Code's shape by default
         errors.append("entry: the JSON of one hook entry as the config file holds it")
     else:
@@ -274,4 +268,38 @@ def validate_adapter(adapter: Any) -> List[str]:
             errors.append(problem)
         elif "hooks.enabled" in adapter["defaults"] and adapter.get("hooks_path") != "hooks.events":
             errors.append("defaults.hooks.enabled: only with hooks_path hooks.events (it would sit among the event lists)")
+    return errors
+
+
+def validate_adapter(adapter: Any) -> List[str]:
+    """
+    Why a proposed adapter cannot be installed (empty: it can). An adapter is data only: it maps a
+    harness's events, fields and answers onto guard's; it never decides what runs or what is allowed.
+    """
+    from guard.agent.events import DEFAULT_FIELDS
+    if not isinstance(adapter, dict):
+        return ["the adapter is not a JSON object"]
+    errors: List[str] = []
+    errors.extend(_validate_adapter_metadata(adapter))
+
+    hook_errors, hooks = _validate_hooks_list(adapter.get("hooks"))
+    errors.extend(hook_errors)
+
+    if adapter.get("hooks_path", "hooks") not in HOOKS_PATHS:
+        errors.append(f"hooks_path: one of {', '.join(HOOKS_PATHS)}")
+    # only text values reach the sets below: a list or object in the proposal is an error, not a crash
+    events = {h["event"] for h in hooks if isinstance(h, dict) and isinstance(h.get("event"), str)}
+    can_block = adapter.get("can_block", [])
+    if not isinstance(can_block, list) or not all(isinstance(e, str) for e in can_block) or not set(can_block) <= events:
+        errors.append("can_block: events the adapter hooks")
+
+    fields = adapter.get("fields", {})
+    if not isinstance(fields, dict) or any(
+        k not in DEFAULT_FIELDS or not isinstance(v, list) or not all(isinstance(p, str) and len(p) <= 100 for p in v)
+        for k, v in fields.items()
+    ):
+        errors.append(f"fields: lists of payload paths for {', '.join(DEFAULT_FIELDS)}")
+
+    errors.extend(_validate_output_rules(adapter, hooks, can_block))
+    errors.extend(_validate_entry_limits_defaults(adapter))
     return errors
