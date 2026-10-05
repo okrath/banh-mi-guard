@@ -424,7 +424,7 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
       </p>
       <div class="card" style="margin-top: 16px;">
         <strong>🧾 No diff in your repository:</strong> inside a repository guard writes only in <code>.git</code> and the Git-excluded <code>.guard/</code> folder (local invariants, sessions, reports). Repository files (agent docs, hooks kept in the tree such as <code>.husky/</code>, <code>guard.invariants.json</code>) are only read; <code>guard doctor</code> tells you what to change. Where guard is asked to write agent docs, it appends a marked block and keeps your content (<code>.guard.bak</code> backup).<br><br>
-        <strong>🔒 State isolation &amp; signed approvals:</strong> approvals are cryptographically signed with HMAC-SHA256 (<code>~/.guard/approval.key</code>). Automated agent edit tools are refused on any <code>.guard/</code> path, shell modifications to <code>.guard/session.json</code> trigger notifications, and unsigned approvals from older sessions must be re-posted before committing.
+        <strong>🔒 State isolation &amp; signed approvals:</strong> approvals are cryptographically signed with HMAC-SHA256 (<code>$GUARD_HOME/approval.key</code>). Automated agent edit tools are blocked on <code>.guard/</code>, and unsigned approvals are refused on commit. See <a href="architecture.md#4-security-model--state-integrity">Architecture: Security Model</a>.
       </div>
       <p style="margin-top: 16px;">After an upgrade, <code>guard update self</code> refreshes what guard installed and prints a setup check; <code>guard doctor</code> shows the same check at any time.</p>
     </section>

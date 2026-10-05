@@ -87,7 +87,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 | Image without a pinned tag or digest, or `:latest` (YAML `image:`, Dockerfile `FROM`; in an edited Dockerfile a stage defined outside the diff looks like an image: mark that line with `guard-allow`) | Rule | `INFRA-002` (MEDIUM) |
 | API schema compatibility, atomic multi-table writes | LLM review; backend template invariants (UNVERIFIED) | — |
 | The project still builds / tests pass | Build command (`pnpm run build`, `pytest`, `go test ./...`, ...) | build check (blocks on failure) |
-| Diff & baseline snapshot inspection integrity | Git diff inspection | blocks on diff error |
+| Diff & baseline snapshot inspection integrity | Git diff inspection | blocks on diff error (see [Scoring and the final verdict](#scoring-and-the-final-verdict)) |
 
 ---
 
@@ -107,7 +107,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| New files that nothing references in any language's code or config (a Go file also counts as referenced through its package directory), draft names (`*.tmp`, `*backup*`, `temp_*`) | Rule | `DEAD-001` |
+| New files that nothing references in any language's code or config (a Go file also counts as referenced through its package directory; MEDIUM), draft or scratchpad names (`*.tmp`, `*backup*`, `temp_*`, `test_scratch*`; HIGH) | Rule | `DEAD-001` (HIGH / MEDIUM) |
 | A removed string key (`case 'edit':`), export or CSS class that is still referenced somewhere in the repository | Rule | `DEAD-REF` (HIGH) |
 | Commented-out code, unused imports and private functions (any language) | LLM review | — |
 
@@ -117,7 +117,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| Redundant packages when stdlib or the runtime suffices, matched as whole names: npm (`is-odd`, `uuid`, `mkdirp`, `rimraf`), Python (`pathlib2`, `mock`), Go (`github.com/pkg/errors`, not `// indirect` modules), Rust (`lazy_static`, `once_cell`), Java/Kotlin (`joda-time`), PHP (`paragonie/random_compat`), .NET (`System.ValueTuple`); Gemfile, pubspec.yaml and Package.swift list none yet; also with `--focus simplicity` | Rule | `LAZY-001` |
+| Redundant packages when stdlib or the runtime suffices, matched as whole names: npm (`is-odd`, `uuid`, `mkdirp`, `rimraf`), Python (`pathlib2`, `mock`), Go (`github.com/pkg/errors`, not `// indirect` modules), Rust (`lazy_static`, `once_cell`), Java/Kotlin (`joda-time`), PHP (`paragonie/random_compat`), .NET (`System.ValueTuple`); Gemfile, pubspec.yaml and Package.swift list none yet; also with `--focus simplicity` | Rule | `LAZY-001` (HIGH) |
 | Over-engineering (pass-through wrappers, one-method classes, reinvented standard helpers in any language) | LLM review | — |
 | Net lines added or removed | Informational only (deleting code earns no score bonus) | `NET-LOC` |
 
@@ -141,7 +141,7 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 ## Scoring and the final verdict
 
 - **Blocks outright** (no LLM can approve): a failed build, a violated invariant, a CRITICAL rule, a file out of scope, a Git diff inspection or snapshot error (surfaced in `diff_summary.error`), with `--full` an OCR review that did not run or a high/critical OCR finding, and in `--focus dead-code` / `--focus simplicity` any finding of that pillar.
-- Otherwise the heuristic score starts at 10 and loses points for HIGH and MEDIUM findings (and for diff inspection errors); below 7.5 the heuristic verdict is REVISE.
+- **Heuristic score:** starts at 10.0 and docks points for CRITICAL and HIGH rule violations, code hygiene (`DEAD-*`), simplicity (`LAZY-*`), out-of-scope files, invariant check failures, and Git diff inspection errors (which dock 5.0 points, dropping the score below 7.5 and forcing REVISE). Code hygiene and simplicity findings cost lightly compared to stability or security warnings. MEDIUM findings do not lower the score (they are advisory follow-ups). If the heuristic score falls below 7.5, the heuristic verdict is `REVISE`.
 - The configured LLM then reviews the report, the verified evidence and the diff (in parts when it is large) and gives the final `APPROVED` / `REVISE`. If it does not answer, the report says "Heuristic Gate (no LLM review)" and why.
 
 ## Focus flag (`--focus`)

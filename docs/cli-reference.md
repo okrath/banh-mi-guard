@@ -79,6 +79,8 @@ guard pre "<prompt>" [options]
 * `--allow-dirty`: Start although files are already modified. They are snapshotted (`git stash create`, working tree untouched, pinned at `refs/guard/baseline`) and reported as pre-existing; post reviews only the edits made after pre (diff against the snapshot), marks untouched files `PRE-EXISTING`, and raises `SCOPE-003` as a MEDIUM notice. If baseline snapshot creation fails (e.g. repository has no commits or no tracked modifications), the failure reason is recorded in the pre-task note, and post falls back to reviewing the full diff.
 * `--force`: Restart an unfinished (pre without post) or rejected (`REVISE`) session. The restart keeps its baseline, snapshot, base commit, scope and locked invariants, is listed in the reports, and files covered only by scope added in the restart fail as `SCOPE-004`. Stashing, restarting and popping, or committing mid-task, is still audited, because post diffs against the base commit recorded at the first pre.
 
+*Output:* Records the scope, the base commit (and a baseline snapshot with `--allow-dirty`), detects the repository domain, locks the invariants and evaluates them once as a baseline, and writes `### 🔍 PRE-TASK IMPACT NOTE` to `.guard/PRE_TASK_NOTE.md`.
+
 Pre refuses to start on a dirty tree (without `--allow-dirty`) and over an unfinished or rejected session (without `--force`). Scope is strictly what the prompt names or `--scope` declares; files already dirty are never added to it. With no scope, the post report says scope was not audited instead of flagging every file. Paths come from `git status --porcelain -z`, so renamed files and names with spaces or Vietnamese characters are tracked correctly. Globs are accepted only via `--scope`: prose such as "do not edit *.css" never widens scope.
 
 ---
@@ -98,20 +100,21 @@ guard post [options]
 * `--hook`: Git-hook mode. Skips when the repository has no guard session or when guard is not on `PATH`; with an approved session, passes only when staged/committed changes match what was approved. Never runs OCR.
 * `--full`: Full review. Adds an Alibaba OCR review of the task's changes (it reads the repository, costs tokens, takes minutes; see details below). Without it the report says "Alibaba OCR: not run", and an approved report tells the agent to ask you before committing whether you want this full review.
 
+*Output:* Inspects git diff, detects out-of-scope and deleted files, scans the built-in rules and code hygiene, runs the Alibaba OCR review (only with `--full`), executes the build command, runs invariant checks, and requests **Final Gate Approval from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
+
 ### Inspection Pipeline & Gate Decisions:
 Post audits against the base commit recorded at pre, runs the build command, invariant checks and the removed-symbol reference check, then asks the LLM.
-- **Diff & Baseline Snapshot Errors Force REVISE:** If Git diff inspection or baseline snapshot diff inspection fails, the error is surfaced in `diff_summary.error` and docks 5.0 points from the heuristic score, forcing a `REVISE` verdict. If snapshot creation failed at pre, the report details why and reviews the full diff.
-- **Heuristic vs LLM Gate:** The report names the gate that actually ran. It says "LLM Gate" only when the LLM answered. Otherwise it says "Heuristic Gate (no LLM review)" and records the reason (`llm_error`, `review_mode` in `.guard/session.json`), for example a timeout or a model that refused to review a part. A heuristic REVISE (failed build, violated invariant, CRITICAL rule, out-of-scope file, diff inspection error, with `--full` an OCR review that did not run or a high/critical OCR finding, or a score below 7.5) is final; otherwise the LLM decides.
+- **Diff & Baseline Snapshot Errors Force REVISE:** If Git diff inspection or baseline snapshot diff inspection fails, the error is surfaced in `diff_summary.error` and docks 5.0 points from the heuristic score, forcing a `REVISE` verdict (see [Quality Pillars: Scoring and the final verdict](quality-pillars.md#scoring-and-the-final-verdict)). If snapshot creation failed at pre, the report details why and reviews the full diff.
+- **Heuristic vs LLM Gate:** The report names the gate that actually ran. It says "LLM Gate" only when the LLM answered. Otherwise it says "Heuristic Gate (no LLM review)" and records the reason (`llm_error`, `review_mode` in `.guard/session.json`), for example a timeout or a model that refused to review a part. A heuristic REVISE (outright blockers such as build failure, violated invariant, CRITICAL rule, out-of-scope file, diff error, or score below 7.5; see [Quality Pillars](quality-pillars.md#scoring-and-the-final-verdict)) is final; otherwise the LLM decides.
 - **Large Diff Handling:** Large diffs are reviewed in parts of up to 80k characters (one REVISE rejects the whole diff); deleted files are sent as a one-line note; an answer that ignores the SCORE/VERDICT format is retried once. A review request has no time limit: AI review takes as long as it takes, and it ends when the LLM answers or its provider returns an error (`llm.timeout` applies only to `guard config test` pings). Deleting code earns no score bonus.
 - **Removed Symbol References (`DEAD-REF`):** Removals that a compiler cannot see are checked over the whole repository: every string key (`case 'edit':`), export and CSS class deleted by the diff is searched for. One that is no longer defined but still referenced raises `DEAD-REF` (HIGH) with the locations. The summary line goes into every LLM review part as verified evidence.
 - **HTML Sinks (`SEC-003`):** Checks every assignment on a line, and a comment that mentions "sanitize" does not silence it. Only an empty literal, a value that is exactly one `DOMPurify.sanitize(...)` call, or an explicit `// guard-allow SEC-003: <reason>` exempts a line, and that marker is still listed as a `LOW` finding.
 - **Alibaba OCR review (`guard post --full`):** OCR is optional: a plain `guard post` does not run it and the report says "Alibaba OCR: not run". When a plain `guard post` is approved, the report tells the agent to ask you before committing whether you want a full review with OCR: say yes and it runs `guard post --full`, say no and the gate approval is enough. Asking for a full review at any time also runs it; Git hooks never run it. `guard config ocr always` runs it on every post and `guard config ocr optional` switches that off; only you can run `guard config ocr`, in an interactive terminal. With `--full`, guard runs `ocr review` from the base commit recorded at pre to a snapshot of the working tree, so commits made mid-task, unstaged edits and new files are all reviewed (the snapshot is a Git object built in a throwaway index; your index, working tree and branches are not touched). The task prompt is passed as `--background`. It takes minutes, not seconds, and has no time limit: guard passes `--timeout 0` and sets OCR's per-request limit, which OCR cannot switch off, to ten years (`OCR_LLM_TIMEOUT`, overriding a shorter value in the environment), so the review ends only when OCR finishes or reports the provider's error; Ctrl+C stops it. A high or critical OCR finding blocks (REVISE); medium and low findings are listed and passed to the LLM gate. OCR not running (not installed, a provider error, a partial review) is `OCR-RUN` (HIGH) and also blocks: the report says "did not run" with the reason, never a pass. Findings on files that were already dirty before pre and that the task left untouched are dropped, and the report counts them; a dirty file the task edits is reviewed like any other. A partial review (the provider failed on some files) is resumed once with `--resume`, so only the failed files run again. A gateway that drops parallel requests needs a lower `ocr.concurrency` in `~/.guard/config.json` (0 keeps OCR's default of 8).
 - **Commit Line:** The post report of approved work ends with a **Commit** line telling the agent which mode is set (`auto` or `ask`); see [guard config commit](#5-guard-config).
 ### Signed Approvals & State Protection:
-- **HMAC Signed Approvals:** Approvals are cryptographically signed using HMAC-SHA256 with a private key stored in `~/.guard/approval.key` (32 bytes, created atomically on first use, file mode 0600 on POSIX). The signature covers the repository path, session ID, and approved file content fingerprints.
-- **Refusal of `.guard/` Edits:** Automated agent edit tools (`edit`, `write`, `multiedit`, `notebookedit`) targeting `.guard` or any path under `.guard/` are immediately blocked (`Guard: guard's state is written only by guard commands.`).
-- **Session Tamper Detection:** When shell commands modify `.guard/session.json` outside of legitimate guard commands, guard issues an explicit warning notification.
-- **Older / Unsigned Sessions Must Post Again:** Sessions from older guard versions or sessions lacking a valid HMAC approval signature are rejected on agent commit and stop hooks (`Guard: this approval is missing a valid signature. Run guard post again before committing.`). Agents must run `guard post` again to obtain a valid signed approval.
+Approvals are cryptographically signed using HMAC-SHA256, automated agent edit tools targeting `.guard/` are blocked, shell modifications to `session.json` trigger warnings, and unsigned or older approvals are rejected on agent commit, stop hooks, and Git pre-commit hooks (`guard post --hook`).
+
+For complete cryptographic signing rules (`$GUARD_HOME/approval.key`, default `~/.guard/approval.key`), state isolation, and tamper protection specifications, see [Architecture: Security Model & State Integrity](architecture.md#4-security-model--state-integrity).
 ---
 
 ## 3. `guard run`
@@ -122,7 +125,7 @@ Executes the automated Sandwich Pattern around any command.
 guard run "<prompt>" -- <command...>
 ```
 
-Accepts the same pre-task options: `--scope`, `--allow-dirty`, `--force`.
+Accepts the same pre-task options: `--scope`, `--allow-dirty`, `--force`. The agent wrapper script (`.guard/bin/guard-exec`) accepts these same pre-task flags, reading them from `GUARD_PRE_ARGS`.
 
 ### Example:
 ```bash
@@ -177,8 +180,16 @@ guard config commit ask    # the agent asks you for every commit message
 **LLM Configuration Providers:**
 1. **OpenAI / OpenAI-Compatible**: OpenAI, **Ollama** (`http://localhost:11434/v1`), **DeepSeek** (`https://api.deepseek.com/v1`), OpenRouter, vLLM, or Local Gateways (`http://127.0.0.1:8090/v1`).
 2. **Anthropic**: Claude API (any current Claude model id).
-3. **Your own agent CLI instead of an API key.** `guard config llm` offers a third choice, *My agent CLI*: the review gate then asks `claude`, `codex` or `omp` on this machine (`guard agent add` offers it for the agent it adds) (your subscription answers, no key or gateway). Guard sends one prompt and reads one answer, with the CLI's tools off (`claude -p --tools ""`) or read-only (`codex exec --sandbox read-only`), in an empty temporary folder outside any repository. `guard config test` checks it without a review prompt: the CLI's sign-in (`claude auth status`, `codex login status`) and its model list (`codex debug models` reads the catalog locally; `claude -p /model` usually answers without a model call), which `guard config llm` also offers to pick the model. It also answers the Alibaba OCR review through an internal OpenAI-compatible endpoint (127.0.0.1) that starts a throwaway agent session with tools off, outside any repository; when that endpoint fails or is not running, OCR falls back to delegating reviews through the agent CLI with guard's rules and diff chunks in one prompt. A failure in delegation is recorded as `OCR-RUN` (HIGH).
-4. **Credential Security:** Keys are kept in `~/.guard/config.json` (readable by its owner only, mode 0600 on Linux and macOS). `guard config llm --local` does not touch OCR, because OCR's settings apply to the whole machine; run `guard config sync --repo <repository>` if that repository's LLM should serve OCR.
+3. **My agent CLI**: `claude`, `codex` or `omp` on this machine answers the review gate through your subscription, with no API key or gateway:
+   - Claude runs with its tools and your MCP servers off (`claude -p --tools ""`).
+   - Codex runs without your config and without its shell tool, in its read-only sandbox (`codex exec --sandbox read-only`).
+   - omp runs with no tools and no saved session (omp ignores a system prompt in print mode, so the rules lead the prompt, ahead of the marked repository text).
+   - Claude and Codex both execute in an empty folder outside any repository, with the review rules in the CLI's system prompt.
+   - `agy` is not offered: headless it asks for tools that only `--dangerously-skip-permissions` would allow.
+   - `guard agent add claude-code`, `codex` or `omp` offers to make that agent guard's LLM. Guard checks the CLI by its sign-in and model list (`codex debug models` reads its catalog locally; `claude -p /model` usually answers without a model call) and offers those models to choose from.
+   - With *My agent CLI*, `guard post --full` runs Alibaba OCR through the same CLI: guard starts a local endpoint for that review only (127.0.0.1, a random port and token), runs OCR from a throwaway home whose OCR settings point at it (your own OCR settings are never changed), and answers each of OCR's requests with one CLI call that has OCR's tools written into the prompt and returns one tool call, which OCR runs. Two requests run at a time. The report says `answered by the <cli> CLI (tool calls written as text)`, and a CLI that fails is an OCR failure with its reason.
+   - When that review does not run, guard warns and falls back to OCR's delegation mode: `ocr delegate` lists the files and OCR's rules for them (using OCR's rules, not guard's), and the same CLI, tools still off, reviews each rule group's diff in one prompt (in parts of up to 150,000 characters when it is larger). The report then says `answered by the <cli> CLI as the fallback after …` with the first path's reason. A file the fallback did not review (the CLI failed, or its diff is over 150,000 characters) keeps the review failed.
+4. **Credential Security:** Keys are kept in `~/.guard/config.json` (readable by its owner only, mode 0600 on Linux and macOS). When synced to Alibaba OCR, OCR stores the key in plain text in its own configuration file (`~/.opencodereview/config.json`). `guard config llm --local` does not touch OCR, because OCR's settings apply to the whole machine; run `guard config sync --repo <repository>` if that repository's LLM should serve OCR.
 
 ---
 
@@ -190,16 +201,18 @@ guard install --workspace <dir>        # workspace: directives in <dir>/CLAUDE.m
 guard uninstall [--workspace <dir>]    # remove the marked directive blocks and guard's hooks
 ```
 
-Global writes the marked guard block into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and `~/.config/opencode/AGENTS.md`, only for agents whose config directory exists; existing content is kept and backed up once (`*.guard.bak`). Uninstall removes only the marked block (deleting a file that held nothing else) and unsets `core.hooksPath` only when it points at guard's hooks.
+Global writes the marked guard block into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and `~/.config/opencode/AGENTS.md`, only for agents whose config directory exists; existing content is kept and backed up once (`*.guard.bak`). Uninstall removes only the marked block (deleting a file that held nothing else) and unsets `core.hooksPath` only when it points at guard's hooks. With global hooks (`core.hooksPath`), each repository's own hook (and an existing hook kept as `.guard.bak`) in its common `hooks/` directory still runs first, including from linked worktrees. `guard install` offers the agents it finds on this machine (checked adapters for Claude Code, Codex, Cursor, Grok Build, Gemini CLI, Google Antigravity, ZCode, omp, pi and opencode).
 
 **Safe-append for agent docs written by guard:** `guard install` (your global agent docs), `guard install --workspace` (only docs Git does not track) and the legacy `guard hook install --mode agent|all` append a marked block and keep your content, with a one-time `.guard.bak` backup. Uninstall removes only the marked block.
 
-**Guard never creates a diff in your repository:** Inside a repository it writes only where Git tracks nothing: the `.git` directory and the `.guard/` folder, which it keeps out of Git through `.git/info/exclude` (never through `.gitignore`). Files that belong to the repository (agent docs, hooks kept in the tree such as `.husky/`, `guard.invariants.json`) are only read. When one of them needs a change, `guard doctor` tells you what to change; you decide.
+**Guard never creates a diff in your repository:** It writes only in `.git` and the Git-excluded `.guard/` directory; repository files are read-only. See [Architecture: Non-Invasive Repository State](architecture.md#4-security-model--state-integrity).
 
 **Automatic repository setup:** The first time guard runs inside a Git repository (`guard pre`, `guard post`, `guard install`), it:
 - creates the local `.guard/invariants.json` when the repository has no invariants yet, importing the agent docs' invariant section;
 - checks which hook directory Git really uses. With the global hooks nothing is added. When Git runs hooks from inside `.git`, guard makes that `pre-commit` call guard. When the repository keeps its hooks in its own tree (for example husky's `.husky`), guard does not touch them; the setup check shows the one line to add;
 - records the repository in `~/.guard/repos.json`.
+
+Outside a Git repository only the agent directives apply.
 
 ---
 
@@ -207,7 +220,7 @@ Global writes the marked guard block into `~/.claude/CLAUDE.md`, `~/.codex/AGENT
 
 Manages Git hooks, AI Agent directives, and multi-repo workspace protection. `guard hook install` without options runs `guard install`; its options keep the previous per-repository behavior.
 
-After `guard install`, every repository is set up automatically the first time guard runs in it, without creating any repository diff: the local, Git-excluded `.guard/invariants.json` is created when the repository has no invariants, and a guard hook is added only when Git runs hooks from inside `.git`. Hooks kept in the repository tree (e.g. `.husky/`) and repository agent docs are never edited; `guard doctor` shows what to change. `guard hook refresh` rewrites what guard installed earlier to the current version; the same refresh runs once automatically after each upgrade.
+Repositories are set up automatically on first use without creating a diff (see [Automatic repository setup](#6-guard-install--guard-uninstall)). Hooks kept in the repository tree (e.g. `.husky/`) and repository agent docs are never edited; `guard doctor` shows what to change. `guard hook refresh` rewrites what guard installed earlier to the current version; the same refresh runs once automatically after each upgrade.
 
 ```bash
 guard hook install          # same as `guard install` when used without options
@@ -241,7 +254,7 @@ guard hook uninstall [--mode <git|agent|all>] [--global]
 * `--all-repos`: Automatically install Git hooks into all discovered child Git repositories in workspace mode.
 * `--select-repos <indices|names>`: Comma-separated list of child repo numbers (e.g. `2,3,7,8`) or folder names.
 
-Every install mode creates the local `.guard/invariants.json` when the repository has no invariants (see `guard invariants init`) and never overwrites an existing file. Where guard appends directives it keeps the existing content, adds a marked block and makes a one-time `.guard.bak` backup. Linked worktrees are fully supported via `--git-common-dir`.
+Legacy install modes support safe-append for agent directives and automatic invariant initialization (see [Safe-append](#6-guard-install--guard-uninstall) and [guard invariants init](#8-guard-invariants)). Linked worktrees are fully supported via `--git-common-dir`.
 
 ---
 
@@ -272,6 +285,8 @@ guard invariants check
 guard invariants prune
 ```
 
+`guard invariants prune` is user-only and needs an interactive terminal; an agent cannot run it.
+
 Setup creates the local file automatically and never overwrites an existing one. Imported entries start without checks (`UNVERIFIED`) until you add them:
 ```json
 {
@@ -282,7 +297,7 @@ Setup creates the local file automatically and never overwrites an existing one.
   ]
 }
 ```
-Every check runs on the current file contents. `forbid` fails when any matched file contains the regex, and `require` fails when none of them does. A check whose `files` glob matches nothing also fails, and so does an invalid regex. A malformed `guard.invariants.json` makes `guard pre` stop with the parse error. Invariants without checks are reported as `UNVERIFIED` (manual) and never counted as passed. A check that was already failing when pre ran is reported as `BASELINE_FAILED` (a warning), so an old defect does not block unrelated tasks; a check that starts failing during the task blocks approval. When a task adds or edits `guard.invariants.json`, post also self-checks the new file on the current tree (`... (new guard.invariants.json, self-check)`), so a malformed or failing file cannot be committed.
+Every check runs on the current file contents. `forbid` fails when any matched file contains the regex, and `require` fails when none of them does. A check whose `files` glob matches nothing also fails, and so does an invalid regex. A malformed `guard.invariants.json` makes `guard pre` stop with the parse error. Invariants without checks are reported as `UNVERIFIED` (manual) and never counted as passed. A check that was already failing when pre ran is reported as `BASELINE_FAILED` (a warning), so an old defect does not block unrelated tasks; a check that starts failing during the task blocks approval. When a task adds or edits `guard.invariants.json`, post also self-checks the new file on the current tree (`... (new guard.invariants.json, self-check)`), so a malformed or failing file cannot be committed. This repository's own gate-integrity invariants live in [`guard.invariants.json`](../guard.invariants.json).
 
 **Rules learned during review:** The LLM gate may propose durable rules it notices in the diff (`INVARIANTS:` section of its answer). Guard writes a proposal into the local `.guard/invariants.json` (never into the repository's file) only when its id and description are new and its check passes on the current code; it is tagged `"origin": "llm:<session>"`, listed under "Invariants learned in this review", and enforced from the next `guard pre`. To share a learned rule with the team, copy it into `guard.invariants.json` yourself. Rejected proposals are listed with the reason.
 
