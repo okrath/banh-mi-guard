@@ -63,6 +63,7 @@ def test_command_wrappers_are_not_readers():
 
 def test_a_retargeted_symlink_is_a_change(tmp_path):
     import os
+
     from guard.agent.bash import content_hash
     (tmp_path / "a").write_text("same", encoding="utf-8")
     (tmp_path / "b").write_text("same", encoding="utf-8")

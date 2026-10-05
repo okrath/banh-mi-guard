@@ -230,7 +230,7 @@ class SessionManager:
         Return approved_fingerprints if the session's approval signature verifies.
         Returns {} when the signature is missing, wrong, or invalid.
         """
-        if self.is_approval_verified(session):
+        if session and session.post and self.is_approval_verified(session):
             return session.post.approved_fingerprints
         return {}
 

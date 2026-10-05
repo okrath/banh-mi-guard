@@ -63,7 +63,11 @@ CLAUDE_CODE: Dict[str, Any] = {
         },
     },
 }
-from guard.agent.builtins import ADAPTERS as _SHIPPED, EXTENSION_MARKER, EXTENSION_SOURCES  # noqa: E402
+from guard.agent.builtins import ADAPTERS as _SHIPPED  # noqa: E402  # circular dependency between adapter and builtins
+from guard.agent.builtins import (  # noqa: E402  # circular dependency between adapter and builtins
+    EXTENSION_MARKER,
+    EXTENSION_SOURCES,
+)
 
 BUILT_IN = {"claude-code": CLAUDE_CODE, **_SHIPPED}  # the popular agents, each checked against its own source
 
@@ -245,6 +249,8 @@ def command_line(command: List[str]) -> str:
 
 def _short_path(path: str) -> Optional[str]:
     """The Windows 8.3 short name of an existing path (no spaces), or None when there is none."""
+    if sys.platform != "win32":
+        return None
     try:
         import ctypes
         buffer = ctypes.create_unicode_buffer(1024)

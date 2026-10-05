@@ -8,19 +8,22 @@ import json
 import sys
 from unittest.mock import patch
 
+from test_untracked import make_repo
 from typer.testing import CliRunner
 
 import guard.cli as cli
-
 import guard.commands.invariants as invariants_cmds
 from guard.cli import app
 from guard.core.config import GuardConfig, LLMConfig
 from guard.core.invariant_eval import DomainType
 from guard.core.llm_reviewer import LLMReviewerEngine
 from guard.core.project_invariants import (
-    append_learned_invariants, dump_invariants, learned_without_checks, similar, write_invariants_file,
+    append_learned_invariants,
+    dump_invariants,
+    learned_without_checks,
+    similar,
+    write_invariants_file,
 )
-from test_untracked import make_repo
 
 CHECK = [{"files": "src/chat.ts", "require": "export"}]
 
@@ -147,6 +150,7 @@ def test_prune_removes_only_learned_rules_without_checks_and_only_for_the_user(t
 
 def test_learning_while_pruning_keeps_the_new_rule(tmp_path, monkeypatch):
     import threading
+
     import guard.core.project_invariants as pi
     repo = make_repo(tmp_path)
     old = {"id": "OLD", "description": "Learned without check", "checks": [], "origin": "llm:s1"}

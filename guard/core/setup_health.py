@@ -10,13 +10,30 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 from guard.core.repo_setup import (
-    AGENT_DOC_NAMES, DIRECTIVE_END, DIRECTIVE_START, GLOBAL_AGENT_DOCS, LEGACY_COMMENT, MANUAL_HOOK_LINE,
-    _detected_adapters, _directive_block, _git, _inside_git_dir, _same, effective_hooks_dir, git_root, global_agent_docs,
-    guard_home, has_legacy,
+    AGENT_DOC_NAMES,
+    DIRECTIVE_END,
+    DIRECTIVE_START,
+    GLOBAL_AGENT_DOCS,
+    LEGACY_COMMENT,
+    MANUAL_HOOK_LINE,
+    _detected_adapters,
+    _directive_block,
+    _git,
+    _inside_git_dir,
+    _same,
+    effective_hooks_dir,
+    git_root,
+    global_agent_docs,
+    guard_home,
+    has_legacy,
 )
+
+
+class AddHealthRow(Protocol):
+    def __call__(self, level: str, item: str, detail: str, fix: str = "") -> None: ...
 
 
 def _global_hooks_active() -> bool:
@@ -55,7 +72,7 @@ def _local_agent_docs(cwd: Path) -> List[Path]:
     return docs
 
 
-def _check_git_hooks(repo: Optional[Path], add: Callable[[str, str, str, str], None], install_fix: str) -> None:
+def _check_git_hooks(repo: Optional[Path], add: AddHealthRow, install_fix: str) -> None:
     if _global_hooks_active():
         if (guard_home() / "hooks" / "pre-commit").is_file():
             add("ok", "Git hooks", "global hooks check every repository")
@@ -84,7 +101,7 @@ def _check_git_hooks(repo: Optional[Path], add: Callable[[str, str, str, str], N
         add("missing", "Git hooks", "no global guard hooks are installed", install_fix)
 
 
-def _check_agent_directives(cwd: Path, add: Callable[[str, str, str, str], None], install_fix: str) -> None:
+def _check_agent_directives(cwd: Path, add: AddHealthRow, install_fix: str) -> None:
     global_docs = global_agent_docs()
     local_docs = _local_agent_docs(cwd)
     states = {d: _doc_state(d) for d in global_docs + local_docs}
@@ -106,7 +123,7 @@ def _check_agent_directives(cwd: Path, add: Callable[[str, str, str, str], None]
         add("missing", "Agent directives", "no agent instruction file tells the agent to run guard pre/post", install_fix)
 
 
-def _check_by_hand_adapter(adapter: dict, add: Callable[[str, str, str, str], None]) -> None:
+def _check_by_hand_adapter(adapter: dict, add: AddHealthRow) -> None:
     name = adapter["name"]
     from guard.agent.adapter import test_record_path
     try:
@@ -137,7 +154,7 @@ def _check_by_hand_adapter(adapter: dict, add: Callable[[str, str, str, str], No
             "added by hand; no test has seen them yet", f"guard agent test {name}")
 
 
-def _check_agent_hooks(add: Callable[[str, str, str, str], None]) -> None:
+def _check_agent_hooks(add: AddHealthRow) -> None:
     from guard.agent.adapter import installed, protection, test_record_path
     for adapter in _detected_adapters():
         name = adapter["name"]
@@ -181,7 +198,7 @@ def _check_agent_hooks(add: Callable[[str, str, str, str], None]) -> None:
                 "an edit was refused")
 
 
-def _check_invariants(repo: Optional[Path], add: Callable[[str, str, str, str], None]) -> None:
+def _check_invariants(repo: Optional[Path], add: AddHealthRow) -> None:
     if not repo:
         return
     from guard.core.project_invariants import InvariantsFileError, load_project_invariants
@@ -204,7 +221,7 @@ def _check_invariants(repo: Optional[Path], add: Callable[[str, str, str, str], 
                 add("ok", "Invariants", f"{len(items) - unchecked}/{len(items)} invariants have automated checks")
 
 
-def _check_llm(add: Callable[[str, str, str, str], None]) -> None:
+def _check_llm(add: AddHealthRow) -> None:
     from guard.core.config import LLMProtocol, load_global_config
     llm = load_global_config().llm
     if llm.protocol == LLMProtocol.CLI and not llm.ready:
@@ -229,7 +246,7 @@ def _check_llm(add: Callable[[str, str, str, str], None]) -> None:
         add("missing", "LLM", "no LLM configured: guard post falls back to the heuristic gate", "guard config llm")
 
 
-def _check_ocr(repo: Optional[Path], cwd: Path, add: Callable[[str, str, str, str], None]) -> None:
+def _check_ocr(repo: Optional[Path], cwd: Path, add: AddHealthRow) -> None:
     from guard.core.config import LLMProtocol, load_config, load_global_config, ocr_in_sync
     llm = load_global_config().llm
     ocr_binary = load_config(repo or cwd).ocr.binary_path  # the config guard post uses here
@@ -256,7 +273,7 @@ def _check_ocr(repo: Optional[Path], cwd: Path, add: Callable[[str, str, str, st
             "npm install -g @alibaba-group/open-code-review   then: guard config sync")
 
 
-def _check_commit_messages(add: Callable[[str, str, str, str], None]) -> None:
+def _check_commit_messages(add: AddHealthRow) -> None:
     from guard.core.config import load_global_config
     cfg = load_global_config()
     if cfg.commit_mode:
@@ -267,7 +284,7 @@ def _check_commit_messages(add: Callable[[str, str, str, str], None]) -> None:
             "guard config commit auto   (or: guard config commit ask)")
 
 
-def _check_untracked(repo: Optional[Path], add: Callable[[str, str, str, str], None]) -> None:
+def _check_untracked(repo: Optional[Path], add: AddHealthRow) -> None:
     if not repo:
         return
     from guard.core.untracked import RegistryError, undecided
@@ -276,6 +293,7 @@ def _check_untracked(repo: Optional[Path], add: Callable[[str, str, str, str], N
     except (RuntimeError, RegistryError) as e:
         pending = []
         from rich.markup import escape
+
         from guard.core.untracked import printable
         add("warn", "Untracked paths", f"cannot list untracked paths: {escape(printable(str(e)))}",
             "git status   (fix the repository, then guard doctor)")
@@ -286,7 +304,7 @@ def _check_untracked(repo: Optional[Path], add: Callable[[str, str, str, str], N
             "guard untracked <path> --include   (or --ignore)")
 
 
-def _check_legacy_files(cwd: Path, add: Callable[[str, str, str, str], None]) -> None:
+def _check_legacy_files(cwd: Path, add: AddHealthRow) -> None:
     models = guard_home() / "models"
     if models.is_dir():
         size_mb = sum(f.stat().st_size for f in models.rglob("*") if f.is_file()) / (1024 * 1024)

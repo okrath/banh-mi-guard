@@ -7,17 +7,23 @@ import json
 import os
 from pathlib import Path
 
+from test_agent_events import make_repo
 from typer.testing import CliRunner
 
 import guard.cli as cli
-
 import guard.commands.agent as agent_cmds
 from guard.agent.adapter import (
-    CLAUDE_CODE, AdapterError, installed, read_config, render, with_guard, without_guard, write_config,
+    CLAUDE_CODE,
+    AdapterError,
+    installed,
+    read_config,
+    render,
+    with_guard,
+    without_guard,
+    write_config,
 )
 from guard.agent.events import Decision
 from guard.cli import app, execute_pre_task
-from test_agent_events import make_repo
 
 COMMAND = ["C:/tools/guard.exe"]
 FOREIGN = {"matcher": "Bash", "hooks": [{"type": "command", "command": "npx", "args": ["lint-staged"]}]}

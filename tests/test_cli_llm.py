@@ -142,9 +142,9 @@ def test_doctor_names_the_cli_and_says_ocr_runs_through_it(tmp_path, monkeypatch
 
 def test_the_review_goes_through_the_cli(runs, tmp_path):
     from guard.core.config import GuardConfig
+    from guard.core.invariant_eval import DomainType
     from guard.core.llm_reviewer import LLMReviewerEngine
     from guard.core.ocr_engine import DiffSummary
-    from guard.core.invariant_eval import DomainType
     calls, answers = runs
     answers["claude"] = json.dumps({"type": "result", "is_error": False, "result": (
         "VERDICT: APPROVED\nSCORE: 9\nSUMMARY: fine\nFINDINGS: None\nINVARIANTS: None\nREMEDIATION: None")})

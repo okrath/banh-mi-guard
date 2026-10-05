@@ -6,14 +6,13 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, NoReturn, Optional
 
 import typer
 from rich.table import Table
 
 from guard.cli import app, console
 from guard.core.config import load_config
-
 
 # A hook payload is a small JSON object; anything bigger is not read (and the action is allowed, logged)
 MAX_EVENT_BYTES = 5_000_000
@@ -53,7 +52,7 @@ def _forget_switches(name: str, path: Path) -> None:
     except OSError as e:
         console.print(f"[bold red]❌ Guard's hooks are out of {path}, but {switched_path(name)} could not be deleted "
                       f"({e}). Delete it yourself before adding guard again.[/bold red]", highlight=False)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
 
 
 def _file_state(path: Path):
@@ -96,7 +95,7 @@ def _home_relative(path: Path) -> str:
     return _shown(path, path.parent, Path.home())
 
 
-def _cannot_set_up(name: str, problem: str, inv=None) -> None:
+def _cannot_set_up(name: str, problem: str, inv=None) -> NoReturn:
     """Tell the user guard could not make this agent work, what they can do, and exit."""
     from guard.agent.discover import issue_url
     console.print(f"[bold yellow]⚠️ Guard could not set up {name}:[/bold yellow] ", end="")
@@ -152,7 +151,7 @@ def _investigate(name: str, need_found: bool = True):
         inv = investigate(name)
     except ValueError as e:
         console.print(f"[bold red]❌ {name!r}: {e}.[/bold red]", highlight=False)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     console.print(f"[cyan]🔎 {name}: binary {inv.binary or 'not on PATH'}; {len(inv.listing)} config file(s) found, "
                   f"{len(inv.files)} read as structure only (no text values).[/cyan]")
     for note in inv.notes:
@@ -179,8 +178,15 @@ def _write_text_atomic(path: Path, text: str) -> None:
 def _install_extension(adapter: dict, name: str) -> None:
     """omp, pi, opencode: guard writes one file of its own (shown first, confirmed); a file of anyone else's stays."""
     import difflib
+
     from guard.agent.adapter import (
-        AdapterError, adapters_dir, config_path, extension_is_guards, extension_text, save_adapter, _record_name,
+        AdapterError,
+        _record_name,
+        adapters_dir,
+        config_path,
+        extension_is_guards,
+        extension_text,
+        save_adapter,
     )
     path = config_path(adapter)
     if path.exists() and not extension_is_guards(adapter):
@@ -190,7 +196,7 @@ def _install_extension(adapter: dict, name: str) -> None:
         text = extension_text(adapter)
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]", highlight=False)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     seen = _file_state(path)
     old = seen.decode("utf-8", errors="replace") if isinstance(seen, bytes) else ""
     if old == text:
@@ -222,8 +228,24 @@ def _install_extension(adapter: dict, name: str) -> None:
 def _install_adapter(adapter: dict, name: str) -> None:
     """Show the config diff, confirm, back up and write; a config guard cannot edit gets the entries to add by hand."""
     from guard.agent.adapter import (
-        AdapterError, adapters_dir, config_path, diff, dump, guard_command, installed, load_adapter, others_under,
-        read_config, save_adapter, switched_on, switched_path, with_guard, write_config, _at, _entry, _record_name,
+        AdapterError,
+        _at,
+        _entry,
+        _record_name,
+        adapters_dir,
+        config_path,
+        diff,
+        dump,
+        guard_command,
+        installed,
+        load_adapter,
+        others_under,
+        read_config,
+        save_adapter,
+        switched_on,
+        switched_path,
+        with_guard,
+        write_config,
     )
     _registered_ok(adapter, name)  # every install, including one from a record written earlier
     for limit in adapter.get("limits") or []:  # what guard cannot do for this agent, said before anything is written
@@ -398,8 +420,8 @@ def agent_fix_cmd(
     inv = _investigate(name, need_found=not note)
     log_path = guard_home() / "agent-events.log"
     from guard.agent.discover import event_summary
-    lines = [l for l in (log_path.read_text(encoding="utf-8", errors="replace").splitlines() if log_path.is_file() else [])
-             if f" {name} " in l][-50:]
+    lines = [line for line in (log_path.read_text(encoding="utf-8", errors="replace").splitlines() if log_path.is_file() else [])
+             if f" {name} " in line][-50:]
     log = event_summary(lines) + (f"\nThe user says: {note}" if note else "")  # the note is the user's own words
     adapter = _proposed_adapter(name, inv, previous=previous, log=log or "none")
     change = adapter_diff(previous or {}, adapter)
@@ -445,13 +467,22 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
     guard's entries; everything else stays as it is). An agent cannot remove its own guard.
     """
     from guard.agent.adapter import (
-        AdapterError, config_path, diff, read_config, switched_path, without_guard, write_config, _at, _drop_at,
+        AdapterError,
+        _at,
+        _drop_at,
+        config_path,
+        diff,
+        read_config,
+        switched_path,
+        without_guard,
+        write_config,
     )
     adapter = _adapter_or_exit(name)
     _registered_ok(adapter, name)  # an edited record cannot point remove at another config file
     path = config_path(adapter)
     if adapter.get("kind") == "extension":
         import difflib
+
         from guard.agent.adapter import extension_state, extension_text
         state = extension_state(adapter)
         if state in ("missing", "foreign"):
@@ -481,7 +512,7 @@ def agent_remove_cmd(name: str = typer.Argument(..., help="Adapter, e.g. claude-
         before = read_config(path, adapter)
     except AdapterError as e:
         console.print(f"[bold red]❌ {e}[/bold red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     after = without_guard(before, adapter["name"], adapter)
     record = switched_path(name)
     try:  # the settings guard turned on at add (ZCode's hooks.enabled), still as guard left them
@@ -555,8 +586,8 @@ def agent_test_cmd(
         raise typer.Exit(code=1)
     lines = []
     if log_path.is_file():
-        lines = [l for l in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                 if l[:32] >= since[:32] and f" {name} " in l and " EVENT " in l]
+        lines = [line for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                 if line[:32] >= since[:32] and f" {name} " in line and " EVENT " in line]
     flag.unlink(missing_ok=True)
     def same(name: str) -> str:  # `PreToolUse`, `preToolUse` and `pre_tool_use` are one event
         return name.replace("_", "").lower()
@@ -579,7 +610,7 @@ def agent_test_cmd(
     from guard.agent.adapter import test_record_path  # what doctor shows as this agent's last test
     record = test_record_path(name)
     record.parent.mkdir(parents=True, exist_ok=True)
-    from guard.agent.adapter import config_path, config_fingerprint
+    from guard.agent.adapter import config_fingerprint, config_path
     record.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "events": len(lines),
                                   "blocked_edit": blocked_edit, "missing": missing,
                                   "config": config_fingerprint(config_path(adapter))}), encoding="utf-8")

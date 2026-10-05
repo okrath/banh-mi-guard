@@ -17,12 +17,11 @@ from guard.core.diff_inspector import DiffSummary, GitDiffInspector
 from guard.core.llm_client import LLMClientError, call_llm, ping_llm
 from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.removal_check import check_removed_symbols
+from guard.core.session import SessionManager
 from guard.domains.pre_analysis import analyze_task
 from guard.hooks.runner import run_sandwich_task
-from guard.core.session import SessionManager
 from guard.reporters.markdown import snapshot_missing_reason
 from guard.task_flow import execute_post_task, execute_pre_task
-
 
 SAMPLE_REMOVAL_DIFF = """diff --git a/src/app.ts b/src/app.ts
 --- a/src/app.ts

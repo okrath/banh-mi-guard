@@ -88,7 +88,8 @@ def structure(text: str) -> str:
             head = f"{m.group(1)}{key}{m.group(3)}"
             out.append(f"{head} {kept}" if value else head)
         else:
-            out.append(re.match(r"^\s*-?\s*", line).group(0) + TEXT)  # a list item, comment or continuation
+            m_prefix = re.match(r"^\s*-?\s*", line)
+            out.append((m_prefix.group(0) if m_prefix else "") + TEXT)  # a list item, comment or continuation
     return "\n".join(out)
 
 
@@ -163,7 +164,7 @@ def _first_bytes(command: List[str], timeout: float = 10.0) -> str:
 
     def read() -> None:  # chunk by chunk, so what arrived before the timeout is kept
         while proc.stdout and sum(map(len, got)) < VERSION_BYTES:
-            chunk = proc.stdout.read1(VERSION_BYTES - sum(map(len, got)))
+            chunk = proc.stdout.read1(VERSION_BYTES - sum(map(len, got)))  # pyright: ignore[reportAttributeAccessIssue]  # BufferedReader.read1 exists at runtime on binary stdout
             if not chunk:
                 return
             got.append(chunk)

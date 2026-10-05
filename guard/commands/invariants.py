@@ -11,9 +11,15 @@ from rich.table import Table
 
 from guard.cli import app, console
 from guard.core.project_invariants import (
-    INVARIANTS_FILENAME, InvariantsFileError, evaluate_checks, init_invariants_file, learned_without_checks, load_project_invariants, prune_learned_without_checks, similar_groups,
+    INVARIANTS_FILENAME,
+    InvariantsFileError,
+    evaluate_checks,
+    init_invariants_file,
+    learned_without_checks,
+    load_project_invariants,
+    prune_learned_without_checks,
+    similar_groups,
 )
-
 
 # Subcommand: guard invariants
 invariants_app = typer.Typer(
@@ -57,7 +63,7 @@ def invariants_check_cmd(
         items = load_project_invariants(target_repo)
     except InvariantsFileError as e:
         console.print(f"[bold red]❌ {e}[/bold red]")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from e
     if items is None:
         console.print(f"[yellow]No {INVARIANTS_FILENAME} in {target_repo}. Create it with `guard invariants init`.[/yellow]")
         raise typer.Exit(code=2)
@@ -96,7 +102,7 @@ def invariants_prune_cmd(
         unchecked = learned_without_checks(target_repo)
     except InvariantsFileError as e:
         console.print(f"[bold red]❌ {e}[/bold red]")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from e
     if not unchecked:
         console.print("[green]No learned rule without a check.[/green]")
         return

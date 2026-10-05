@@ -6,6 +6,7 @@ effective rules agree with them; unresolvable paths are handled errors, never cr
 import pathlib
 import threading
 
+from test_untracked import exclude_text, make_repo
 from typer.testing import CliRunner
 
 from guard.cli import app, execute_pre_task
@@ -14,7 +15,6 @@ from guard.core.ocr_engine import GitDiffInspector
 from guard.core.session import SessionManager
 from guard.core.untracked import DECISIONS_FILE, RegistryError, decide, load_decisions, undecided
 from guard.core.untracked_names import is_guard_dir
-from test_untracked import exclude_text, make_repo
 
 
 def test_a_folder_named_like_guard_is_the_users(tmp_path):
@@ -59,6 +59,7 @@ def test_concurrent_writers_never_lose_each_others_lines(tmp_path):
 def test_rewriting_info_exclude_keeps_its_mode(tmp_path):
     import os
     import stat
+
     import pytest
     if os.name == "nt":
         pytest.skip("POSIX permission bits")

@@ -14,7 +14,6 @@ from typing import Any, List, Optional
 from guard.agent.adapter import BUILT_IN, NAME, USER_ROOTS, user_path
 from guard.agent.events import EVENTS as _EVENTS
 
-
 WORD = re.compile(r"^[A-Za-z][\w.-]{0,39}\Z")  # a harness event name, or a literal in an entry template
 
 

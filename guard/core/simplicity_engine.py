@@ -14,8 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from guard.core.ocr_engine import DiffSummary, FileDiffStat, RuleViolation
-
+from guard.core.ocr_engine import DiffSummary, RuleViolation
 
 # Known redundant npm packages easily replaced by native modern JS/TS runtime APIs
 REDUNDANT_NPM_PACKAGES = {

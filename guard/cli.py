@@ -13,45 +13,17 @@ Provides:
 
 from __future__ import annotations
 
-import hashlib
-import json
-import re
-import subprocess
+import subprocess  # noqa: F401  # mocked as guard.cli.subprocess by tests/test_repo_setup.py
 import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import typer
-from rich.console import Console
-from rich.panel import Panel
 
 from guard import __app_name__, __version__
-from guard.core.config import load_config, load_global_config
-from guard.core.hygiene_engine import HygieneEngine
-from guard.core.impact import check_impact, expected_impact
-from guard.core.invariant_eval import DomainType, evaluate_invariants
-from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
-from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner, RuleViolation, run_ocr_review
-from guard.core.project_invariants import (
-    INVARIANTS_FILENAME,
-    InvariantsFileError,
-    append_learned_invariants,
-    evaluate_checks,
-    load_local_invariants,
-    load_project_invariants,
-    load_shared_invariants,
-    removed_or_relaxed,
-)
-from guard.core.removal_check import check_removed_symbols
-from guard.core.repo_setup import ensure_repo_setup, needs_refresh, refresh_after_upgrade
-from guard.core.session import BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
-from guard.core.simplicity_engine import SimplicityEngine
+from guard.core.repo_setup import needs_refresh, refresh_after_upgrade
+from guard.core.session import SessionManager, SessionStatus
 from guard.core.updater import get_cached_update_notice, maybe_trigger_background_update_check
-from guard.domains.detector import detect_build_command, detect_domain, extract_contracts_and_invariants
-from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
-from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
 from guard.task_flow import (  # noqa: F401
     BUILD_TIMEOUT_S,
     _drop_diff_files,
@@ -198,12 +170,14 @@ def run_cmd(
 # the names imported are what the pipeline above looks up here at call time. Run as `python -m guard.cli`,
 # this file is __main__ and registers nothing: its end runs the guard.cli module's main instead.
 if __name__ != "__main__":
+    # isort: off
     import guard.commands.invariants  # noqa: E402,F401
     import guard.commands.config  # noqa: E402,F401
     from guard.commands.setup import print_setup_health  # noqa: E402
     import guard.commands.review  # noqa: E402,F401
     import guard.commands.agent  # noqa: E402,F401
     import guard.commands.maintenance  # noqa: E402,F401
+    # isort: on
 
 
 def _force_utf8_console():
@@ -211,7 +185,9 @@ def _force_utf8_console():
     for stream in (sys.stdout, sys.stderr):
         try:
             if stream and (stream.encoding or "").lower().replace("-", "") != "utf8":
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                reconfig = getattr(stream, "reconfigure", None)
+                if callable(reconfig):
+                    reconfig(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, OSError):
             # Best-effort console UTF-8 reconfigure: never crash on non-standard streams
             pass

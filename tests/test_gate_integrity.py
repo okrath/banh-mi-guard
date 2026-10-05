@@ -254,7 +254,8 @@ def test_renamed_and_spaced_paths_are_tracked(tmp_path):
 def test_malformed_invariants_file_fails_pre_cleanly(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "guard.invariants.json").write_text("{not json", encoding="utf-8")
-    git(repo, "add", "."); git(repo, "commit", "-m", "bad")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "bad")
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is False
 
     (repo / "guard.invariants.json").write_text(json.dumps({"invariants": [
@@ -268,7 +269,8 @@ def test_invariant_failing_before_task_warns_but_does_not_block(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "guard.invariants.json").write_text(json.dumps({"invariants": [
         {"id": "LEGACY", "description": "no fetch", "checks": [{"files": "src/*.ts", "forbid": r"fetch\("}]}]}), encoding="utf-8")
-    git(repo, "add", "."); git(repo, "commit", "-m", "inv")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "inv")
     assert execute_pre_task("Fix src/other.ts", repo_path=repo) is True
     (repo / "src" / "other.ts").write_text("export const x = 5;\n", encoding="utf-8")
     assert execute_post_task(repo_path=repo) is True
@@ -294,6 +296,7 @@ def test_hook_approval_covers_only_the_approved_changes(tmp_path):
 
 def test_reset_archives_and_closes_a_rejected_session(tmp_path):
     from typer.testing import CliRunner
+
     from guard.cli import app
 
     repo = make_repo(tmp_path)
@@ -469,7 +472,8 @@ def test_removed_symbols_still_referenced_are_reported(tmp_path):
         "export function icon(n: string) {\n  switch (n) {\n    case 'edit':\n      return 'e';\n    case 'gone':\n      return 'g';\n  }\n}\n", encoding="utf-8")
     (repo / "src" / "style.css").write_text(".btn-live { color: red; }\n.btn-dead { color: blue; }\n", encoding="utf-8")
     (repo / "src" / "use.ts").write_text("icon('edit'); el.className = 'btn-live';\n", encoding="utf-8")
-    git(repo, "add", "."); git(repo, "commit", "-m", "base")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
     assert execute_pre_task("Remove dead icons and css", repo_path=repo, scope=["src"]) is True
 
     (repo / "src" / "icons.ts").write_text(

@@ -13,7 +13,7 @@ import shutil
 import subprocess
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
 from rich.console import Console
@@ -302,7 +302,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
         default_model = current_cfg.llm.model if current_cfg.llm.model not in ["gpt-4o", "gpt-4o-mini"] else "claude-3-7-sonnet"
 
     # Step 2: Base URL
-    console.print(f"\n[bold yellow]Step 2: Base URL[/bold yellow]")
+    console.print("\n[bold yellow]Step 2: Base URL[/bold yellow]")
     if protocol == LLMProtocol.OPENAI:
         console.print("[dim]• OpenAI: https://api.openai.com/v1\n• Ollama: http://localhost:11434/v1\n• DeepSeek: https://api.deepseek.com/v1\n• Local Gateway: http://127.0.0.1:8090/v1[/dim]")
     else:
@@ -311,7 +311,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     base_url = Prompt.ask("Base URL", default=default_url)
 
     # Step 3: API Key
-    console.print(f"\n[bold yellow]Step 3: API Key[/bold yellow]")
+    console.print("\n[bold yellow]Step 3: API Key[/bold yellow]")
     env_key = os.environ.get("OPENAI_API_KEY" if protocol == LLMProtocol.OPENAI else "ANTHROPIC_API_KEY", "")
     key_default = current_cfg.llm.api_key or env_key
     
@@ -322,7 +322,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
         api_key = Prompt.ask("API Key", default=key_default, password=True)
 
     # Step 4: Model Name
-    console.print(f"\n[bold yellow]Step 4: Model Name[/bold yellow]")
+    console.print("\n[bold yellow]Step 4: Model Name[/bold yellow]")
     if protocol == LLMProtocol.OPENAI:
         console.print("[dim]Examples: gpt-4o, deepseek-chat, muse, qwen2.5-coder:latest[/dim]")
     else:
@@ -331,7 +331,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     model = Prompt.ask("Model Name", default=default_model)
 
     # Step 5: Timeout
-    console.print(f"\n[bold yellow]Step 5: Timeout[/bold yellow]")
+    console.print("\n[bold yellow]Step 5: Timeout[/bold yellow]")
     console.print("[dim]Maximum request timeout in seconds. For browser automation or local LLMs, recommend 60-120s.[/dim]")
     timeout_str = Prompt.ask("Timeout (seconds)", default=str(int(current_cfg.llm.timeout or 60.0)))
     try:
@@ -349,7 +349,7 @@ def run_llm_wizard(local: bool = False, repo_path: Optional[Path] = None) -> Gua
     current_cfg.llm = new_llm
 
     # Step 6: Test Ping
-    console.print(f"\n[bold yellow]Step 6: Connection Test (Ping Test)[/bold yellow]")
+    console.print("\n[bold yellow]Step 6: Connection Test (Ping Test)[/bold yellow]")
     do_ping = Confirm.ask("Do you want to test the connection now?", default=True)
     if do_ping:
         with console.status("[cyan]Sending connection test request to LLM endpoint...[/cyan]"):

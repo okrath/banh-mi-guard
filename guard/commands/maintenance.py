@@ -20,7 +20,11 @@ from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.core.updater import (
-    UpdateSecurityStatus, check_guard_self_update, check_ocr_update, perform_ocr_upgrade, perform_self_upgrade,
+    UpdateSecurityStatus,
+    check_guard_self_update,
+    check_ocr_update,
+    perform_ocr_upgrade,
+    perform_self_upgrade,
 )
 from guard.domains.detector import detect_domain
 
@@ -106,7 +110,7 @@ def update_cmd(
         return
 
     # Default target: ocr
-    console.print(f"[cyan]Checking updates for Alibaba OCR (@alibaba-group/open-code-review)...[/cyan]")
+    console.print("[cyan]Checking updates for Alibaba OCR (@alibaba-group/open-code-review)...[/cyan]")
     check_res = check_ocr_update(quarantine_days=quarantine_days)
 
     if check_only:

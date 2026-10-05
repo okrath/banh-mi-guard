@@ -25,12 +25,13 @@ from guard.reporters.terminal import (
     symbol,
 )
 
+
 def _save_or_exit(mgr: SessionManager, session) -> None:
     try:
         mgr._save(session)
     except OSError as err:
         console.print(f"[bold red]❌ Could not save session: {err}[/bold red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from err
 
 
 @app.command("finding")
@@ -149,7 +150,7 @@ def untracked_cmd(
             pending = undecided(target)
         except (RuntimeError, RegistryError) as e:
             console.print(f"[bold red]❌ Cannot list untracked paths: {shown(str(e))}[/bold red]")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from e
         for entry, choice in decisions.items():
             # Git still listing a path an "ignore" covers, or the same name as a file/folder in its
             # place, means that rule is not in effect for what is there now
@@ -167,4 +168,4 @@ def untracked_cmd(
     except ValueError as e:
         console.print("[bold red]❌[/bold red] ", end="")
         console.print(printable(str(e)), markup=False)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e

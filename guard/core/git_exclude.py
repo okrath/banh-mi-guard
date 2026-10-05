@@ -40,8 +40,8 @@ def inside_git_dir(repo: Path, path: Path) -> None:
     try:
         common = exclude.parent.parent.resolve()
         path.resolve().relative_to(common)
-    except ValueError:
-        raise OSError(f"{path} resolves outside {common}; guard does not follow it")
+    except ValueError as e:
+        raise OSError(f"{path} resolves outside {common}; guard does not follow it") from e
     except RuntimeError as e:  # a symlink loop, before Python 3.13
         raise OSError(f"{path} cannot be resolved ({e}); guard does not follow it") from e
 

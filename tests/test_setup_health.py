@@ -11,7 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from guard.cli import app
-from guard.core.repo_setup import DIRECTIVE_END, DIRECTIVE_START, install_global
+from guard.core.repo_setup import install_global
 from guard.core.setup_health import setup_health
 
 
@@ -94,6 +94,7 @@ def test_hooks_kept_in_the_repository_are_reported_with_the_line_to_add(fake_mac
 def test_first_command_after_upgrade_prints_the_check_once(fake_machine, tmp_path, monkeypatch, capsys):
     """An old `guard update self` cannot refresh; the new version's first command must speak up."""
     import sys
+
     from guard import cli
 
     repo = make_repo(tmp_path / "app")

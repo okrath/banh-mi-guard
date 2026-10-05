@@ -15,9 +15,17 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from guard.core.diff_inspector import DiffSummary, FileDiffStat, GitDiffInspector, glob_to_regex  # noqa: F401  (moved; importers keep this path)
-from guard.core.rulebook import OCRRulebookRunner, RuleViolation, _unsafe_html_sinks  # noqa: F401  (moved; importers keep this path)
-
+from guard.core.diff_inspector import (  # noqa: F401  (moved; importers keep this path)
+    DiffSummary,
+    FileDiffStat,
+    GitDiffInspector,
+    glob_to_regex,
+)
+from guard.core.rulebook import (  # noqa: F401  (moved; importers keep this path)
+    OCRRulebookRunner,
+    RuleViolation,
+    _unsafe_html_sinks,
+)
 
 OCR_SEVERITY = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "LOW"}
 # Terminal statuses OCR reports as a successful review (its IDE extension treats completed_with_errors,
@@ -268,10 +276,12 @@ def _run_ocr(ocr_bin, repo_path, out_file, base_ref, snapshot, background, skip_
         return line, run_violation + violations
     if status == "skipped":
         return "complete: OCR reported status skipped (it reviewed no file)", violations
-    llm = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+    raw_llm = data.get("llm")
+    llm: dict = raw_llm if isinstance(raw_llm, dict) else {}
     note = f"; {dropped} finding(s) dropped: on files dirty before pre and unchanged by this task" if dropped else ""
     # Coverage is the evidence of a finished review; failed tool calls while exploring are only shown
-    tool_calls = data.get("tool_calls") if isinstance(data.get("tool_calls"), dict) else {}
+    raw_tool_calls = data.get("tool_calls")
+    tool_calls: dict = raw_tool_calls if isinstance(raw_tool_calls, dict) else {}
     if isinstance(tool_calls.get("failure"), int) and tool_calls["failure"] > 0:
         note += f"; {tool_calls['failure']} of {tool_calls.get('total', '?')} OCR tool call(s) failed while exploring"
     return f"complete: {len(violations)} finding(s) (model {llm.get('model', '?')}, status {status}){note}", violations

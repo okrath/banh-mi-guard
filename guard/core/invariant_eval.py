@@ -88,19 +88,19 @@ def evaluate_invariants(
             if "escape" in desc_lower:
                 status, note = STATUS_PASSED, "No keyboard/escape handler removed in diff"
                 # Key-handling signals only; identifiers such as escapeHtml / escapedText are not handlers
-                if any(KEY_HANDLER_REGEX.search(l) for l in removed_lines):
+                if any(KEY_HANDLER_REGEX.search(line) for line in removed_lines):
                     status, note = STATUS_FAILED, "Detected removal of keyboard/escape handler in diff"
             elif "disabled" in desc_lower:
                 status, note = STATUS_PASSED, "No disabled state removed in diff"
-                if any("disabled" in l.lower() for l in removed_lines):
+                if any("disabled" in line.lower() for line in removed_lines):
                     status, note = STATUS_FAILED, "Detected removal of disabled state in diff"
             elif "timeout" in desc_lower:
                 status, note = STATUS_PASSED, "No timeout construct added in diff"
-                if any("timeout" in l.lower() for l in added_lines):
+                if any("timeout" in line.lower() for line in added_lines):
                     status, note = STATUS_FAILED, "Detected forbidden addition of timeout construct"
             elif "secret" in desc_lower:
                 status, note = STATUS_PASSED, "No hardcoded secret added in diff"
-                if any(re.search(r"\b(api_key|secret|password)\s*[:=]\s*['\"].+['\"]", l.lower()) for l in added_lines):
+                if any(re.search(r"\b(api_key|secret|password)\s*[:=]\s*['\"].+['\"]", line.lower()) for line in added_lines):
                     status, note = STATUS_FAILED, "Detected potential hardcoded secret in diff additions"
 
         checks.append(InvariantCheck(

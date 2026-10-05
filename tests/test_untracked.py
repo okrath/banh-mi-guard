@@ -10,7 +10,9 @@ from typer.testing import CliRunner
 
 from guard.cli import app, execute_post_task, execute_pre_task
 from guard.core.untracked import MARK, decide, load_decisions, undecided
-from guard.core.untracked import _save as REAL_SAVE  # restored by hand: monkeypatch.undo() would also undo conftest's isolation
+from guard.core.untracked import (
+    _save as REAL_SAVE,  # restored by hand: monkeypatch.undo() would also undo conftest's isolation
+)
 
 
 def make_repo(tmp_path: Path) -> Path:
@@ -139,6 +141,7 @@ def test_pre_asks_even_while_an_earlier_task_is_open(tmp_path):
 
 def test_a_failed_update_leaves_the_path_undecided(tmp_path, monkeypatch):
     import pytest
+
     import guard.core.untracked as untracked
     repo = make_repo(tmp_path)
     (repo / "plans").mkdir()
@@ -205,6 +208,7 @@ def test_a_recorded_folder_can_be_included_after_it_is_gone(tmp_path):
 
 def test_a_broken_registry_is_reported_and_never_overwritten(tmp_path, capsys):
     import pytest
+
     from guard.core.untracked import RegistryError, _decisions_path
     repo = make_repo(tmp_path)
     (repo / "a.md").write_text("x\n", encoding="utf-8")
@@ -259,6 +263,7 @@ def test_a_forced_restart_also_checks_untracked_paths(tmp_path):
 
 def test_registry_resolution_failures_are_registry_errors(tmp_path, monkeypatch):
     import pytest
+
     import guard.core.untracked as untracked
     from guard.core.untracked import RegistryError
     repo = make_repo(tmp_path)
@@ -282,6 +287,7 @@ def test_an_interrupted_ignore_is_still_a_decision(tmp_path):
 
 def test_a_failed_undo_is_reported_and_a_stale_ignore_hides_nothing(tmp_path, monkeypatch):
     import pytest
+
     import guard.core.untracked as untracked
     repo = make_repo(tmp_path)
     (repo / "plans").mkdir()
@@ -320,6 +326,7 @@ def test_what_is_on_disk_decides_file_or_folder(tmp_path):
 
 def test_a_complete_guard_block_wins_over_a_stale_include(tmp_path):
     import json
+
     from guard.core.untracked import _decisions_path
     repo = make_repo(tmp_path)
     (repo / "logs").mkdir()

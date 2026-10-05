@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from guard.core import ocr_bridge
 from guard.core.ocr_bridge import AgentBridge, complete, parse, render
 
 TOOLS = [{"type": "function", "function": {"name": "file_read", "description": "Read a file.",

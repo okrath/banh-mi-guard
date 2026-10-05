@@ -10,9 +10,13 @@ import typer
 
 from guard.cli import app, console
 from guard.core.config import (
-    get_global_config_path, get_local_config_path, load_config, load_global_config, print_config_table, save_config,
+    get_global_config_path,
+    get_local_config_path,
+    load_config,
+    load_global_config,
+    print_config_table,
+    save_config,
 )
-
 
 # Subcommand: guard config
 config_app = typer.Typer(
@@ -52,8 +56,8 @@ def config_test_cmd(
     """
     Ping test the currently configured LLM endpoint.
     """
-    from guard.core.llm_client import ping_llm
     from guard.core.config import LLMProtocol
+    from guard.core.llm_client import ping_llm
     cfg = load_config(Path(repo) if repo else None)
     if cfg.llm.protocol == LLMProtocol.CLI:
         console.print(f"[cyan]Checking the [bold]{cfg.llm.cli_agent or '(none chosen)'}[/bold] CLI (model: "

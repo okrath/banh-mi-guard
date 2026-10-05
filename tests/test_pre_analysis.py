@@ -4,18 +4,10 @@ Tests for guard pre-analysis: combined domain and baseline contracts via LLM.
 
 import json
 import os
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-import subprocess
-
-
-def _git_repo(path):
-    """A folder that is a Git repository: guard reads only the files Git lists there."""
-    path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
-    return path
 
 from guard.core.config import GuardConfig, LLMConfig, LLMProtocol
 from guard.core.invariant_eval import DomainType
@@ -26,6 +18,13 @@ from guard.domains.pre_analysis import (
     build_pre_analysis_prompt,
 )
 from guard.task_flow import execute_pre_task
+
+
+def _git_repo(path):
+    """A folder that is a Git repository: guard reads only the files Git lists there."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
 
 
 def _make_config(ready: bool = True) -> GuardConfig:
@@ -532,7 +531,7 @@ def test_manifest_line_capped_at_400_characters(tmp_path):
 
     prompt_text, notes = build_pre_analysis_prompt(repo, "Check line cap", [], None)
     assert any("manifest line cut to 400 of" in n for n in notes)
-    manifest_lines = [l for l in prompt_text.splitlines() if l.startswith("package.json files")]
+    manifest_lines = [line for line in prompt_text.splitlines() if line.startswith("package.json files")]
     assert len(manifest_lines) == 1
     assert len(manifest_lines[0]) <= 400
     assert manifest_lines[0].endswith("...")
@@ -567,7 +566,7 @@ CONTRACTS:
     assert res1.domain_source == "LLM"
 
     # Repeat with same model: hits cache
-    res2 = analyze_task(repo, "Task", ["main.py"], None, cfg1)
+    _ = analyze_task(repo, "Task", ["main.py"], None, cfg1)
     assert call_count == 1
 
     # Call with different model gpt-4o: calls stub again!
@@ -616,6 +615,7 @@ def test_read_scoped_files_bounds_read_length(tmp_path, monkeypatch):
 
 def test_scope_directories_and_globs_reach_the_prompt(tmp_path):
     import subprocess
+
     from guard.domains.pre_analysis import build_pre_analysis_prompt
 
     (tmp_path / "src" / "app").mkdir(parents=True)
@@ -704,6 +704,7 @@ def test_skip_binary_file_with_nul_bytes(tmp_path):
 
 def test_scope_expanding_to_50_files_over_budget_yields_at_most_21_notes(tmp_path):
     import subprocess
+
     from guard.domains.pre_analysis import _read_scoped_files
     repo = tmp_path / "repo"
     scope_dir = repo / "scoped"

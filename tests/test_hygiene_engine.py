@@ -2,7 +2,6 @@
 Unit tests for Hygiene & Dead Code Engine.
 """
 
-from pathlib import Path
 from guard.core.hygiene_engine import HygieneEngine
 from guard.core.ocr_engine import DiffSummary, FileDiffStat
 

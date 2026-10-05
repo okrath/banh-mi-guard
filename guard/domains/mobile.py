@@ -6,7 +6,6 @@ Extracts native permissions, lifecycle states, offline caching, safe area/notche
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import List, Optional
 

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from guard.core.updater import (
     UpdateSecurityStatus,
     VersionCheckResult,
@@ -208,7 +209,6 @@ def test_perform_self_upgrade_pip_fallback(clean_pip_env):
 
 
 def test_perform_self_upgrade_windows_fail_restores(clean_pip_env, tmp_path):
-    from pathlib import Path
     from guard.core.updater import perform_self_upgrade
 
     exe_path = tmp_path / "guard.exe"
@@ -231,7 +231,6 @@ def test_perform_self_upgrade_windows_fail_restores(clean_pip_env, tmp_path):
 
 
 def test_perform_self_upgrade_windows_success_clean(clean_pip_env, tmp_path):
-    from pathlib import Path
     from guard.core.updater import perform_self_upgrade
 
     exe_path = tmp_path / "guard.exe"

@@ -81,11 +81,12 @@ def definitions(path: str, text: str) -> List[Tuple[int, str, str]]:
         if py:
             m = PY_DEF.match(line)
             found = m and m.groups()
-        elif REMOVED_EXPORT.match("-" + line):
-            found = ("export", REMOVED_EXPORT.match("-" + line).group(1))
+        elif (m_exp := REMOVED_EXPORT.match("-" + line)):
+            found = ("export", m_exp.group(1))
         else:
             m = JS_DEF.match(line)
-            found = (m and m.groups()) or (JS_FN_VAR.match(line) and ("function", JS_FN_VAR.match(line).group(1)))
+            m_fn = JS_FN_VAR.match(line) if not m else None
+            found = (m and m.groups()) or (m_fn and ("function", m_fn.group(1)))
         if found:
             kind, name = found
             if not (name.startswith("__") and name.endswith("__")):
@@ -278,7 +279,7 @@ def check_impact(
     check_outside = expected is not None and bool(scope)
     known: Dict[Tuple[str, str], ImpactSymbol] = {}
     listed: Set[str] = set()
-    if check_outside:
+    if check_outside and expected is not None:
         known = {(s.file, s.name): s for s in expected.symbols}
         listed = {p for s in expected.symbols for p in s.references + s.tests}
     elif expected is None:
@@ -292,7 +293,7 @@ def check_impact(
     untested: Dict[str, List[str]] = {}
     for path, name, kind, removed in changed:
         others = sorted(refs.get(name, set()) - {path})
-        if check_outside:
+        if check_outside and expected is not None:
             sym = known.get((path, name))
             if (sym and sym.capped) or (sym is None and path in expected.capped_files):
                 skipped.append(f"`{name}`")  # pre could not list its whole range

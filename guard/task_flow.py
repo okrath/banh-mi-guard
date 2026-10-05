@@ -22,7 +22,7 @@ from rich.panel import Panel
 
 from guard.core.config import load_config, load_global_config
 from guard.core.hygiene_engine import HygieneEngine
-from guard.core.impact import check_impact, expected_impact
+from guard.core.impact import ImpactRange, check_impact, expected_impact
 from guard.core.invariant_eval import DomainType, InvariantResult, evaluate_invariants
 from guard.core.llm_reviewer import LLMReviewerEngine, ReviewVerdict
 from guard.core.ocr_engine import DiffSummary, GitDiffInspector, OCRRulebookRunner, RuleViolation, run_ocr_review
@@ -125,11 +125,12 @@ def _pre_check_session_and_owner(
     from guard.agent.events import fresh_claim, load_state
     from guard.core.session import describe_owner
     claim = fresh_claim(load_state(target_repo))
-    held_by = superseded.pre.owner if superseded and isinstance(superseded.pre.owner, dict) else None
-    if held_by and claim and claim["session"] != held_by.get("session"):
+    pre = superseded.pre if superseded else None
+    held_by = pre.owner if pre and isinstance(pre.owner, dict) else None
+    if pre and held_by and claim and claim["session"] != held_by.get("session"):
         console.print(
             f"[bold red]❌ This working tree is held by another agent's guard session[/bold red] "
-            f"({escape(describe_owner(held_by))}, task: {escape(' '.join(superseded.pre.prompt.split())[:80])}).\n"
+            f"({escape(describe_owner(held_by))}, task: {escape(' '.join(pre.prompt.split())[:80])}).\n"
             "Do parallel work in a separate [bold]git worktree add[/bold], or wait until that task is committed. "
             "The user can release it with [bold]guard reset[/bold].")
         return None
@@ -178,7 +179,7 @@ class _PreBaseline:
     candidate_files: List[str]
     late_scope: List[str]
     restarts: List[dict]
-    impact: Optional[dict]
+    impact: Optional[ImpactRange]
     snapshot_error: Optional[str] = None
 
 
@@ -247,7 +248,7 @@ class _PreAnalysis:
 
 def _pre_analyze(
     target_repo: Path, prompt: str, candidate_files: List[str],
-    impact: Optional[dict], config, superseded: Optional[Any],
+    impact: Optional[ImpactRange], config, superseded: Optional[Any],
 ) -> _PreAnalysis:
     """Analyze domain, reason, and baseline contracts with LLM or inheritance."""
     # A restart keeps the first pre's analysis: the task may have edited the scoped files since
@@ -406,7 +407,7 @@ def _post_check_hook_and_session(
     if hook and session is None:
         console.print("[dim]Banh-Mi-Guard: no guard session in this repository, skipping.[/dim]")
         return False, True, None
-    if hook and session.status == SessionStatus.COMPLETED:
+    if hook and session is not None and session.status == SessionStatus.COMPLETED:
         # An approval covers only the exact file contents it approved, not later or unrelated work
         approved = session_mgr.verified_approval(session)
         uncovered = [
@@ -663,7 +664,7 @@ def _post_ocr(
         console.print(
             "[cyan]🔎 Alibaba OCR is reviewing the changes (no time limit; it ends when OCR finishes or reports an error, Ctrl+C stops it)...[/cyan]"
         )
-        review = dict(
+        review: Dict[str, Any] = dict(
             base_ref=pre.base_ref if pre else None, background=pre.prompt if pre else "Post-task verification",
             skip_files=preexisting_files, binary=config.ocr.binary_path, concurrency=config.ocr.concurrency,
             on_snapshot=start_build, cache_key=_ocr_cache_key(config, pre),
@@ -742,12 +743,12 @@ class _PostGateResult:
     review_verdict: Any
     build_res: Optional[BuildCheckResult]
     learned: List[str]
-    rejected_props: List[dict]
+    rejected_props: List[str]
 
 
 def _record_learned_invariants(
     target_repo: Path, review_verdict, session_id: str,
-) -> Tuple[List[str], List[dict]]:
+) -> Tuple[List[str], List[str]]:
     """Persist and format rules proposed by LLM review after verifying they pass on current code."""
     # Rules the reviewer discovered are written only after validation (new, and passing on this code),
     # before fingerprints are taken so the updated file is part of what was approved.
@@ -842,7 +843,7 @@ def _post_record_and_report(
         reviewed_fingerprints={p: _fingerprint(target_repo / p) for p in {f.path for f in diff_scope.diff_summary.files}},
         findings=[f.model_dump() for f in review_verdict.findings],
         learned_invariants=gate_res.learned, rejected_invariant_proposals=gate_res.rejected_props,
-        ocr_status=ocr_res.ocr_status, impact_summary=rules_res.impact_summary,
+        ocr_status=ocr_res.ocr_status, impact_summary=rules_res.impact_summary or "",
         ocr_complete=ocr_res.ocr_status.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in rules_res.violations),
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
@@ -942,6 +943,7 @@ def _ocr_cache_key(config, pre) -> Optional[str]:
     """
     import hashlib
     import re
+
     from guard.core.config import _llm_fingerprint
     from guard.core.updater import get_installed_ocr_version
     # the version is read from `ocr`: for another configured binary it says nothing

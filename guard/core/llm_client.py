@@ -204,9 +204,9 @@ def call_llm(
         raise LLMClientError(f"Unsupported protocol: {cfg.protocol}")
 
     except httpx.HTTPError as e:
-        raise LLMClientError(f"HTTP Network error: {str(e)}")
+        raise LLMClientError(f"HTTP Network error: {str(e)}") from e
     except Exception as e:
         # LLM client boundary: wrap any unexpected error as LLMClientError so callers handle failure uniformly
         if isinstance(e, LLMClientError):
             raise
-        raise LLMClientError(f"Unexpected error ({type(e).__name__}): {str(e)}")
+        raise LLMClientError(f"Unexpected error ({type(e).__name__}): {str(e)}") from e

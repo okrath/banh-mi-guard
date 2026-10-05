@@ -8,18 +8,13 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
-from pydantic import BaseModel
-
 from guard.core.code_text import (
-    CODE,
     CSS,
     ERB,
     MARKUP,
     PY,
     RB,
-    YAML,
     _block_comments,
-    _call_arguments,
     _carry_comment,
     _carry_string,
     _comment_start,
@@ -27,8 +22,6 @@ from guard.core.code_text import (
     _is_dockerfile,
     _is_docs_path,
     _is_test_path,
-    _mask_strings,
-    _scan,
     _tag_end,
 )  # noqa: F401
 from guard.core.rules import (
@@ -36,12 +29,11 @@ from guard.core.rules import (
     MAX_IMG_TAG,
     MAX_RULE_LINE,
     RuleViolation,
-    SUPPRESS_COMMENT,
+    _ruby_xss,
+    _sql_injection,
     _unsafe_html_sinks,
     _unsafe_yaml_load,
     shell_backtick_at,
-    _ruby_xss,
-    _sql_injection,
 )  # noqa: F401
 
 
@@ -287,7 +279,7 @@ class OCRRulebookRunner:
                 severity="LOW" if allowed else severity,
                 file_path=path,
                 line_number=line_num,
-                message=f"{rule_id} suppressed by author: {suppress.group(2).strip()[:120]}" if allowed else advice,
+                message=f"{rule_id} suppressed by author: {suppress.group(2).strip()[:120]}" if (allowed and suppress) else advice,
                 snippet=code[:80],
             ))
         return found
