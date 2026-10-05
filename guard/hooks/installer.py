@@ -312,6 +312,77 @@ class HookInstaller:
 
         return True, messages
 
+    def _uninstall_git_hooks(self) -> List[str]:
+        """Remove git hook scripts, restore backups, and clean exclude."""
+        messages: List[str] = []
+        for hook_name in ["pre-commit", "prepare-commit-msg"]:
+            hook_file = self.git_hooks_dir / hook_name
+            backup_file = self.git_hooks_dir / f"{hook_name}.guard.bak"
+
+            if hook_file.exists():
+                content = hook_file.read_text(encoding="utf-8", errors="ignore")
+                whole = is_legacy_whole_file(content) or "BANH-MI-GUARD AUTO-GENERATED HOOK" in content \
+                    or "BANH-MI-GUARD COMMIT MSG HOOK" in content
+                if not whole and strip_guard_parts(content) != content:
+                    # the user's own hook with guard's lines in it (any version): only those lines go
+                    hook_file.write_text(strip_guard_parts(content), encoding="utf-8", newline="\n")
+                    messages.append(f"Removed guard's lines from {hook_file}")
+                elif not whole and mentions_guard(content):
+                    messages.append(f"Left {hook_file} as it is: it names guard in a form guard did not write")
+                elif whole:
+                    if is_legacy_whole_file(content):  # guard <= 0.10's file: a copy is kept, as on refresh
+                        legacy_backup_path(hook_file).write_text(content, encoding="utf-8", newline="\n")
+                    hook_file.unlink()
+                    messages.append(f"Removed Guard hook: {hook_file}")
+
+                    # Restore backup if available
+                    if backup_file.exists():
+                        backup_file.rename(hook_file)
+                        messages.append(f"Restored previous hook backup from {backup_file}")
+
+        # Clean stealth local exclude
+        if self._remove_git_exclude():
+            messages.append("Cleaned '.guard/' entry from local .git/info/exclude")
+        return messages
+
+    def _uninstall_agent_hooks(self) -> List[str]:
+        """Remove agent wrapper and clean directives from instruction documents."""
+        messages: List[str] = []
+        agent_file = self.guard_bin_dir / "guard-exec"
+        if agent_file.exists():
+            agent_file.unlink()
+            messages.append(f"Removed Agent harness wrapper: {agent_file}")
+
+        # Clean directives from CLAUDE.md & AGENT.md (Safe restore / preserve user content)
+        start_marker, end_marker = DIRECTIVE_START, DIRECTIVE_END
+        for doc_path in [self.claude_md_path, self.agent_md_path]:
+            bak_path_new = doc_path.with_name(f"{doc_path.name}.guard.bak")
+            bak_path_legacy = doc_path.with_suffix(".guard.bak")
+            bak_path = bak_path_new if bak_path_new.exists() else bak_path_legacy
+            if bak_path.exists():
+                doc_path.unlink(missing_ok=True)
+                bak_path.rename(doc_path)
+                if bak_path == bak_path_new and bak_path_legacy.exists():
+                    bak_path_legacy.unlink(missing_ok=True)
+                messages.append(f"Restored previous {doc_path.name} from backup")
+            elif doc_path.exists():
+                # a guard <= 0.10 block (both markers) is removed the same way as a current one
+                content = legacy_directive_to_current(doc_path.read_text(encoding="utf-8", errors="ignore"))
+                if start_marker in content and end_marker in content:
+                    before = content.split(start_marker)[0].rstrip()
+                    after = content.split(end_marker)[1].lstrip()
+                    remaining = (before + "\n\n" + after).strip()
+                    if remaining:
+                        doc_path.write_text(remaining + "\n", encoding="utf-8")
+                        messages.append(f"Cleaned Guard directives from {doc_path.name}, preserved user directives")
+                    else:
+                        doc_path.unlink()
+                        messages.append(f"Removed Guard-generated {doc_path.name}")
+                elif "BANH-MI-GUARD" in content or content.strip() == AGENT_DIRECTIVES_TEMPLATE.strip():
+                    doc_path.unlink()
+                    messages.append(f"Removed Guard-generated {doc_path.name}")
+        return messages
+
     def uninstall(self, mode: str = "all") -> Tuple[bool, List[str]]:
         """
         Safely uninstall Guard hooks and restore backups if they exist.
@@ -322,76 +393,17 @@ class HookInstaller:
         if mode_clean not in valid_modes:
             raise ValueError(f"Invalid mode '{mode}'. Expected one of: {sorted(valid_modes)}")
 
-        messages = []
+        messages: List[str] = []
         normalized_mode = "git" if mode_clean in ["git", "stealth"] else ("agent" if mode_clean == "agent" else "all")
 
         # Remove git hooks
         if normalized_mode in ["git", "all"]:
-            for hook_name in ["pre-commit", "prepare-commit-msg"]:
-                hook_file = self.git_hooks_dir / hook_name
-                backup_file = self.git_hooks_dir / f"{hook_name}.guard.bak"
-
-                if hook_file.exists():
-                    content = hook_file.read_text(encoding="utf-8", errors="ignore")
-                    whole = is_legacy_whole_file(content) or "BANH-MI-GUARD AUTO-GENERATED HOOK" in content \
-                        or "BANH-MI-GUARD COMMIT MSG HOOK" in content
-                    if not whole and strip_guard_parts(content) != content:
-                        # the user's own hook with guard's lines in it (any version): only those lines go
-                        hook_file.write_text(strip_guard_parts(content), encoding="utf-8", newline="\n")
-                        messages.append(f"Removed guard's lines from {hook_file}")
-                    elif not whole and mentions_guard(content):
-                        messages.append(f"Left {hook_file} as it is: it names guard in a form guard did not write")
-                    elif whole:
-                        if is_legacy_whole_file(content):  # guard <= 0.10's file: a copy is kept, as on refresh
-                            legacy_backup_path(hook_file).write_text(content, encoding="utf-8", newline="\n")
-                        hook_file.unlink()
-                        messages.append(f"Removed Guard hook: {hook_file}")
-
-                        # Restore backup if available
-                        if backup_file.exists():
-                            backup_file.rename(hook_file)
-                            messages.append(f"Restored previous hook backup from {backup_file}")
-
-            # Clean stealth local exclude
-            if self._remove_git_exclude():
-                messages.append("Cleaned '.guard/' entry from local .git/info/exclude")
+            messages.extend(self._uninstall_git_hooks())
 
         # Remove agent wrapper and directives
         if normalized_mode in ["agent", "all"]:
-            agent_file = self.guard_bin_dir / "guard-exec"
-            if agent_file.exists():
-                agent_file.unlink()
-                messages.append(f"Removed Agent harness wrapper: {agent_file}")
+            messages.extend(self._uninstall_agent_hooks())
 
-            # Clean directives from CLAUDE.md & AGENT.md
-            # Clean directives from CLAUDE.md & AGENT.md (Safe restore / preserve user content)
-            start_marker, end_marker = DIRECTIVE_START, DIRECTIVE_END
-            for doc_path in [self.claude_md_path, self.agent_md_path]:
-                bak_path_new = doc_path.with_name(f"{doc_path.name}.guard.bak")
-                bak_path_legacy = doc_path.with_suffix(".guard.bak")
-                bak_path = bak_path_new if bak_path_new.exists() else bak_path_legacy
-                if bak_path.exists():
-                    doc_path.unlink(missing_ok=True)
-                    bak_path.rename(doc_path)
-                    if bak_path == bak_path_new and bak_path_legacy.exists():
-                        bak_path_legacy.unlink(missing_ok=True)
-                    messages.append(f"Restored previous {doc_path.name} from backup")
-                elif doc_path.exists():
-                    # a guard <= 0.10 block (both markers) is removed the same way as a current one
-                    content = legacy_directive_to_current(doc_path.read_text(encoding="utf-8", errors="ignore"))
-                    if start_marker in content and end_marker in content:
-                        before = content.split(start_marker)[0].rstrip()
-                        after = content.split(end_marker)[1].lstrip()
-                        remaining = (before + "\n\n" + after).strip()
-                        if remaining:
-                            doc_path.write_text(remaining + "\n", encoding="utf-8")
-                            messages.append(f"Cleaned Guard directives from {doc_path.name}, preserved user directives")
-                        else:
-                            doc_path.unlink()
-                            messages.append(f"Removed Guard-generated {doc_path.name}")
-                    elif "BANH-MI-GUARD" in content or content.strip() == AGENT_DIRECTIVES_TEMPLATE.strip():
-                        doc_path.unlink()
-                        messages.append(f"Removed Guard-generated {doc_path.name}")
         return True, messages
 
     def _write_hook_file(self, target_path: Path, script_content: str):
