@@ -187,10 +187,14 @@ class AgentBridge:
 
     @property
     def url(self) -> str:
+        if self._server is None:
+            raise RuntimeError("AgentBridge server is not running")
         return f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def env(self, base: Dict[str, str]) -> Dict[str, str]:
         """OCR's environment for this review: its HOME (and USERPROFILE) is the throwaway one."""
+        if self._home is None:
+            raise RuntimeError("AgentBridge temporary directory is not initialized")
         return {**base, "HOME": self._home.name, "USERPROFILE": self._home.name}
 
     def __exit__(self, *exc) -> None:

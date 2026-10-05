@@ -367,6 +367,7 @@ def test_ocr_reviews_only_files_changed_since_its_last_complete_review(tmp_path)
 
 def test_the_cache_is_off_when_the_ocr_version_is_unknown():
     from types import SimpleNamespace
+
     from guard.cli import _ocr_cache_key
     cfg = SimpleNamespace(ocr=SimpleNamespace(binary_path="ocr"))
     pre = SimpleNamespace(base_ref="abc")

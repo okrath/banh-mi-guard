@@ -12,7 +12,14 @@ import pytest
 from typer.testing import CliRunner
 
 from guard.agent.adapter import (
-    BUILT_IN, config_path, extension_text, installed, load_adapter, render, with_guard, without_guard,
+    BUILT_IN,
+    config_path,
+    extension_text,
+    installed,
+    load_adapter,
+    render,
+    with_guard,
+    without_guard,
 )
 from guard.agent.adapter_validation import validate_adapter
 from guard.agent.events import Decision, normalise
@@ -150,7 +157,6 @@ def test_a_file_guard_did_not_write_is_never_replaced():
 
 def test_list_shows_every_popular_agent(monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
     listed = CliRunner().invoke(app, ["agent", "list"])
     for name in POPULAR:
@@ -205,7 +211,6 @@ def test_a_changed_extension_file_is_shown_before_it_is_deleted(monkeypatch, cap
     import typer
 
     import guard.cli as cli
-
     import guard.commands.agent as agent_cmds
     adapter = BUILT_IN["pi"]
     path = config_path(adapter)
@@ -230,7 +235,6 @@ def test_omp_refuses_a_stop_once_then_lets_it_through():
 
 def test_list_skips_test_records_and_doctor_warns_when_no_edit_was_refused(tmp_path, monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir, test_record_path
     from guard.core.setup_health import setup_health
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
@@ -293,7 +297,6 @@ def test_doctor_skips_a_broken_registered_record(tmp_path):
 
 def test_grok_snake_case_events_count_in_agent_test(monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.core.repo_setup import guard_home
     assert CliRunner().invoke(app, ["agent", "test", "grok"]).exit_code == 0
     with open(guard_home() / "agent-events.log", "a", encoding="utf-8") as f:
@@ -412,7 +415,6 @@ def test_zcode_hooks_count_as_on_only_when_enabled_is_exactly_true(value):
 
 def test_an_extension_file_changed_while_the_diff_was_shown_is_left_alone(monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_path
     path = extension_path(BUILT_IN["pi"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -503,7 +505,6 @@ def test_presence_without_a_detect_folder_needs_the_config_file():
 
 def test_an_empty_file_that_appeared_after_the_diff_is_not_replaced(monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import extension_path
     path = extension_path(BUILT_IN["pi"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -600,6 +601,7 @@ def test_a_switch_record_whose_switch_is_off_is_dropped_on_add(monkeypatch):
 
 def test_a_config_write_that_fails_leaves_no_switch_record(monkeypatch):
     import typer
+
     import guard.cli as cli
     import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_path
@@ -618,8 +620,6 @@ def test_a_config_write_that_fails_leaves_no_switch_record(monkeypatch):
 
 
 def test_a_switch_the_user_set_to_null_is_theirs_and_never_recorded(monkeypatch):
-    import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import switched_on
     zcode = BUILT_IN["zcode"]
     assert switched_on(zcode, {"hooks": {"enabled": None}}) == [] and switched_on(zcode, {"hooks": {}}) == ["hooks.enabled"]
@@ -747,9 +747,9 @@ def test_a_hand_added_hook_test_older_than_the_fingerprint_is_unverified_not_cha
 
 def test_remove_says_so_when_the_switch_record_cannot_be_deleted(monkeypatch, capsys):
     import typer
+
     import guard.cli as cli
     import guard.commands.agent as agent_cmds
-    from guard.agent import adapter as adapter_mod
     from guard.agent.adapter import switched_path
     zcode = BUILT_IN["zcode"]
     path = config_path(zcode)

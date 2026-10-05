@@ -263,6 +263,7 @@ def test_every_piece_of_an_oversized_file_names_the_file(monkeypatch):
 
 def test_contracts_included_in_llm_prompt():
     from unittest.mock import patch
+
     from guard.core.session import DomainContract
 
     contracts = [

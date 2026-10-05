@@ -326,6 +326,7 @@ def _local_file_lock(repo_path: Path):
     overwrite each other's rules. Outside Git there is no shared metadata to protect: no lock.
     """
     from contextlib import nullcontext
+
     from guard.core.git_exclude import ExcludeLock
     try:
         return ExcludeLock(repo_path)

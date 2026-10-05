@@ -7,7 +7,6 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-
 PY = (".py",)
 
 JS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")

@@ -771,7 +771,7 @@ def test_fix7_sec_005_swift_and_rust_multiline_builders():
         'process.arguments = ["-c", userCmd]',
         "process.launch()",
     ]
-    swift_diff = "+++ b/src/Proc.swift\n@@ -0,0 +1,4 @@\n" + "".join(f"+{l}\n" for l in swift_lines)
+    swift_diff = "+++ b/src/Proc.swift\n@@ -0,0 +1,4 @@\n" + "".join(f"+{line}\n" for line in swift_lines)
     swift_hits = [v for v in OCRRulebookRunner().scan_diff(swift_diff) if v.rule_id == "SEC-005"]
     assert len(swift_hits) >= 1
     assert swift_hits[0].line_number == 2
@@ -782,7 +782,7 @@ def test_fix7_sec_005_swift_and_rust_multiline_builders():
         'process.executableURL = URL(fileURLWithPath: "/bin/bash")',
         "try process.run()",
     ]
-    swift_url_diff = "+++ b/src/Proc.swift\n@@ -0,0 +1,3 @@\n" + "".join(f"+{l}\n" for l in swift_url_lines)
+    swift_url_diff = "+++ b/src/Proc.swift\n@@ -0,0 +1,3 @@\n" + "".join(f"+{line}\n" for line in swift_url_lines)
     swift_url_hits = [v for v in OCRRulebookRunner().scan_diff(swift_url_diff) if v.rule_id == "SEC-005"]
     assert len(swift_url_hits) >= 1
     assert swift_url_hits[0].line_number == 2
@@ -797,7 +797,7 @@ def test_fix7_sec_005_swift_and_rust_multiline_builders():
         "    .arg(user_input)",
         "    .output()?;",
     ]
-    rust_diff = "+++ b/src/proc.rs\n@@ -0,0 +1,4 @@\n" + "".join(f"+{l}\n" for l in rust_lines)
+    rust_diff = "+++ b/src/proc.rs\n@@ -0,0 +1,4 @@\n" + "".join(f"+{line}\n" for line in rust_lines)
     rust_hits = [v for v in OCRRulebookRunner().scan_diff(rust_diff) if v.rule_id == "SEC-005"]
     # Both lines 1 and 2 match on their own
     assert any(h.line_number == 1 for h in rust_hits)

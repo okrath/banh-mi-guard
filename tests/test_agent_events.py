@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import pytest
-
 from typer.testing import CliRunner
 
 from guard.agent.events import AgentEvent, _pid_alive, decide, load_state, normalise
@@ -182,6 +181,7 @@ def test_a_command_with_a_heredoc_is_measured_not_trusted():
 
 def test_concurrent_posts_keep_each_others_marker(tmp_path):
     import os
+
     from guard.agent.events import POST_MARKER, post_running
     repo = make_repo(tmp_path)
     marker = repo / ".guard" / POST_MARKER
@@ -207,6 +207,7 @@ def test_a_prompt_in_utf8_survives_a_cp1252_console(tmp_path):
 def test_stop_waits_for_a_running_post_and_a_marker_never_allows_it(tmp_path, monkeypatch):
     import sys
     import time
+
     import guard.agent.events as events
     repo = make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
@@ -322,6 +323,7 @@ def test_stop_ignores_pre_existing_changes_the_task_did_not_touch(tmp_path):
 
 def test_parallel_hook_calls_keep_every_fingerprint(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
+
     from guard.agent.events import load_state
     repo = make_repo(tmp_path)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -370,7 +372,6 @@ def test_a_new_prompt_wins_over_the_restarted_sessions_prompt(tmp_path):
 
 
 def test_oversized_payload_is_allowed_and_logged(tmp_path, monkeypatch):
-    import guard.cli as cli
     import guard.commands.agent as agent_cmds
     from guard.core.repo_setup import guard_home
     monkeypatch.setattr(agent_cmds, "MAX_EVENT_BYTES", 100)
@@ -407,6 +408,7 @@ def test_pre_keeps_fingerprints_of_commands_still_running(tmp_path):
 def test_posix_zombie_process_is_not_reported_alive():
     import sys
     import time
+
     import guard.agent.events as events
     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
     time.sleep(0.5)

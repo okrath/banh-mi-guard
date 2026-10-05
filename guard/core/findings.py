@@ -9,7 +9,6 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 
-
 SEVERITIES = ("critical", "high", "medium", "low")
 KINDS = ("correctness", "security", "requirement", "maintainability", "style", "documentation", "other")
 BLOCKING_KINDS = {"correctness", "security"}

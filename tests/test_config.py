@@ -13,6 +13,7 @@ from guard.core.config import (
     sync_to_alibaba_ocr,
 )
 
+
 def test_llm_config_masking():
     cfg = LLMConfig(api_key="sk-1234567890abcdef")
     assert cfg.masked_api_key == "sk-1...cdef"
@@ -86,6 +87,7 @@ def test_local_llm_wizard_never_writes_the_machine_wide_ocr_config(tmp_path):
 
 def test_save_config_file_permissions(tmp_path):
     import os
+
     import pytest
     if os.name == "nt":
         pytest.skip("POSIX file permissions (0o600) cannot be expressed on Windows")

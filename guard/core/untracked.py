@@ -25,7 +25,17 @@ from guard.core.git_exclude import inside_git_dir as _inside_git_dir
 from guard.core.git_exclude import open_no_follow as _open_no_follow  # noqa: F401  (kept importable here)
 from guard.core.git_exclude import write_bytes_atomic as _write_bytes_atomic
 from guard.core.untracked_names import (  # noqa: F401  (public names of this module)
-    MARK, exclude_lines as _exclude_lines, is_guard_dir as _is_guard_dir, normalise, printable, shown, suggest,
+    MARK,
+    normalise,
+    printable,
+    shown,
+    suggest,
+)
+from guard.core.untracked_names import (
+    exclude_lines as _exclude_lines,
+)
+from guard.core.untracked_names import (
+    is_guard_dir as _is_guard_dir,
 )
 
 DECISIONS_FILE = "guard-untracked.json"
@@ -129,7 +139,7 @@ def undecided(repo: Path, skip_task_files: bool = True) -> List[str]:
     session = SessionManager(repo).load_local_session()
     running = skip_task_files and session and session.pre and \
         session.status in (SessionStatus.AWAITING_POST, SessionStatus.NEEDS_FIX)
-    baseline = set(session.pre.baseline_dirty) if running else None  # a finished task's baseline says nothing
+    baseline = set(session.pre.baseline_dirty) if (running and session and session.pre) else None  # a finished task's baseline says nothing
 
     def created_by_task(entry: str) -> bool:
         return baseline is not None and not any(

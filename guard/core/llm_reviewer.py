@@ -21,15 +21,9 @@ from pydantic import BaseModel, Field
 
 from guard.core.config import GuardConfig
 from guard.core.findings import (
-    BLOCKING_KINDS,
-    KINDS,
-    SEVERITIES,
     Finding,
-    _norm,
     _parse_invariant_proposals,
     _resolved_script,
-    classify,
-    finding_id,
     parse_findings,
 )  # noqa: F401
 from guard.core.invariant_eval import DomainType, InvariantResult
@@ -279,7 +273,7 @@ class LLMReviewerEngine:
         self._task_text = prompt  # what a quoted requirement is checked against
 
         model_name = self.config.llm.model
-        domain_str = domain.value if hasattr(domain, "value") else str(domain)
+        domain_str = domain.value if isinstance(domain, DomainType) else str(domain)
 
         focus_instruction = ""
         if focus == "security":

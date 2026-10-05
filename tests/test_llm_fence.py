@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
+
 import httpx
-import pytest
 
 from guard.core import cli_llm
 from guard.core.config import LLMConfig, LLMProtocol
@@ -8,8 +8,8 @@ from guard.core.llm_client import (
     UNTRUSTED_CLOSE,
     UNTRUSTED_OPEN,
     UNTRUSTED_RULE,
-    fence_untrusted,
     call_llm,
+    fence_untrusted,
 )
 
 

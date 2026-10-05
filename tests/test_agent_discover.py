@@ -31,7 +31,6 @@ FOREIGN = {"command": "node audit.js", "timeout": 5}
 
 
 def test_only_the_version_number_of_the_agent_is_sent(monkeypatch):
-    import subprocess
     acme_home()
     monkeypatch.setattr(discover.shutil, "which", lambda name: "C:/tools/acme.exe")
     out = f"acme 1.7.2 (build abc)\nlogged in as me@example.com with key {SECRET}\n"
@@ -133,7 +132,6 @@ def test_an_llm_failure_still_offers_the_way_forward():
 
 def test_list_survives_a_broken_record(monkeypatch):
     import guard.cli as cli
-    import guard.commands.agent as agent_cmds
     from guard.agent.adapter import adapters_dir
     monkeypatch.setattr(cli.console, "width", 250, raising=False)
     adapters_dir().mkdir(parents=True, exist_ok=True)
@@ -148,7 +146,6 @@ def test_an_address_is_not_a_version():
 
 
 def test_an_ambiguous_version_is_left_out(monkeypatch):
-    import subprocess
     monkeypatch.setattr(discover.shutil, "which", lambda name: "C:/tools/x.exe")
     out = "x 2.0.1 (update 2.1.0 available, proxy 10.0.0.5)\n"
     monkeypatch.setattr(discover, "_first_bytes", lambda *a, **k: out)
@@ -637,7 +634,7 @@ def test_fix_summary_survives_a_field_path_that_is_not_text():
 
 def test_a_config_guard_cannot_read_ends_with_the_way_forward(monkeypatch, capsys):
     import typer
-    from guard import cli
+
     import guard.commands.agent as agent_cmds
     from guard.agent.adapter import AdapterError
 
@@ -653,8 +650,9 @@ def test_a_config_guard_cannot_read_ends_with_the_way_forward(monkeypatch, capsy
 
 def test_a_failed_config_write_keeps_the_adapter_as_it_was(monkeypatch, capsys):
     import typer
-    from guard import cli
+
     import guard.commands.agent as agent_cmds
+    from guard import cli
     from guard.agent.adapter import adapters_dir, config_path
     adapter = dict(CURSOR, name="widget", config="~/.widget/hooks.json", detect="~/.widget")
     config_path(adapter).parent.mkdir(parents=True, exist_ok=True)
@@ -705,10 +703,12 @@ def test_a_config_in_a_moved_appdata_folder_can_be_named_as_discovery_shows_it(t
 
 
 def test_the_issue_names_a_config_that_failed_to_write_without_the_full_path(monkeypatch, capsys):
-    import typer
     from urllib.parse import unquote
-    from guard import cli
+
+    import typer
+
     import guard.commands.agent as agent_cmds
+    from guard import cli
     adapter = dict(CURSOR, name="widget", config="~/.widget/hooks.json", detect="~/.widget")
     (home() / ".widget").mkdir(parents=True, exist_ok=True)
 

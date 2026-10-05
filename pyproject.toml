@@ -23,6 +23,8 @@ dependencies = [
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "ruff",
+    "pyright",
 ]
 
 [project.scripts]
@@ -31,3 +33,19 @@ guard = "guard.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["guard*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+include = ["guard"]
+pythonVersion = "3.10"

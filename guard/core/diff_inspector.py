@@ -125,8 +125,8 @@ class GitDiffInspector:
                         f"+++ b/{uf}",
                         f"@@ -0,0 +1,{max(1, len(lines))} @@",
                     ]
-                    for l in lines:
-                        synth.append(f"+{l}")
+                    for line in lines:
+                        synth.append(f"+{line}")
                     synthetic_diffs.append("\n".join(synth))
                 except OSError as e:
                     self.last_error = f"untracked file {uf} could not be read: {e}"
@@ -289,7 +289,8 @@ class GitDiffInspector:
                 if match:
                     current_file = match.group(2)
                     current_status = "modified"
-                    files_map[current_file] = FileDiffStat(path=current_file, status=current_status)
+                    if current_file:
+                        files_map[current_file] = FileDiffStat(path=current_file, status=current_status)
             elif line.startswith("new file mode") and current_file:
                 files_map[current_file].status = "added"
             elif line.startswith("deleted file mode") and current_file:

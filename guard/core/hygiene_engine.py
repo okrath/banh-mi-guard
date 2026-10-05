@@ -13,10 +13,10 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional
 
 from guard.core.code_text import CODE
-from guard.core.ocr_engine import DiffSummary, FileDiffStat, RuleViolation
+from guard.core.ocr_engine import DiffSummary, RuleViolation
 
 SEARCH_EXTENSIONS = CODE + (
     ".json", ".yaml", ".yml", ".toml", ".xml",

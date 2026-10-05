@@ -10,11 +10,8 @@ from pathlib import Path
 import pytest
 
 import guard.cli as cli
-
 import guard.commands.agent as agent_cmds
-
 import guard.commands.config as config_cmds
-
 import guard.commands.setup as setup_cmds
 from guard.agent.adapter import CLAUDE_CODE, installed
 from guard.core.config import GuardConfig, LLMConfig, load_global_config, ocr_in_sync, save_config
@@ -158,6 +155,7 @@ def test_what_setup_reports_is_what_happened(machine, tmp_path, monkeypatch):
 def test_ocr_syncs_run_one_at_a_time():
     import threading
     import time
+
     from guard.core.config import _sync_lock
     order = []
 
@@ -206,8 +204,9 @@ def test_doctor_shows_the_llm_and_the_ocr_sync(machine, tmp_path, monkeypatch):
 
 def test_config_ocr_cmd_refuses_without_tty(monkeypatch):
     import sys
-    import typer
+
     import pytest
+    import typer
     cfg = load_global_config()
     initial = cfg.ocr.always
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
@@ -229,8 +228,9 @@ def test_ocr_always_runs_the_review_on_a_plain_post_but_never_in_the_hook(tmp_pa
     import sys
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
-    from guard.cli import execute_post_task, execute_pre_task
     from test_agent_events import make_repo
+
+    from guard.cli import execute_post_task, execute_pre_task
     repo = make_repo(tmp_path)
     config_cmds.config_ocr_cmd("always")
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True

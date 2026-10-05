@@ -11,7 +11,13 @@ from pathlib import Path
 from guard.cli import execute_pre_task
 from guard.core import repo_setup
 from guard.core.repo_setup import (
-    DIRECTIVE_END, DIRECTIVE_START, HOOK_BLOCK_START, ensure_repo_setup, guard_home, refresh_after_upgrade, refresh_directive_block,
+    DIRECTIVE_END,
+    DIRECTIVE_START,
+    HOOK_BLOCK_START,
+    ensure_repo_setup,
+    guard_home,
+    refresh_after_upgrade,
+    refresh_directive_block,
 )
 from guard.core.setup_health import setup_health
 from guard.hooks.templates import AGENT_DIRECTIVES_TEMPLATE
@@ -134,7 +140,9 @@ def test_unmarked_directives_warning_says_how_to_fix(tmp_path):
 
 def test_update_self_refreshes_with_the_new_binary(monkeypatch):
     from unittest.mock import patch
+
     from typer.testing import CliRunner
+
     from guard.cli import app
 
     calls = []

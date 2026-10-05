@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from guard.agent.bash import content_hash
-
 from guard.agent.events import (
     AgentEvent,
     _is_guard_path,
@@ -32,7 +31,6 @@ from guard.core.session import (
     PreTaskRecord,
     SessionManager,
     SessionStatus,
-    compute_approval_signature,
     get_approval_key,
 )
 from guard.task_flow import _post_check_hook_and_session, execute_post_task, execute_pre_task
@@ -318,7 +316,8 @@ def test_guard_path_and_uncovered_logic(tmp_path):
 
 def test_guard_accept_write_path_produces_verifiable_signature(tmp_path, fake_ocr_review, monkeypatch):
     import sys
-    from guard.commands.review import accept_cmd, Prompt
+
+    from guard.commands.review import Prompt, accept_cmd
 
     repo = _make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
@@ -506,6 +505,7 @@ def test_guard_command_detection_variants():
 
 def test_save_oserror_in_finding_command(tmp_path, monkeypatch):
     from typer.testing import CliRunner
+
     from guard.cli import app
 
     repo = _make_repo(tmp_path)

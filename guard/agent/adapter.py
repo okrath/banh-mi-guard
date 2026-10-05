@@ -63,7 +63,11 @@ CLAUDE_CODE: Dict[str, Any] = {
         },
     },
 }
-from guard.agent.builtins import ADAPTERS as _SHIPPED, EXTENSION_MARKER, EXTENSION_SOURCES  # noqa: E402
+from guard.agent.builtins import ADAPTERS as _SHIPPED  # noqa: E402  # circular dependency between adapter and builtins
+from guard.agent.builtins import (  # noqa: E402  # circular dependency between adapter and builtins
+    EXTENSION_MARKER,
+    EXTENSION_SOURCES,
+)
 
 BUILT_IN = {"claude-code": CLAUDE_CODE, **_SHIPPED}  # the popular agents, each checked against its own source
 

@@ -171,7 +171,6 @@ def test_guard_accept_is_the_users_and_approves_only_what_was_reviewed(tmp_path,
     assert CliRunner().invoke(app, ["accept"]).exit_code == 1  # no terminal: an agent cannot accept
 
     import guard.cli as cli
-
     import guard.commands.review as review_cmds
 
     def accept(answer):

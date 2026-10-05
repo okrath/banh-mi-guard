@@ -16,8 +16,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from guard.core.repo_setup import (
-    DIRECTIVE_END, DIRECTIVE_START, is_legacy_whole_file, legacy_backup_path, legacy_directive_to_current,
-    mentions_guard, strip_guard_parts,
+    DIRECTIVE_END,
+    DIRECTIVE_START,
+    is_legacy_whole_file,
+    legacy_backup_path,
+    legacy_directive_to_current,
+    mentions_guard,
+    strip_guard_parts,
     strip_legacy_parts,
 )
 from guard.hooks.templates import (

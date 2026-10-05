@@ -1,9 +1,9 @@
 import hashlib
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
-from unittest.mock import patch
 
 # The user's real agent config and guard home, resolved before any test patches HOME
 _REAL_FILES = [Path(os.path.expanduser("~/.claude/settings.json")), Path(os.path.expanduser("~/.guard/agents/claude-code.json"))]

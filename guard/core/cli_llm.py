@@ -19,8 +19,8 @@ Alibaba OCR cannot use this: it only calls an HTTP endpoint, with tool calls. `g
 from __future__ import annotations
 
 import json
-import re
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -121,7 +121,11 @@ def _models(agent: str, binary: str, timeout: float = 60) -> List[str]:
     except (ValueError, AttributeError):
         return []
     shown = [m for m in catalog if isinstance(m, dict) and m.get("visibility") == "list" and isinstance(m.get("slug"), str)]
-    return [m["slug"] for m in sorted(shown, key=lambda m: m.get("priority") if isinstance(m.get("priority"), int) else 99)]
+    def _prio(item: dict) -> int:
+        p = item.get("priority")
+        return p if isinstance(p, int) else 99
+
+    return [m["slug"] for m in sorted(shown, key=_prio)]
 
 
 def probe(agent: str, timeout: Optional[float] = None) -> tuple:

@@ -204,7 +204,8 @@ def fresh_claim(state: Dict[str, Any]) -> Optional[Dict[str, str]]:
     session did, and when two did (two pres started together): which pre is whose is then unknown,
     so neither gets an owner and the shared behaviour applies.
     """
-    claims = state.get("claims") if isinstance(state.get("claims"), dict) else {}
+    raw_claims = state.get("claims")
+    claims: dict = raw_claims if isinstance(raw_claims, dict) else {}
     fresh = [(s, c) for s, c in claims.items() if isinstance(c, dict) and time.time() - c.get("at", 0) <= CLAIM_TTL_S]
     if len(fresh) != 1:
         return None
@@ -231,7 +232,7 @@ def _from_another_session(ev: AgentEvent, session) -> bool:
 def _held_reason(session) -> str:
     owner, pre = _owner(session), session.pre
     task = " ".join(pre.prompt.split())[:80]
-    return (f"this working tree is held by another agent's guard session ({describe_owner(owner)}, task "
+    return (f"this working tree is held by another agent's guard session ({describe_owner(owner or {})}, task "
             f"\"{task}\", since {pre.timestamp[:16].replace('T', ' ')} UTC)")
 
 
@@ -379,9 +380,10 @@ def is_guard_command(cmd: str) -> bool:
 
 def _claim(state: Dict[str, Any], agent_session: str, agent: str) -> None:
     """Record that this agent session starts a `guard pre`; claims older than CLAIM_TTL_S go."""
-    claims = state.get("claims") if isinstance(state.get("claims"), dict) else {}
+    raw_claims = state.get("claims")
+    claims_dict: dict = raw_claims if isinstance(raw_claims, dict) else {}
     now = time.time()
-    claims = {s: c for s, c in claims.items() if isinstance(c, dict) and now - c.get("at", 0) <= CLAIM_TTL_S}
+    claims = {s: c for s, c in claims_dict.items() if isinstance(c, dict) and now - c.get("at", 0) <= CLAIM_TTL_S}
     claims[agent_session] = {"agent": agent, "at": now}
     state["claims"] = claims
 
@@ -472,7 +474,9 @@ def decide(ev: AgentEvent) -> Decision:
         unclassified = bool(tool) and tool not in EDIT_TOOLS and not shell and not ev.file_paths
         if shell and ev.command and ev.agent_session and GUARD_PRE.search(ev.command):
             # the guard pre this command starts belongs to this agent session (its owner)
-            update_state(repo, lambda s: _claim(s, session_key(ev), ev.agent))
+            s_key = session_key(ev)
+            if s_key:
+                update_state(repo, lambda s: _claim(s, s_key, ev.agent))
         if (shell and ev.command and not is_read_only(ev.command)) or unclassified:
             # An unknown command, or a tool guard cannot classify that names no file: it runs, and
             # what it changed is measured afterwards (the after-tool event)

@@ -5,11 +5,11 @@ UTF-8, exclude-file bytes and line endings, terminal escaping and copy-safe sugg
 
 import subprocess
 
+from test_untracked import exclude_text, make_repo  # pytest puts tests/ on sys.path
 from typer.testing import CliRunner
 
 from guard.cli import app, execute_pre_task
 from guard.core.untracked import MARK, decide, load_decisions, undecided
-from test_untracked import exclude_text, make_repo  # pytest puts tests/ on sys.path
 
 
 def test_special_characters_are_ignored_literally(tmp_path):
@@ -46,6 +46,7 @@ def test_include_removes_only_that_entrys_pair(tmp_path):
 
 def test_more_control_characters_and_git_launch_failures(tmp_path, monkeypatch, capsys):
     import pytest
+
     import guard.core.untracked as untracked
     repo = make_repo(tmp_path)
     for bad in ("x\u0085y", "x y"):  # C1 next-line and the Unicode line separator
@@ -99,6 +100,7 @@ def test_rejected_names_are_shown_literally(tmp_path, monkeypatch):
 
 def test_safe_names_must_be_safe_to_the_end_and_listing_errors_are_clean(tmp_path, monkeypatch):
     import pytest
+
     import guard.core.untracked as untracked
     from guard.core.untracked import suggest
     assert "<the path above>" in suggest("ok.md\n")  # a trailing newline is not a safe name
@@ -110,7 +112,9 @@ def test_safe_names_must_be_safe_to_the_end_and_listing_errors_are_clean(tmp_pat
 
 def test_the_lock_file_is_never_opened_through_a_link(tmp_path):
     import os
+
     import pytest
+
     from guard.core.untracked import _open_no_follow
     target = tmp_path / "elsewhere"
     target.mkdir()
