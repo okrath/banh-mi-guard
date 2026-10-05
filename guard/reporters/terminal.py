@@ -17,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
-from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings, snapshot_missing_reason
+from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
 
 console = Console()
 
@@ -92,7 +92,7 @@ def render_pre_task_terminal(pre: PreTaskRecord):
 
     if pre.baseline_dirty:
         if not pre.baseline_snapshot:
-            snapshot_reason = snapshot_missing_reason(pre)
+            snapshot_reason = pre.baseline_snapshot_error
             reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
             console.print(f"[bold yellow]⚠️ Started with {len(pre.baseline_dirty)} pre-existing modified file(s). Baseline snapshot missing{reason_part}; post will review the full diff.[/bold yellow]")
         else:
@@ -118,8 +118,7 @@ def render_pre_task_terminal(pre: PreTaskRecord):
                             border_style="green"))
 
 
-def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None):
-    # Overall Verdict Badge (from the configured LLM / Gatekeeper)
+def _render_post_verdict_banner(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None) -> None:
     is_approved = post.muse_verdict == "APPROVED"
     badge_style = "bold white on green" if is_approved else "bold white on red"
     label = gate_label(post).upper()
@@ -137,12 +136,14 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
     console.print(Panel(summary_text, border_style="green" if is_approved else "red"))
 
     if pre and pre.baseline_dirty and not pre.baseline_snapshot:
-        snapshot_reason = snapshot_missing_reason(pre)
+        snapshot_reason = pre.baseline_snapshot_error
         reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
         console.print(f"[bold yellow]⚠️ Baseline snapshot missing{reason_part}: review covers the full diff.[/bold yellow]")
     if post.diff_summary and post.diff_summary.error:
         console.print(f"[bold red]❌ Diff inspection error: {post.diff_summary.error}[/bold red]")
-    # Diff & Blast Radius Table
+
+
+def _render_post_diff_and_build(post: PostTaskRecord) -> None:
     if post.diff_summary:
         diff_table = Table(title="📊 Actual Impact Range & Blast Radius (OCR Inspector)", show_header=True)
         diff_table.add_column("File Path", style="bold")
@@ -163,7 +164,6 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
             diff_table.add_row(f.path, f.status, str(f.insertions), str(f.deletions), scope_badge)
         console.print(diff_table)
 
-    # Build Check status
     if post.build_check:
         b_color = "green" if post.build_check.passed else "red"
         b_icon = "✅" if post.build_check.passed else "❌"
@@ -172,7 +172,8 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
             b_text += f"\n[dim]{post.build_check.output[:300]}[/dim]"
         console.print(Panel(b_text, title="⚙️ Project Health & Build Verification", border_style=b_color))
 
-    # Invariants Verification
+
+def _render_post_invariants(post: PostTaskRecord) -> None:
     if post.invariant_result:
         inv_table = Table(title="🧪 Invariant Verification (deterministic checks)", show_header=True)
         inv_table.add_column("ID", width=12)
@@ -190,48 +191,49 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
             inv_table.add_row(c.id, c.description, v_text, c.notes)
         console.print(inv_table)
 
-    # Rule Violations (OCR, Code Hygiene & Simplicity)
-    if post.rule_violations:
-        ocr_viols = [v for v in post.rule_violations if not v.rule_id.startswith(("DEAD-", "LAZY-", "OCR-"))]
-        dead_viols = [v for v in post.rule_violations if v.rule_id.startswith("DEAD-")]
-        lazy_viols = [v for v in post.rule_violations if v.rule_id.startswith("LAZY-")]
 
-        if ocr_viols:
-            viol_table = Table(title="🚨 Built-in Rulebook Violations", show_header=True, header_style="bold red")
-            viol_table.add_column("Rule ID", style="bold red", width=10)
-            viol_table.add_column("Severity", width=10)
-            viol_table.add_column("Location")
-            viol_table.add_column("Violation Message")
+def _render_post_rule_violations(post: PostTaskRecord) -> None:
+    if not post.rule_violations:
+        return
+    ocr_viols = [v for v in post.rule_violations if not v.rule_id.startswith(("DEAD-", "LAZY-", "OCR-"))]
+    dead_viols = [v for v in post.rule_violations if v.rule_id.startswith("DEAD-")]
+    lazy_viols = [v for v in post.rule_violations if v.rule_id.startswith("LAZY-")]
 
-            for v in ocr_viols:
-                loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
-                viol_table.add_row(v.rule_id, v.severity, loc, v.message)
-            console.print(viol_table)
+    if ocr_viols:
+        viol_table = Table(title="🚨 Built-in Rulebook Violations", show_header=True, header_style="bold red")
+        viol_table.add_column("Rule ID", style="bold red", width=10)
+        viol_table.add_column("Severity", width=10)
+        viol_table.add_column("Location")
+        viol_table.add_column("Violation Message")
+        for v in ocr_viols:
+            loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
+            viol_table.add_row(v.rule_id, v.severity, loc, v.message)
+        console.print(viol_table)
 
-        if dead_viols:
-            hygiene_table = Table(title="🧹 Code & Asset Hygiene Audit (Dead Code Gate)", show_header=True, header_style="bold yellow")
-            hygiene_table.add_column("Rule ID", style="bold yellow", width=10)
-            hygiene_table.add_column("Severity", width=10)
-            hygiene_table.add_column("Location")
-            hygiene_table.add_column("Hygiene Issue & Recommendation")
+    if dead_viols:
+        hygiene_table = Table(title="🧹 Code & Asset Hygiene Audit (Dead Code Gate)", show_header=True, header_style="bold yellow")
+        hygiene_table.add_column("Rule ID", style="bold yellow", width=10)
+        hygiene_table.add_column("Severity", width=10)
+        hygiene_table.add_column("Location")
+        hygiene_table.add_column("Hygiene Issue & Recommendation")
+        for v in dead_viols:
+            loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
+            hygiene_table.add_row(v.rule_id, v.severity, loc, v.message)
+        console.print(hygiene_table)
 
-            for v in dead_viols:
-                loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
-                hygiene_table.add_row(v.rule_id, v.severity, loc, v.message)
-            console.print(hygiene_table)
+    if lazy_viols:
+        simplicity_table = Table(title="🛋️ Engineering Frugality & KISS Audit (Simplicity Gate)", show_header=True, header_style="bold magenta")
+        simplicity_table.add_column("Rule ID", style="bold magenta", width=10)
+        simplicity_table.add_column("Severity", width=10)
+        simplicity_table.add_column("Location")
+        simplicity_table.add_column("Simplicity & YAGNI Recommendation")
+        for v in lazy_viols:
+            loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
+            simplicity_table.add_row(v.rule_id, v.severity, loc, v.message)
+        console.print(simplicity_table)
 
-        if lazy_viols:
-            simplicity_table = Table(title="🛋️ Engineering Frugality & KISS Audit (Simplicity Gate)", show_header=True, header_style="bold magenta")
-            simplicity_table.add_column("Rule ID", style="bold magenta", width=10)
-            simplicity_table.add_column("Severity", width=10)
-            simplicity_table.add_column("Location")
-            simplicity_table.add_column("Simplicity & YAGNI Recommendation")
 
-            for v in lazy_viols:
-                loc = f"{v.file_path}:{v.line_number}" if v.line_number else v.file_path
-                simplicity_table.add_row(v.rule_id, v.severity, loc, v.message)
-            console.print(simplicity_table)
-
+def _render_post_findings_and_summary(post: PostTaskRecord) -> None:
     for f in post.findings:
         label = "[bold red]BLOCKING[/bold red]" if f.get("blocking") else "[dim]advisory[/dim]"
         console.print(f"{label} [{f.get('id')}] {f.get('severity')} {f.get('kind')} ", end="")
@@ -266,6 +268,14 @@ def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord]
     if post.all_passed:
         console.print("[bold cyan]📝 Commit:[/bold cyan] ", end="")
         console.print(commit_instruction(post), markup=False)
+
+
+def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None):
+    _render_post_verdict_banner(post, pre)
+    _render_post_diff_and_build(post)
+    _render_post_invariants(post)
+    _render_post_rule_violations(post)
+    _render_post_findings_and_summary(post)
 
 
 # --- guard accept -------------------------------------------------------------------------------------
