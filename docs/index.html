@@ -258,7 +258,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. POST-TASK PHASE: `guard post`                            │
 │ • Diff Inspector (0-cost): Diff audit &amp; blast radius check  │
-│ • Static rules: secrets, injection, listeners, infra, UX    │
+│ • Static rules: secrets, injection, XSS, infra, UX          │
 │ • Alibaba OCR (LLM, --full): Reviews the task's changes     │
 │ • Project Health Check: Automated compile &amp; test execution  │
 │ • Invariant checks (0-cost): guard.invariants.json rules    │
@@ -398,6 +398,7 @@ guard doctor</code></pre>
       <ul>
         <li><strong>OpenAI / OpenAI-Compatible:</strong> OpenAI, DeepSeek, Ollama (<code>http://localhost:11434/v1</code>), OpenRouter, or Local Gateways (<code>http://127.0.0.1:8090/v1</code>).</li>
         <li><strong>Anthropic:</strong> Claude API (any current Claude model).</li>
+        <li><strong>My agent CLI:</strong> <code>claude</code>, <code>codex</code>, or <code>omp</code> on this machine answers through your subscription with no API key.</li>
       </ul>
       <p>Test your connection with an instant sub-second verification ping:</p>
       <pre><code>guard config test</code></pre>
@@ -422,7 +423,8 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
         The agent reads the directives and runs <code>guard pre</code> before editing; the first guard run inside a repository sets it up, and the Git hook checks every commit. Agents without a global instruction file (Cursor, omp) get the directives through a workspace install.
       </p>
       <div class="card" style="margin-top: 16px;">
-        <strong>🧾 No diff in your repository:</strong> inside a repository guard writes only in <code>.git</code> and the Git-excluded <code>.guard/</code> folder (local invariants, sessions, reports). Repository files (agent docs, hooks kept in the tree such as <code>.husky/</code>, <code>guard.invariants.json</code>) are only read; <code>guard doctor</code> tells you what to change. Where guard is asked to write agent docs, it appends a marked block and keeps your content (<code>.guard.bak</code> backup).
+        <strong>🧾 No diff in your repository:</strong> inside a repository guard writes only in <code>.git</code> and the Git-excluded <code>.guard/</code> folder (local invariants, sessions, reports). Repository files (agent docs, hooks kept in the tree such as <code>.husky/</code>, <code>guard.invariants.json</code>) are only read; <code>guard doctor</code> tells you what to change. Where guard is asked to write agent docs, it appends a marked block and keeps your content (<code>.guard.bak</code> backup).<br><br>
+        <strong>🔒 State isolation &amp; signed approvals:</strong> approvals are cryptographically signed with HMAC-SHA256 (<code>$GUARD_HOME/approval.key</code>). Automated agent edit tools are blocked on <code>.guard/</code>, and unsigned approvals are refused on commit. See <a href="architecture.md#4-security-model--state-integrity">Architecture: Security Model</a>.
       </div>
       <p style="margin-top: 16px;">After an upgrade, <code>guard update self</code> refreshes what guard installed and prints a setup check; <code>guard doctor</code> shows the same check at any time.</p>
     </section>
@@ -459,8 +461,8 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
             <td><code>--scope</code>, <code>--allow-dirty</code>, <code>--force</code></td>
           </tr>
           <tr>
-            <td><code>guard invariants init / check</code></td>
-            <td>Create the local invariants file / evaluate every rule on the current code</td>
+            <td><code>guard invariants init / check / prune</code></td>
+            <td>Create local invariants file / evaluate rules / prune unchecked learned rules</td>
             <td><code>--shared</code></td>
           </tr>
           <tr>
@@ -474,9 +476,19 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
             <td><code>--defer "&lt;why&gt;"</code>, <code>--reject "&lt;evidence&gt;"</code></td>
           </tr>
           <tr>
+            <td><code>guard untracked [path]</code></td>
+            <td>Decide whether an untracked path is tracked by guard or always ignored</td>
+            <td><code>--include</code>, <code>--ignore</code></td>
+          </tr>
+          <tr>
             <td><code>guard accept</code></td>
             <td>Your decision on a task that used its review rounds: approve as reviewed, or allow three more rounds</td>
             <td>interactive terminal only</td>
+          </tr>
+          <tr>
+            <td><code>guard setup</code></td>
+            <td>Interactive setup for missing config: LLM, Alibaba OCR, commit mode, agent hooks</td>
+            <td>—</td>
           </tr>
           <tr>
             <td><code>guard review</code></td>
@@ -485,7 +497,7 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
           </tr>
           <tr>
             <td><code>guard config llm</code></td>
-            <td>Launch interactive LLM configuration wizard (an API, or your own <code>claude</code> / <code>codex</code> CLI)</td>
+            <td>Launch interactive LLM configuration wizard (an API, or your own <code>claude</code> / <code>codex</code> / <code>omp</code> CLI)</td>
             <td><code>--local</code></td>
           </tr>
           <tr>
