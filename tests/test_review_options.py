@@ -1,19 +1,21 @@
 """
-Unit tests for guard.core.review_options (Task O).
+Unit tests for guard.core.review_options.
 
 Validates:
 - Defaults of ReviewOptions
-- Layered resolution: defaults < global_cfg < cli
+- Layered resolution: defaults < global_cfg["review"] < cli
 - CLI overrides global_cfg and defaults
 - CLI None values do not override config or defaults
+- Flat global_cfg without 'review' dict is not read as review options
 - Unknown keys in config and CLI are ignored with no error
-- Strict validation of invalid values with informative error messages
-- Boolean spellings (true/false/1/0/yes/no/y/n/t/f, case-insensitive)
-- Isolation from environment variables (GUARD_REVIEW_*)
+- Ignored keys reporting for review config typos and non-object review
+- Strict validation of invalid values with informative error messages naming all invalid fields
+- Attribute assignment validation and with_overrides revalidation
+- Boolean spellings (true/false/1/0/yes/no, case-insensitive)
+- Isolation from environment variables (GUARD_REVIEW_* and unprefixed names)
 - Cost hint arithmetic (retries, reviewers, validation stage)
 - Effective sources reporting
-- Direct testing of normalization and extraction helpers
-- Leaf module property: zero imports from guard
+- Leaf module property: zero imports from guard, no relative imports
 """
 
 from __future__ import annotations
@@ -26,13 +28,8 @@ import pytest
 
 from guard.core.review_options import (
     ReviewOptions,
-    _extract_config_dict,
-    _extract_dict,
-    _normalize_field,
-    _parse_bool,
-    _parse_int,
-    _parse_threat_frame,
     effective_sources,
+    ignored_keys,
     load_review_options,
 )
 
@@ -88,23 +85,28 @@ def test_fields_from_global_config_review_key() -> None:
     assert sources["part_manifest"] == "default"
 
 
-def test_fields_from_flat_global_config() -> None:
+def test_flat_global_config_is_not_read_as_review_options() -> None:
+    # Top-level keys without 'review' dict must NOT be treated as review options
     global_cfg = {
-        "reviewers": 3,
+        "reviewers": 4,
         "part_manifest": True,
         "validate_findings": True,
     }
     opts = load_review_options(global_cfg=global_cfg)
-    assert opts.reviewers == 3
-    assert opts.part_manifest is True
-    assert opts.validate_findings is True
+    assert opts.reviewers == 1  # Default kept
+    assert opts.part_manifest is False  # Default kept
+    assert opts.validate_findings is False  # Default kept
     assert opts.coverage_notes is True
 
     sources = effective_sources(global_cfg=global_cfg)
-    assert sources["reviewers"] == "config"
-    assert sources["part_manifest"] == "config"
-    assert sources["validate_findings"] == "config"
-    assert sources["coverage_notes"] == "default"
+    assert sources["reviewers"] == "default"
+    assert sources["part_manifest"] == "default"
+    assert sources["validate_findings"] == "default"
+
+    # Non-dict 'review' key also yields defaults
+    global_cfg_invalid_review = {"review": "not a dict", "reviewers": 4}
+    opts_invalid = load_review_options(global_cfg=global_cfg_invalid_review)
+    assert opts_invalid.reviewers == 1
 
 
 def test_fields_from_cli() -> None:
@@ -244,12 +246,21 @@ def test_every_field_individually_from_config() -> None:
 
 
 def test_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Prefixed environment variables
     monkeypatch.setenv("GUARD_REVIEW_REVIEWERS", "3")
     monkeypatch.setenv("GUARD_REVIEW_THREAT_FRAME", "auto")
     monkeypatch.setenv("GUARD_REVIEW_VALIDATE_FINDINGS", "true")
     monkeypatch.setenv("GUARD_REVIEW_COVERAGE_NOTES", "false")
     monkeypatch.setenv("GUARD_REVIEW_MAX_LLM_CALLS", "99")
     monkeypatch.setenv("GUARD_REVIEW_STAGE_TIMEOUT_S", "5000")
+
+    # Unprefixed environment variables
+    monkeypatch.setenv("REVIEWERS", "3")
+    monkeypatch.setenv("VALIDATE_FINDINGS", "1")
+    monkeypatch.setenv("THREAT_FRAME", "auto")
+    monkeypatch.setenv("COVERAGE_NOTES", "0")
+    monkeypatch.setenv("MAX_LLM_CALLS", "50")
+    monkeypatch.setenv("STAGE_TIMEOUT_S", "3000")
 
     opts = load_review_options()
     assert opts.reviewers == 1
@@ -285,14 +296,6 @@ def test_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPatch) -> N
         ("NO", False),
         ("1", True),
         ("0", False),
-        ("y", True),
-        ("Y", True),
-        ("n", False),
-        ("N", False),
-        ("t", True),
-        ("T", True),
-        ("f", False),
-        ("F", False),
     ],
 )
 def test_bool_spellings(raw: Any, expected: bool) -> None:
@@ -310,6 +313,16 @@ def test_bool_spellings(raw: Any, expected: bool) -> None:
         assert getattr(loaded, field) is expected
 
 
+@pytest.mark.parametrize("invalid_bool", ["y", "n", "t", "f", "banana", "maybe", 2, -1, [1], {"a": 1}])
+def test_invalid_boolean_spellings_rejected(invalid_bool: Any) -> None:
+    for field in ["coverage_notes", "part_manifest", "validate_findings"]:
+        with pytest.raises(ValueError) as excinfo:
+            ReviewOptions(**{field: invalid_bool})
+        msg = str(excinfo.value)
+        assert field in msg
+        assert "boolean (true/false/1/0/yes/no)" in msg
+
+
 @pytest.mark.parametrize("invalid_val", [0, 6, 9, -1, "abc", "0", "9", True, False, 2.5])
 def test_invalid_reviewers_raises_value_error(invalid_val: Any) -> None:
     with pytest.raises(ValueError) as excinfo:
@@ -323,7 +336,7 @@ def test_invalid_reviewers_raises_value_error(invalid_val: Any) -> None:
     assert "reviewers" in str(excinfo_load.value)
 
     with pytest.raises(ValueError) as excinfo_sources:
-        effective_sources(global_cfg={"reviewers": invalid_val})
+        effective_sources(global_cfg={"review": {"reviewers": invalid_val}})
     assert "reviewers" in str(excinfo_sources.value)
 
 
@@ -338,16 +351,6 @@ def test_invalid_threat_frame_raises_value_error(invalid_val: Any) -> None:
     with pytest.raises(ValueError) as excinfo_load:
         load_review_options(cli={"threat_frame": invalid_val})
     assert "threat_frame" in str(excinfo_load.value)
-
-
-@pytest.mark.parametrize("invalid_val", ["banana", "maybe", 2, -1, [1], {"a": 1}])
-def test_invalid_boolean_raises_value_error(invalid_val: Any) -> None:
-    for field in ["coverage_notes", "part_manifest", "validate_findings"]:
-        with pytest.raises(ValueError) as excinfo:
-            ReviewOptions(**{field: invalid_val})
-        msg = str(excinfo.value)
-        assert field in msg
-        assert "boolean (true/false/1/0/yes/no)" in msg
 
 
 @pytest.mark.parametrize("invalid_val", [0, -1, -10, "zero", "0", False, True])
@@ -368,29 +371,117 @@ def test_invalid_stage_timeout_s_raises_value_error(invalid_val: Any) -> None:
     assert ">= 30" in msg
 
 
-def test_unknown_keys_ignored() -> None:
-    # Directly in constructor
+def test_validation_lists_all_invalid_fields() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        ReviewOptions(reviewers=0, threat_frame="invalid")  # type: ignore[arg-type]
+    msg = str(excinfo.value)
+    assert "reviewers" in msg
+    assert "threat_frame" in msg
+
+    with pytest.raises(ValueError) as excinfo_multi:
+        load_review_options(
+            cli={
+                "reviewers": 9,
+                "threat_frame": "bad",
+                "max_llm_calls": 0,
+                "stage_timeout_s": 10,
+            }
+        )
+    multi_msg = str(excinfo_multi.value)
+    assert "reviewers" in multi_msg
+    assert "threat_frame" in multi_msg
+    assert "max_llm_calls" in multi_msg
+    assert "stage_timeout_s" in multi_msg
+
+
+def test_validate_assignment() -> None:
+    opts = ReviewOptions()
+
+    with pytest.raises(ValueError) as excinfo_rev:
+        opts.reviewers = 0
+    assert "reviewers" in str(excinfo_rev.value)
+
+    with pytest.raises(ValueError) as excinfo_tf:
+        opts.threat_frame = "invalid"  # type: ignore[assignment]
+    assert "threat_frame" in str(excinfo_tf.value)
+
+    with pytest.raises(ValueError) as excinfo_calls:
+        opts.max_llm_calls = 0
+    assert "max_llm_calls" in str(excinfo_calls.value)
+
+    with pytest.raises(ValueError) as excinfo_timeout:
+        opts.stage_timeout_s = 10
+    assert "stage_timeout_s" in str(excinfo_timeout.value)
+
+    # Valid assignments succeed
+    opts.reviewers = 3
+    assert opts.reviewers == 3
+
+    opts.threat_frame = "auto"
+    assert opts.threat_frame == "auto"
+
+
+def test_with_overrides() -> None:
+    opts = ReviewOptions()
+    opts2 = opts.with_overrides(reviewers=4, threat_frame="auto", validate_findings=True)
+    assert opts2.reviewers == 4
+    assert opts2.threat_frame == "auto"
+    assert opts2.validate_findings is True
+    assert opts2.coverage_notes is True  # Preserved from opts
+    assert opts.reviewers == 1  # Original not mutated
+
+    # Invalid overrides revalidate and list all invalid fields
+    with pytest.raises(ValueError) as excinfo:
+        opts.with_overrides(reviewers=0, threat_frame="bad")
+    msg = str(excinfo.value)
+    assert "reviewers" in msg
+    assert "threat_frame" in msg
+
+
+def test_unknown_keys_ignored_in_loading() -> None:
     opts = ReviewOptions(unknown_key="ignored", future_feature=123)  # type: ignore[call-arg]
     assert not hasattr(opts, "unknown_key")
     assert not hasattr(opts, "future_feature")
 
-    # In global config
     loaded_cfg = load_review_options(
         global_cfg={"future_key": "val", "review": {"extra": 1, "reviewers": 2}}
     )
     assert loaded_cfg.reviewers == 2
     assert not hasattr(loaded_cfg, "extra")
 
-    # In CLI
     loaded_cli = load_review_options(cli={"cli_unknown": True, "threat_frame": "auto"})
     assert loaded_cli.threat_frame == "auto"
     assert not hasattr(loaded_cli, "cli_unknown")
 
-    # Sources do not include unknown keys
-    sources = effective_sources(global_cfg={"extra": 1}, cli={"cli_unknown": 2})
+    sources = effective_sources(global_cfg={"review": {"extra": 1}}, cli={"cli_unknown": 2})
     assert "extra" not in sources
     assert "cli_unknown" not in sources
     assert len(sources) == 9
+
+
+def test_ignored_keys_reporting() -> None:
+    # Clean input
+    assert ignored_keys() == []
+    assert ignored_keys(global_cfg={"review": {"reviewers": 2}}) == []
+    assert ignored_keys(global_cfg={"llm": {"model": "gpt-4o"}}) == []
+
+    # Typo in review object
+    res_cfg = ignored_keys(global_cfg={"review": {"validate_finding": True, "reviewers": 2}})
+    assert res_cfg == ["review.validate_finding"]
+
+    # Unknown key in cli
+    res_cli = ignored_keys(cli={"unknown_flag": 1, "reviewers": 3})
+    assert res_cli == ["unknown_flag"]
+
+    # Both config typo and CLI unknown
+    res_both = ignored_keys(global_cfg={"review": {"typo": 1}}, cli={"cli_typo": 2})
+    assert res_both == ["review.typo", "cli_typo"]
+
+    # Structural warning when review is present but not a dict
+    assert ignored_keys(global_cfg={"review": "not an object"}) == ["review (not an object)"]
+    assert ignored_keys(global_cfg={"review": None}) == ["review (not an object)"]
+    assert ignored_keys(global_cfg={"review": [1, 2]}) == ["review (not an object)"]
+    assert ignored_keys(global_cfg={"review": 123}) == ["review (not an object)"]
 
 
 @pytest.mark.parametrize(
@@ -447,78 +538,14 @@ def test_invalid_container_types_raise_value_error() -> None:
     with pytest.raises(ValueError, match="cli must be a dict or None"):
         load_review_options(cli=123)  # type: ignore[arg-type]
 
+    with pytest.raises(ValueError, match="global_cfg must be a dict or None"):
+        ignored_keys(global_cfg="not a dict")  # type: ignore[arg-type]
 
-def test_internal_parse_bool() -> None:
-    assert _parse_bool("field", True) is True
-    assert _parse_bool("field", False) is False
-    assert _parse_bool("field", 1) is True
-    assert _parse_bool("field", 0) is False
-    assert _parse_bool("field", "yes") is True
-    assert _parse_bool("field", "no") is False
-    with pytest.raises(ValueError, match="expected boolean"):
-        _parse_bool("field", 2)
-    with pytest.raises(ValueError, match="expected boolean"):
-        _parse_bool("field", "invalid")
-    with pytest.raises(ValueError, match="expected boolean"):
-        _parse_bool("field", None)
+    with pytest.raises(ValueError, match="cli must be a dict or None"):
+        ignored_keys(cli=123)  # type: ignore[arg-type]
 
 
-def test_internal_parse_int() -> None:
-    assert _parse_int("reviewers", 3, min_val=1, max_val=5) == 3
-    assert _parse_int("reviewers", "4", min_val=1, max_val=5) == 4
-    with pytest.raises(ValueError, match="expected integer between 1 and 5"):
-        _parse_int("reviewers", 0, min_val=1, max_val=5)
-    with pytest.raises(ValueError, match="expected integer between 1 and 5"):
-        _parse_int("reviewers", 6, min_val=1, max_val=5)
-    with pytest.raises(ValueError, match="expected integer between 1 and 5"):
-        _parse_int("reviewers", True, min_val=1, max_val=5)
-    with pytest.raises(ValueError, match="expected integer between 1 and 5"):
-        _parse_int("reviewers", "abc", min_val=1, max_val=5)
-
-
-def test_internal_parse_threat_frame() -> None:
-    assert _parse_threat_frame("threat_frame", "off") == "off"
-    assert _parse_threat_frame("threat_frame", "auto") == "auto"
-    assert _parse_threat_frame("threat_frame", "AUTO") == "auto"
-    with pytest.raises(ValueError, match="expected one of"):
-        _parse_threat_frame("threat_frame", "invalid")
-    with pytest.raises(ValueError, match="expected one of"):
-        _parse_threat_frame("threat_frame", 123)
-
-
-def test_internal_normalize_field() -> None:
-    assert _normalize_field("coverage_notes", "yes") is True
-    assert _normalize_field("threat_frame", "auto") == "auto"
-    assert _normalize_field("reviewers", "2") == 2
-    assert _normalize_field("max_llm_calls", "15") == 15
-    assert _normalize_field("stage_timeout_s", "60") == 60
-    assert _normalize_field("unknown_field", "value") == "value"
-
-
-def test_internal_validate_and_normalize() -> None:
-    fn: Any = ReviewOptions.__dict__["_validate_and_normalize"]
-    actual_fn = getattr(fn, "__func__", fn)
-    res = actual_fn(ReviewOptions, {"reviewers": "3", "extra": 42})
-    assert res["reviewers"] == 3
-    assert res["extra"] == 42
-    assert actual_fn(ReviewOptions, "not a dict") == "not a dict"
-
-
-def test_internal_extract_dict() -> None:
-    assert _extract_dict(None, "test") == {}
-    assert _extract_dict({"a": 1}, "test") == {"a": 1}
-    with pytest.raises(ValueError, match="test must be a dict or None"):
-        _extract_dict("not a dict", "test")
-
-
-def test_internal_extract_config_dict() -> None:
-    assert _extract_config_dict(None) == {}
-    assert _extract_config_dict({"review": {"reviewers": 2}}) == {"reviewers": 2}
-    assert _extract_config_dict({"reviewers": 2}) == {"reviewers": 2}
-    assert _extract_config_dict({"review": "not a dict"}) == {"review": "not a dict"}
-
-
-def test_leaf_module_has_zero_guard_imports() -> None:
+def test_leaf_module_has_zero_guard_imports_and_no_relative_imports() -> None:
     target_file = Path(__file__).resolve().parent.parent / "guard" / "core" / "review_options.py"
     assert target_file.is_file(), f"Target file does not exist: {target_file}"
 
@@ -530,6 +557,9 @@ def test_leaf_module_has_zero_guard_imports() -> None:
                     f"Illegal guard import in leaf module: {name.name}"
                 )
         elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, (
+                f"Illegal relative import in leaf module: level={node.level} module={node.module}"
+            )
             if node.module:
                 assert not node.module.startswith("guard"), (
                     f"Illegal guard import in leaf module: from {node.module}"
