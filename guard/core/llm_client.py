@@ -32,6 +32,91 @@ class LLMClientError(Exception):
     pass
 
 
+def _ping_cli(cfg: LLMConfig, start: float) -> Tuple[bool, str, float]:
+    from guard.core import cli_llm
+    ok, msg, models = cli_llm.probe(cfg.cli_agent, timeout=cfg.timeout)
+    if ok and cfg.model and models and cfg.model not in models:
+        msg += f" ({cfg.model!r} is not in its list: it may still accept a full model ID)"
+    return ok, msg, (time.perf_counter() - start) * 1000
+
+
+def _ping_models_endpoint(
+    models_url: str,
+    headers: Dict[str, str],
+    base_url: str,
+    start: float,
+) -> Optional[Tuple[bool, str, float]]:
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            res = client.get(models_url, headers=headers)
+            latency = (time.perf_counter() - start) * 1000
+            if res.status_code == 200:
+                return True, "OK (Verified via /models)", latency
+            elif res.status_code in [401, 403]:
+                return False, f"HTTP {res.status_code}: Invalid API key or unauthorized", latency
+    except httpx.ConnectError:
+        latency = (time.perf_counter() - start) * 1000
+        return False, f"Cannot connect to {base_url}. Is the service running?", latency
+    except (httpx.HTTPError, httpx.InvalidURL):
+        pass
+    return None
+
+
+def _ping_openai(cfg: LLMConfig, start: float, headers: Dict[str, str]) -> Tuple[bool, str, float]:
+    models_url = f"{cfg.base_url.rstrip('/')}/models"
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    models_res = _ping_models_endpoint(models_url, headers, cfg.base_url, start)
+    if models_res is not None:
+        return models_res
+
+    # Fallback to /chat/completions
+    url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+    }
+
+    with httpx.Client(timeout=cfg.timeout) as client:
+        res = client.post(url, headers=headers, json=payload)
+        latency = (time.perf_counter() - start) * 1000
+
+        if res.status_code == 200:
+            return True, "OK", latency
+        else:
+            return False, f"HTTP {res.status_code}: {res.text[:200]}", latency
+
+
+def _ping_anthropic(cfg: LLMConfig, start: float, headers: Dict[str, str]) -> Tuple[bool, str, float]:
+    if cfg.api_key:
+        headers["x-api-key"] = cfg.api_key
+    headers["anthropic-version"] = "2023-06-01"
+
+    models_url = f"{cfg.base_url.rstrip('/')}/models"
+    models_res = _ping_models_endpoint(models_url, headers, cfg.base_url, start)
+    if models_res is not None:
+        return models_res
+
+    # Fallback to /messages
+    url = f"{cfg.base_url.rstrip('/')}/messages"
+    payload = {
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+    }
+
+    with httpx.Client(timeout=cfg.timeout) as client:
+        res = client.post(url, headers=headers, json=payload)
+        latency = (time.perf_counter() - start) * 1000
+
+        if res.status_code == 200:
+            return True, "OK", latency
+        else:
+            return False, f"HTTP {res.status_code}: {res.text[:200]}", latency
+
+
 def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     """
     Send a lightweight ping to verify endpoint reachability and credentials.
@@ -40,87 +125,14 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     """
     start = time.perf_counter()
     if cfg.protocol == LLMProtocol.CLI:  # the agent CLI's sign-in and model list, no review prompt
-        from guard.core import cli_llm
-        ok, msg, models = cli_llm.probe(cfg.cli_agent, timeout=cfg.timeout)
-        if ok and cfg.model and models and cfg.model not in models:
-            msg += f" ({cfg.model!r} is not in its list: it may still accept a full model ID)"
-        return ok, msg, (time.perf_counter() - start) * 1000
-    headers = {"Content-Type": "application/json"}
+        return _ping_cli(cfg, start)
 
+    headers = {"Content-Type": "application/json"}
     try:
         if cfg.protocol == LLMProtocol.OPENAI:
-            models_url = f"{cfg.base_url.rstrip('/')}/models"
-            if cfg.api_key:
-                headers["Authorization"] = f"Bearer {cfg.api_key}"
-
-            try:
-                with httpx.Client(timeout=10.0) as client:
-                    res = client.get(models_url, headers=headers)
-                    latency = (time.perf_counter() - start) * 1000
-                    if res.status_code == 200:
-                        return True, "OK (Verified via /models)", latency
-                    elif res.status_code in [401, 403]:
-                        return False, f"HTTP {res.status_code}: Invalid API key or unauthorized", latency
-            except httpx.ConnectError:
-                latency = (time.perf_counter() - start) * 1000
-                return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except (httpx.HTTPError, httpx.InvalidURL):
-                pass
-
-            # Fallback to /chat/completions
-            url = f"{cfg.base_url.rstrip('/')}/chat/completions"
-            payload = {
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 5,
-            }
-            
-            with httpx.Client(timeout=cfg.timeout) as client:
-                res = client.post(url, headers=headers, json=payload)
-                latency = (time.perf_counter() - start) * 1000
-                
-                if res.status_code == 200:
-                    return True, "OK", latency
-                else:
-                    return False, f"HTTP {res.status_code}: {res.text[:200]}", latency
-                    
+            return _ping_openai(cfg, start, headers)
         elif cfg.protocol == LLMProtocol.ANTHROPIC:
-            if cfg.api_key:
-                headers["x-api-key"] = cfg.api_key
-            headers["anthropic-version"] = "2023-06-01"
-
-            models_url = f"{cfg.base_url.rstrip('/')}/models"
-            try:
-                with httpx.Client(timeout=10.0) as client:
-                    res = client.get(models_url, headers=headers)
-                    latency = (time.perf_counter() - start) * 1000
-                    if res.status_code == 200:
-                        return True, "OK (Verified via /models)", latency
-                    elif res.status_code in [401, 403]:
-                        return False, f"HTTP {res.status_code}: Invalid API key or unauthorized", latency
-            except httpx.ConnectError:
-                latency = (time.perf_counter() - start) * 1000
-                return False, f"Cannot connect to {cfg.base_url}. Is the service running?", latency
-            except (httpx.HTTPError, httpx.InvalidURL):
-                pass
-
-            # Fallback to /messages
-            url = f"{cfg.base_url.rstrip('/')}/messages"
-            payload = {
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 5,
-            }
-            
-            with httpx.Client(timeout=cfg.timeout) as client:
-                res = client.post(url, headers=headers, json=payload)
-                latency = (time.perf_counter() - start) * 1000
-                
-                if res.status_code == 200:
-                    return True, "OK", latency
-                else:
-                    return False, f"HTTP {res.status_code}: {res.text[:200]}", latency
-                    
+            return _ping_anthropic(cfg, start, headers)
         return False, f"Unsupported protocol: {cfg.protocol}", 0.0
 
     except httpx.ConnectError:
@@ -132,7 +144,6 @@ def ping_llm(cfg: LLMConfig) -> Tuple[bool, str, float]:
     except (httpx.HTTPError, httpx.InvalidURL, httpx.UnsupportedProtocol, OSError, ValueError, KeyError, TypeError) as e:
         latency = (time.perf_counter() - start) * 1000
         return False, str(e), latency
-
 
 def call_llm(
     cfg: LLMConfig,

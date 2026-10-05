@@ -19,7 +19,7 @@ from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field
 
-from guard.core.config import GuardConfig
+from guard.core.config import GuardConfig, LLMConfig
 from guard.core.findings import (
     Finding,
     _parse_invariant_proposals,
@@ -133,22 +133,18 @@ class LLMReviewerEngine:
             heuristic_verdict.summary += f" LLM review did NOT run ({llm_error})."
         return heuristic_verdict
 
-    def _evaluate_heuristics(
-        self,
-        build_check: Optional[BuildCheckResult],
+    @staticmethod
+    def _check_build_and_scope(
         diff_summary: Optional[DiffSummary],
-        violations: List[RuleViolation],
-        invariant_result: Optional[InvariantResult],
-        focus: str = "all",
-    ) -> LLMReviewVerdict:
-        score = 10.0
+        build_check: Optional[BuildCheckResult],
+    ) -> tuple[float, List[str], List[str]]:
+        deduction = 0.0
         tech_notes: List[str] = []
-        ux_notes: List[str] = []
         remediation: List[str] = []
 
         # Check 0: Git diff inspection error
         if diff_summary and diff_summary.error:
-            score -= 5.0
+            deduction += 5.0
             tech_notes.append(f"Diff Inspection Error: {diff_summary.error}")
             remediation.append(f"Resolve Git error preventing diff inspection: {diff_summary.error}")
 
@@ -157,26 +153,38 @@ class LLMReviewerEngine:
             if build_check.passed:
                 tech_notes.append(f"Compile Check: PASSED (`{build_check.command}` in {build_check.duration_s:.1f}s)")
             else:
-                score -= 4.5
+                deduction += 4.5
                 tech_notes.append(f"Compile Check: FAILED with exit code {build_check.exit_code}")
                 remediation.append(f"Fix compilation errors causing `{build_check.command}` to fail:\n{build_check.output[:300]}")
 
         # Check 2: Out of scope files
         if diff_summary and diff_summary.out_of_scope_files:
-            score -= 2.5 * len(diff_summary.out_of_scope_files)
+            deduction += 2.5 * len(diff_summary.out_of_scope_files)
             tech_notes.append(f"Scope Compliance: Modified {len(diff_summary.out_of_scope_files)} undeclared files: {', '.join(diff_summary.out_of_scope_files)}")
             remediation.append(f"Revert changes to out-of-scope files: {', '.join(diff_summary.out_of_scope_files)}")
+
+        return deduction, tech_notes, remediation
+
+    @staticmethod
+    def _check_violations(
+        violations: List[RuleViolation],
+        focus: str,
+        diff_summary: Optional[DiffSummary],
+    ) -> tuple[float, List[str], List[str], bool, bool]:
+        deduction = 0.0
+        tech_notes: List[str] = []
+        remediation: List[str] = []
 
         # Check 3: Rule Violations
         crit_violations = [v for v in violations if v.severity == "CRITICAL"]
         high_violations = [v for v in violations if v.severity == "HIGH"]
         if crit_violations:
-            score -= 3.5 * len(crit_violations)
+            deduction += 3.5 * len(crit_violations)
             for cv in crit_violations:
                 tech_notes.append(f"Security Alert [{cv.rule_id}]: {cv.message} ({cv.file_path})")
                 remediation.append(f"Resolve critical security violation {cv.rule_id} in `{cv.file_path}`")
         if high_violations:
-            score -= 1.5 * len(high_violations)
+            deduction += 1.5 * len(high_violations)
             for hv in high_violations:
                 tech_notes.append(f"Stability Warning [{hv.rule_id}]: {hv.message} ({hv.file_path})")
                 remediation.append(f"Resolve stability/performance warning {hv.rule_id} in `{hv.file_path}`")
@@ -185,15 +193,16 @@ class LLMReviewerEngine:
         dead_violations = [v for v in violations if v.rule_id.startswith("DEAD-")]
         if dead_violations:
             weight = 2.0 if focus in ("dead-code", "hygiene") else 0.8
-            score -= weight * len(dead_violations)
+            deduction += weight * len(dead_violations)
             for dv in dead_violations:
                 tech_notes.append(f"Hygiene Alert [{dv.rule_id}]: {dv.message} ({dv.file_path})")
                 remediation.append(f"Clean up code hygiene issue [{dv.rule_id}]: {dv.message} in `{dv.file_path}`")
+
         # Check 5: Simplicity & Engineering Frugality (KISS & YAGNI)
         lazy_violations = [v for v in violations if v.rule_id.startswith("LAZY-")]
         if lazy_violations:
             weight = 2.5 if focus in ("simplicity", "yagni", "lazy") else 1.0
-            score -= weight * len(lazy_violations)
+            deduction += weight * len(lazy_violations)
             for lv in lazy_violations:
                 tech_notes.append(f"Simplicity Alert [{lv.rule_id}]: {lv.message} ({lv.file_path})")
                 remediation.append(f"Apply KISS/YAGNI to resolve [{lv.rule_id}]: {lv.message} in `{lv.file_path}`")
@@ -202,8 +211,19 @@ class LLMReviewerEngine:
             net_loc = diff_summary.total_insertions - diff_summary.total_deletions
             tech_notes.append(f"Net {net_loc} LOC (informational, not scored).")
 
-        # Check 6: Invariants (CRITICAL: Invariant violation is a HARD BLOCKER)
+        hygiene_blocked = focus in ("dead-code", "hygiene") and bool(dead_violations)
+        simplicity_blocked = focus in ("simplicity", "yagni", "lazy") and bool(lazy_violations)
+        return deduction, tech_notes, remediation, hygiene_blocked, simplicity_blocked
+
+    @staticmethod
+    def _tally_invariant_deductions(
+        invariant_result: Optional[InvariantResult],
+    ) -> tuple[float, List[str], List[str], bool]:
+        deduction = 0.0
+        ux_notes: List[str] = []
+        remediation: List[str] = []
         invariant_violated = False
+
         if invariant_result:
             if invariant_result.all_passed:
                 verified = len(invariant_result.checks) - invariant_result.unverified_count
@@ -211,15 +231,33 @@ class LLMReviewerEngine:
             else:
                 invariant_violated = True
                 failed_checks = [c for c in invariant_result.checks if not c.passed]
-                score -= 3.0 * len(failed_checks)
+                deduction += 3.0 * len(failed_checks)
                 for fc in failed_checks:
                     ux_notes.append(f"Invariant Violation [{fc.id}]: {fc.description} -> {fc.notes}")
                     remediation.append(f"Restore invariant behavior `{fc.id}`: {fc.description}")
 
-        score = max(0.0, min(10.0, score))
-        
-        hygiene_blocked = focus in ("dead-code", "hygiene") and bool(dead_violations)
-        simplicity_blocked = focus in ("simplicity", "yagni", "lazy") and bool(lazy_violations)
+        return deduction, ux_notes, remediation, invariant_violated
+
+    def _evaluate_heuristics(
+        self,
+        build_check: Optional[BuildCheckResult],
+        diff_summary: Optional[DiffSummary],
+        violations: List[RuleViolation],
+        invariant_result: Optional[InvariantResult],
+        focus: str = "all",
+    ) -> LLMReviewVerdict:
+        deduction_bs, tech_bs, rem_bs = self._check_build_and_scope(diff_summary, build_check)
+        deduction_v, tech_v, rem_v, hygiene_blocked, simplicity_blocked = self._check_violations(
+            violations, focus, diff_summary
+        )
+        deduction_inv, ux_notes, rem_inv, invariant_violated = self._tally_invariant_deductions(invariant_result)
+
+        tech_notes = tech_bs + tech_v
+        remediation = rem_bs + rem_v + rem_inv
+
+        score = max(0.0, min(10.0, 10.0 - deduction_bs - deduction_v - deduction_inv))
+
+        crit_violations = [v for v in violations if v.severity == "CRITICAL"]
         is_hard_blocked = (
             invariant_violated
             or bool(crit_violations)
@@ -254,50 +292,31 @@ class LLMReviewerEngine:
             review_mode="heuristic",
         )
 
-    def _evaluate_with_llm(
-        self,
-        prompt: str,
-        domain: Union[DomainType, str],
-        diff_summary: Optional[DiffSummary],
-        build_check: Optional[BuildCheckResult],
-        violations: List[RuleViolation],
-        invariant_result: Optional[InvariantResult],
-        contracts: Optional[List[DomainContract]],
-        focus: str = "all",
-        evidence: Optional[List[str]] = None,
-        ledger: Optional[List[dict]] = None,
-        known_rules: Optional[List[dict]] = None,
-    ) -> Optional[LLMReviewVerdict]:
-        if not self.config or not self.config.llm:
-            return None
-        self._task_text = prompt  # what a quoted requirement is checked against
-
-        model_name = self.config.llm.model
-        domain_str = domain.value if isinstance(domain, DomainType) else str(domain)
-
-        focus_instruction = ""
+    @staticmethod
+    def _build_focus_instruction(focus: str) -> str:
         if focus == "security":
-            focus_instruction = "CRITICAL FOCUS ON SECURITY: Rigorously audit for hardcoded secrets, injection (SQLi, XSS, Command), CSRF, insecure endpoints, and auth bypass."
-        elif focus == "memory":
-            focus_instruction = "CRITICAL FOCUS ON MEMORY SAFETY: Rigorously audit for dangling event listeners, unclosed streams/sockets/db connections, retained closures, and DOM leaks."
-        elif focus == "performance":
-            focus_instruction = "CRITICAL FOCUS ON PERFORMANCE & LATENCY: Rigorously audit for blocking synchronous I/O, N+1 query patterns, excessive re-renders, and thread lockups."
-        elif focus == "ux":
-            focus_instruction = "CRITICAL FOCUS ON ERGONOMICS & UX: Rigorously audit for broken keyboard shortcuts, modal backdrop handling, viewport responsiveness, and visual state feedback."
-        elif focus in ("dead-code", "hygiene"):
-            focus_instruction = "CRITICAL FOCUS ON CODE HYGIENE & DEAD CODE: Rigorously audit for orphan/unused files, commented-out blocks of code, unused imports, unreferenced helper functions/variables, redundant duplicate logic, and obsolete scratchpad or temporary files."
-        elif focus in ("simplicity", "yagni", "lazy"):
-            focus_instruction = (
+            return "CRITICAL FOCUS ON SECURITY: Rigorously audit for hardcoded secrets, injection (SQLi, XSS, Command), CSRF, insecure endpoints, and auth bypass."
+        if focus == "memory":
+            return "CRITICAL FOCUS ON MEMORY SAFETY: Rigorously audit for dangling event listeners, unclosed streams/sockets/db connections, retained closures, and DOM leaks."
+        if focus == "performance":
+            return "CRITICAL FOCUS ON PERFORMANCE & LATENCY: Rigorously audit for blocking synchronous I/O, N+1 query patterns, excessive re-renders, and thread lockups."
+        if focus == "ux":
+            return "CRITICAL FOCUS ON ERGONOMICS & UX: Rigorously audit for broken keyboard shortcuts, modal backdrop handling, viewport responsiveness, and visual state feedback."
+        if focus in ("dead-code", "hygiene"):
+            return "CRITICAL FOCUS ON CODE HYGIENE & DEAD CODE: Rigorously audit for orphan/unused files, commented-out blocks of code, unused imports, unreferenced helper functions/variables, redundant duplicate logic, and obsolete scratchpad or temporary files."
+        if focus in ("simplicity", "yagni", "lazy"):
+            return (
                 "CRITICAL FOCUS ON SIMPLICITY & PRODUCTIVE LAZINESS (KISS & YAGNI): "
                 "Act as the Laziest Senior Architect in the room. Ruthlessly audit for over-engineering, "
                 "unnecessary new dependencies, multi-layer abstractions for trivial logic, reinvented wheels, "
                 "and code that should not have been written. The best code is code you never write. "
                 "Demand the simplest one-liner, standard library, or native runtime solution."
             )
-        else:
-            focus_instruction = "FULL 360-DEGREE AUDIT: Evaluate across all 5 Quality Pillars (Security, Memory Safety, Performance, Data Integrity, Ergonomics/UX)."
+        return "FULL 360-DEGREE AUDIT: Evaluate across all 5 Quality Pillars (Security, Memory Safety, Performance, Data Integrity, Ergonomics/UX)."
 
-        system_prompt = (
+    @staticmethod
+    def _build_system_prompt(model_name: str, focus_instruction: str) -> str:
+        return (
             f"You are the Senior Lead Architect and Code Reviewer acting as the final safety gate (using model {model_name}).\n"
             f"Review Directive: {focus_instruction}\n"
             "Your task is to audit the post-task verification report and git diff produced by an AI coding agent.\n"
@@ -343,6 +362,20 @@ class LLMReviewerEngine:
             "Propose only rules the project must keep in every future change, not task-specific notes.>"
         )
 
+    @staticmethod
+    def _build_review_header(
+        prompt: str,
+        domain_str: str,
+        focus: str,
+        diff_summary: Optional[DiffSummary],
+        build_check: Optional[BuildCheckResult],
+        violations: List[RuleViolation],
+        invariant_result: Optional[InvariantResult],
+        contracts: Optional[List[DomainContract]],
+        evidence: Optional[List[str]],
+        ledger: Optional[List[dict]],
+        known_rules: Optional[List[dict]],
+    ) -> str:
         files_summary = ", ".join(f"{f.path} ({f.status})" for f in (diff_summary.files if diff_summary else []))
         build_info = f"PASSED ({build_check.command} exit 0)" if (build_check and build_check.passed) else ("FAILED" if build_check else "NOT RUN")
         script = _resolved_script(build_check.output) if build_check else None
@@ -365,7 +398,7 @@ class LLMReviewerEngine:
             for f in (ledger or [])
         ) or "- none"
 
-        header = f"""
+        return f"""
 Domain: {domain_str}
 Review Focus: {focus.upper()}
 Task Prompt: {prompt}
@@ -386,12 +419,15 @@ Findings so far in this session (id, round, status, your earlier wording):
 {ledger_info}
 """
 
-        # No time limit on a review: it ends when the LLM answers or its provider returns an error.
-        # llm.timeout is only for `guard config test` pings.
-        review_cfg = self.config.llm.model_copy(update={"timeout": None})
-
-        # A large diff is reviewed in parts instead of being truncated, so no change goes unreviewed.
-        batches = self._prepare_diff_batches(diff_summary)
+    def _review_diff_batches(
+        self,
+        review_cfg: LLMConfig,
+        batches: List[str],
+        header: str,
+        system_prompt: str,
+        model_name: str,
+        focus: str,
+    ) -> Optional[List[LLMReviewVerdict]]:
         verdicts: List[LLMReviewVerdict] = []
         for i, batch in enumerate(batches, start=1):
             part = f"Diff part {i}/{len(batches)} (other parts are reviewed separately; judge only this part):\n" if len(batches) > 1 else ""
@@ -412,6 +448,54 @@ Findings so far in this session (id, round, status, your earlier wording):
                 self.last_failure = f"part {i}/{len(batches)} answer was not a review: {(raw_response or '').strip()[:160]}"
                 return None
             verdicts.append(verdict)
+        return verdicts
+
+    def _evaluate_with_llm(
+        self,
+        prompt: str,
+        domain: Union[DomainType, str],
+        diff_summary: Optional[DiffSummary],
+        build_check: Optional[BuildCheckResult],
+        violations: List[RuleViolation],
+        invariant_result: Optional[InvariantResult],
+        contracts: Optional[List[DomainContract]],
+        focus: str = "all",
+        evidence: Optional[List[str]] = None,
+        ledger: Optional[List[dict]] = None,
+        known_rules: Optional[List[dict]] = None,
+    ) -> Optional[LLMReviewVerdict]:
+        if not self.config or not self.config.llm:
+            return None
+        self._task_text = prompt  # what a quoted requirement is checked against
+
+        model_name = self.config.llm.model
+        domain_str = domain.value if isinstance(domain, DomainType) else str(domain)
+
+        focus_instruction = self._build_focus_instruction(focus)
+        system_prompt = self._build_system_prompt(model_name, focus_instruction)
+        header = self._build_review_header(
+            prompt=prompt,
+            domain_str=domain_str,
+            focus=focus,
+            diff_summary=diff_summary,
+            build_check=build_check,
+            violations=violations,
+            invariant_result=invariant_result,
+            contracts=contracts,
+            evidence=evidence,
+            ledger=ledger,
+            known_rules=known_rules,
+        )
+
+        # No time limit on a review: it ends when the LLM answers or its provider returns an error.
+        # llm.timeout is only for `guard config test` pings.
+        review_cfg = self.config.llm.model_copy(update={"timeout": None})
+
+        # A large diff is reviewed in parts instead of being truncated, so no change goes unreviewed.
+        batches = self._prepare_diff_batches(diff_summary)
+        verdicts = self._review_diff_batches(review_cfg, batches, header, system_prompt, model_name, focus)
+        if verdicts is None:
+            return None
         return self._merge_verdicts(verdicts)
 
     @staticmethod
