@@ -11,18 +11,19 @@ Table of Pattern Sets
 1. Test File Identification
 | Ecosystem / Tool | Path / File Pattern | Examples |
 |---|---|---|
-| Universal directories | `test/`, `tests/`, `__tests__/`, `spec/`, `specs/` | `tests/foo.py`, `src/__tests__/app.ts` |
-| Python / Go / Rust | `*_test.*`, `test_*.*` | `server_test.go`, `test_main.py` |
-| JS / TS / Ruby | `*.test.*`, `*.spec.*`, `*_spec.rb` | `button.test.tsx`, `user_spec.rb` |
-| Java / Kotlin / Swift / C# | `*Test.java|kt|cs|swift`, `*Tests.*` | `UserTest.java`, `AuthTests.cs` |
+| Universal directories (case-insensitive) | `test/`, `tests/`, `__tests__/`, `spec/`, `specs/` | `tests/foo.py`, `src/__tests__/app.ts` |
+| Python / Go / Rust (prefix/infix) | `*_test.*`, `test_*.*` | `server_test.go`, `test_main.py` |
+| JS / TS / Ruby (infix/suffix) | `*.test.*`, `*.spec.*`, `*_spec.rb` | `button.test.tsx`, `user_spec.rb` |
+| Java / Kotlin / Swift / C# (case-sensitive) | `*Test.java|kt|cs|swift`, `*Tests.*` | `UserTest.java`, `AuthTests.cs` |
 
 2. Assertion Patterns
 | Framework / Ecosystem | Assertion Syntax | Patterns Covered |
 |---|---|---|
-| Python `unittest` / `pytest` / keyword | `assert`, `self.assert*`, `pytest.raises`, `pytest.warns` | `assert`, `assert*`, `pytest.raises` |
+| Python `unittest` / `pytest` / keyword | `assert <expr>`, `self.assert*`, `pytest.raises`, `pytest.warns` | `assert`, `self.assert*`, `pytest.raises` |
 | JS / TS (`jest`, `chai`, `vitest`) | `expect(...)`, `.toBe(...)`, `toThrow(...)`, `.should` | `expect(`, `toThrow(`, `.should` |
 | Go `testing` / `testify` | `t.Error`, `t.Fatal`, `t.Fail`, `require.Equal` | `t.Error*`, `t.Fatal*`, `require.*` |
-| Java / Kotlin (`junit`, `testng`) | `Assert.*`, `assertEquals`, `assertThrows`, `ok(...)` | `Assert.*`, `assert*`, `ok(` |
+| Java / Kotlin (`junit`, `testng`, `kotest`) | `Assert.*`, `assertEquals`, `assertThrows`, `ok(...)`, `shouldBe` | `Assert.*`, `assert*`, `ok(`, `shouldBe` |
+| C# (`xUnit`, `NUnit`, `FluentAssertions`) | `Assert.*`, `.Should()` | `Assert.*`, `.Should()` |
 | Swift `XCTest` | `XCTAssert`, `XCTAssertEqual`, etc. | `XCTAssert*` |
 | Rust | `assert!`, `assert_eq!`, `assert_ne!`, `#[should_panic]` | `assert!*`, `#[should_panic]` |
 | Behavior / BDD | `verify(...)`, `check(...)`, `require(...)` | `verify(`, `check(`, `require(` |
@@ -30,24 +31,32 @@ Table of Pattern Sets
 3. Disabled / Skipped Test Markers
 | Ecosystem / Tool | Marker Syntax | Patterns Covered |
 |---|---|---|
-| Pytest / Python | `@pytest.mark.skip`, `pytest.skip`, `xfail` | `pytest.mark.skip`, `pytest.skip`, `xfail` |
-| JS / TS (`jest`, `mocha`) | `xit(...)`, `xdescribe(...)`, `it.skip(...)`, `.todo(...)`| `xit`, `xdescribe`, `.skip(`, `.todo(` |
-| Java / Kotlin (`junit`) | `@Disabled`, `@Ignore` | `@Disabled`, `@Ignore` |
+| Pytest / Python | `@pytest.mark.skip`, `@pytest.mark.skipif`, `pytest.skip`, `xfail` | `skip`, `skipif`, `xfail` |
+| JS / TS (`jest`, `mocha`) | `xit(...)`, `xdescribe(...)`, `it.skip(...)`, `.todo(...)` | `xit`, `xdescribe`, `.skip(`, `.todo(` |
+| Java / Kotlin (`junit`, `@Disabled @Test`) | `@Disabled`, `@Ignore`, `@Disabled @Test` | `@Disabled`, `@Ignore` |
 | Go | `t.Skip(...)`, `t.Skipf(...)`, `t.SkipNow()` | `t.Skip*` |
-| Rust | `todo!()` | `todo!` |
-| Ruby / RSpec / minitest | `skip(...)`, `pending(...)` | `skip(`, `pending(` |
+| Rust | `todo!()`, `#[ignore]` | `todo!`, `#[ignore]` |
+| Ruby / RSpec / minitest | `skip(...)`, `pending(...)`, `xit(...)` | `skip`, `pending`, `xit` |
+| C# (`xUnit`, `NUnit`) | `[Fact(Skip = ...)]`, `[Ignore]` | `[Fact(Skip=`, `[Ignore]` |
+| PHPUnit | `markTestSkipped(...)` | `markTestSkipped` |
+| Swift / XCTest | `XCTSkip(...)`, `XCTSkipIf(...)`, `XCTSkipUnless(...)` | `XCTSkip*` |
+| Dart / Flutter | `skip: true`, `skip: "reason"` | `skip:` |
 
 4. Global State Mutation Added
 | Target | Language / Mechanism | Covered Syntax |
 |---|---|---|
 | Python sys.path | `sys.path.insert`, `sys.path.append` | `sys.path.(insert|append)` |
-| Python package path | `__path__` modification | `__path__` |
-| Environment variables | `os.environ[...] =`, `os.environ.pop`, `process.env.X =` | `os.environ`, `process.env`, `setenv(`, `putenv(` |
-| Working directory | `os.chdir(...)`, `Dir.chdir(...)` | `os.chdir`, `Dir.chdir` |
+| Python package path | `__path__` insertion / assignment | `__path__` method call or assignment |
+| Environment variables | `os.environ[...] =`, `os.environ.pop/setdefault/update` | `os.environ`, `process.env`, `setenv`, `putenv` |
+| Python / Node / Ruby chdir | `os.chdir(...)`, `process.chdir(...)`, `Dir.chdir(...)` | `os.chdir`, `process.chdir`, `Dir.chdir` |
+| Go / Ruby / Java / Rust env | `os.Setenv`, `ENV[...] =`, `System.setProperty`, `set_var` | `os.Setenv`, `ENV[]=`, `System.setProperty`, `set_var` |
 
-5. Intentionally Left to LLM (Not in Heuristic Scope)
-- Monkeypatch-free module attribute assignment (too language-specific).
-- Complex semantic assertion loops and empty collection assertions.
+Known Heuristic Limits (Left to LLM Review)
+===========================================
+- Embedded test function signatures inside docstrings or multiline strings may split a test block.
+- Assertions inside loops that execute zero times cannot be verified statically.
+- Dynamic test assertions constructed through metaprogramming or reflection.
+- Unrestored module-level monkeypatching without clear framework teardowns.
 """
 
 from __future__ import annotations
@@ -64,39 +73,34 @@ MAX_SCANNED_LINES = 20_000
 MAX_LINE_CHARS = 2_000
 MAX_QUOTE_CHARS = 160
 MAX_EVIDENCE_LINES = 12
-
-# File path pattern matching test files across ecosystems
-_TEST_PATH_RE = re.compile(
-    r"""(?x)
-    (?:^|/)
-    (?:
-        (?:test|tests|__tests__|spec|specs)/.*            # directory name
-        | (?:[^/]*_test|test_[^/]*)\.[a-zA-Z0-9_]+$       # *_test.*, test_*.*
-        | [^/]*\.(?:test|spec)\.[a-zA-Z0-9_]+$           # *.test.*, *.spec.*
-        | [^/]*Test\.(?:java|kt|cs|swift)$               # *Test.java|kt|cs|swift
-        | [^/]*Tests\.[a-zA-Z0-9_]+$                     # *Tests.*
-        | [^/]*_spec\.rb$                                # *_spec.rb
-    )
-    """,
-    re.IGNORECASE,
-)
+MAX_PATH_CHARS = 80
 
 # Import declarations that mention 'assert' or 'require' but are not assertions
 _IMPORT_LINE_RE = re.compile(
     r"^\s*(?:import\s|from\s+\S+\s+import\b|using\s|package\s|#include\b|(?:const|let|var)\s+\S+\s*=\s*require\s*\()"
 )
 
-# Assertion-like patterns
+# Full line comment prefixes across languages (Rust #[...] attributes and C/C++ operators excluded)
+_COMMENT_LINE_RE = re.compile(
+    r"^\s*(?:#(?!\[|!\[)|//|/\*|\*(?:\s|$)|--(?:\s|$)|<!--|;|%|'(?:\s|$)|rem\b)",
+    re.IGNORECASE,
+)
+
+# Assertion patterns (statement or call required; assignments like assertion_count = 0 excluded)
 _ASSERTION_PATTERNS = [
-    re.compile(r"\bassert[a-zA-Z0-9_]*\b", re.IGNORECASE),
-    re.compile(r"\b(?:Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+"),
-    re.compile(r"\bXCTAssert[a-zA-Z0-9_]*"),
+    re.compile(r"(?:^|;\s*)\s*assert(?:\s+|\s*\()"),
+    re.compile(r"\b(?:self\.)?assert(?:[A-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+)\s*\("),
+    re.compile(r"\bassert(?:_eq|_ne)?!\s*[\(\[]"),
+    re.compile(r"\b(?:Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
+    re.compile(r"\bXCTAssert[a-zA-Z0-9_]*\s*\("),
     re.compile(r"\bexpect\s*\("),
     re.compile(r"\btoThrow(?:Error)?\s*\("),
-    re.compile(r"(?:\.should\b|\bshould\s*\(|\bshould\s+(?:be|equal|have|match|raise|not)\b|\.should_[a-zA-Z0-9_]+)"),
+    re.compile(
+        r"(?:\.should\b|\bshould\s*\(|\bshould\s+(?:be|equal|have|match|raise|not)\b|\.should_[a-zA-Z0-9_]+|\bshould(?:Be|NotBe|Equal)\b|\.Should\s*\()"
+    ),
     re.compile(r"(?:\brequire\.[a-zA-Z0-9_]+|\b(?:verify|check)\s*\()"),
     re.compile(r"\brequire\s*\((?!['\"][a-zA-Z0-9_\-\.\/]+['\"]\s*\))"),
-    re.compile(r"\bt\.(?:Error|Fatal|Fail)(?:f|Now)?\b"),
+    re.compile(r"\bt\.(?:Error|Fatal|Fail)(?:f|Now)?\s*\("),
     re.compile(r"\bok\s*\("),
     re.compile(r"#!?\[should_panic"),
     re.compile(r"\bpytest\.(?:raises|warns)\b"),
@@ -104,26 +108,37 @@ _ASSERTION_PATTERNS = [
 
 # Skip / disabled test markers
 _SKIP_PATTERNS = [
-    re.compile(r"\bpytest\.mark\.(?:skip|xfail)\b"),
+    re.compile(r"\bpytest\.mark\.(?:skip|skipif|xfail)\b"),
     re.compile(r"\bpytest\.(?:skip|xfail)\s*\("),
-    re.compile(r"\b(?:xit|xdescribe)\s*\("),
-    re.compile(r"\.(?:skip|todo)\s*\("),
-    re.compile(r"^\s*@(?:Disabled|Ignore)\b"),
+    re.compile(r"\b(?:xit|xdescribe)\b"),
+    re.compile(r"\b(?:test|it|describe|context|suite)\.(?:skip|todo)\s*\("),
+    re.compile(r"^\s*@(?:Disabled|Ignore)\b|@Test\s+@Disabled\b|@Disabled\s+@Test\b"),
+    re.compile(r"\[(?:Fact|Theory)\s*\([^\]]*Skip\s*="),
+    re.compile(r"\[Ignore(?:Attribute)?(?:\([^\]]*\))?\]"),
     re.compile(r"\bt\.Skip(?:f|Now)?\s*\("),
+    re.compile(r"#!?\[ignore(?:\s*=\s*['\"][^'\"]*['\"]|\([^\]]*\))?\]"),
     re.compile(r"\btodo!\s*\(?"),
-    re.compile(r"(?<!def\s)\b(?:skip|pending)\s*\("),
+    re.compile(r"(?<!def\s)(?<!\.)\b(?:skip|pending)\b(?:\s*\(|\s+['\"])"),
+    re.compile(r"\bmarkTestSkipped\s*\("),
+    re.compile(r"\bXCTSkip(?:If|Unless)?\s*\("),
+    re.compile(r"\bskip\s*:\s*(?:true\b|['\"])"),
 ]
 
-# Global state mutation patterns
+# Global state mutation patterns: assignments require =(?!=) and ignore reads/comparisons
 _GLOBAL_MUTATION_PATTERNS = [
     re.compile(r"\bsys\.path\.(?:insert|append)\s*\("),
-    re.compile(r"\b__path__\b"),
-    re.compile(r"\bos\.environ\s*\[[^\]]+\]\s*="),
+    re.compile(r"\b__path__\.(?:insert|append|extend)\s*\("),
+    re.compile(r"\b__path__\s*(?:\[[^\]]+\])?\s*=(?!=)"),
+    re.compile(r"\bos\.environ\s*\[[^\]]+\]\s*=(?!=)"),
     re.compile(r"\bos\.environ\.(?:pop|setdefault|update)\s*\("),
-    re.compile(r"\bprocess\.env(?:\.[a-zA-Z0-9_]+|\[[^\]]+\])\s*="),
-    re.compile(r"(?<!\.)\b(?:setenv|putenv)\s*\("),
+    re.compile(r"\bprocess\.env(?:\.[a-zA-Z0-9_]+|\[[^\]]+\])\s*=(?!=)"),
+    re.compile(r"(?:\bos\.putenv|(?<![\w.])putenv|(?<![\w.])setenv)\s*\("),
     re.compile(r"\bDir\.chdir\b"),
-    re.compile(r"\bos\.chdir\s*\("),
+    re.compile(r"\b(?:os|process)\.chdir\s*\("),
+    re.compile(r"\bENV\s*\[[^\]]+\]\s*=(?!=)"),
+    re.compile(r"\bos\.Setenv\s*\("),
+    re.compile(r"\bSystem\.setProperty\s*\("),
+    re.compile(r"\b(?:std::env::set_var|env::set_var|set_var)\s*\("),
 ]
 
 
@@ -139,38 +154,37 @@ def _extract_sec008_rule_patterns() -> list[re.Pattern]:
     return extracted
 
 
-# Secret assignment patterns: reuse primary rulebook regex + SEC-008 rules from rules.py
+# Reused secret patterns: shared rulebook regex, SEC-008 rules, linear token prefixes and assignments
+_TOKEN_PREFIX_RE = re.compile(
+    r"""(?i)\b(?:sk_live_[a-zA-Z0-9_\-]{8,100}|ghp_[a-zA-Z0-9]{20,100}|AKIA[0-9A-Z]{16}|Bearer\s+[a-zA-Z0-9_\-\.]{20,200})\b"""
+)
+
+_SECRET_ASSIGN_OR_COMPARE_RE = re.compile(
+    r"""(?i)(?:os\.environ\s*\[\s*["']|process\.env\.(?:[a-zA-Z0-9_]{1,60}\.)?|process\.env\s*\[\s*["']|\b)(?:api[_-]?key|secret|token|password|auth[_-]?token|private[_-]?key|jwt)[a-zA-Z0-9_]{0,40}["']?\s*\]?\s*(?:[:=]|={2,3})\s*["'][^"'\r\n]{6,200}["']"""
+)
+
 _REUSED_SECRET_PATTERNS: list[re.Pattern] = [
     OCRRulebookRunner.SECRET_REGEX,
     *_extract_sec008_rule_patterns(),
-    re.compile(
-        r"""(?i)(?:os\.environ\s*\[|process\.env(?:\.|\[))\s*["']?[^"'\r\n\]]*(?:token|secret|password|api[_-]?key|auth|jwt)[^"'\r\n\]]*["']?\s*\]?\s*=\s*["'][^"'\r\n]+["']"""
-    ),
+    _TOKEN_PREFIX_RE,
+    _SECRET_ASSIGN_OR_COMPARE_RE,
 ]
 
 # Test function starters
 _TEST_START_PATTERNS = [
-    # Python def test_...
-    (re.compile(r"^\s*def\s+(test_[a-zA-Z0-9_]+)"), lambda m, _next_line: m.group(1)),
-    # JS/TS/Ruby it(...) or test(...)
+    (re.compile(r"^\s*(?:async\s+def|def)\s+(test_[a-zA-Z0-9_]+)"), lambda m, _next: m.group(1)),
     (
         re.compile(r"^\s*(?:it|test)\s*(?:\(\s*|\s+)['\"`]([^'\"`]{1,60})['\"`]"),
-        lambda m, _next_line: f'{m.group(0).split("(")[0].strip()}("{m.group(1)}")',
+        lambda m, _next: f'{m.group(0).split()[0].split("(")[0].strip()}("{m.group(1)}")',
     ),
-    (re.compile(r"^\s*(it|test)\s*\("), lambda m, _next_line: m.group(1)),
-    # Go func TestXxx
-    (re.compile(r"^\s*func\s+(Test[a-zA-Z0-9_]*)"), lambda m, _next_line: m.group(1)),
-    # Rust fn test_xxx
-    (re.compile(r"^\s*(?:pub\s+)?fn\s+(test_[a-zA-Z0-9_]+)"), lambda m, _next_line: m.group(1)),
-    # Rust #[test]
-    (re.compile(r"^\s*#\[test\]"), lambda _m, next_line: _extract_method_name(next_line) or "#[test]"),
-    # Java @Test
-    (re.compile(r"^\s*@Test\b"), lambda _m, next_line: _extract_method_name(next_line) or "@Test"),
-    # C# [Fact], [Theory], [Test]
-    (
-        re.compile(r"^\s*\[(?:Fact|Theory|Test)\]"),
-        lambda m, next_line: _extract_method_name(next_line) or m.group(0).strip(),
-    ),
+    (re.compile(r"^\s*(it|test)\s*\("), lambda m, _next: m.group(1)),
+    (re.compile(r"^\s*func\s+(Test[a-zA-Z0-9_]*)"), lambda m, _next: m.group(1)),
+    (re.compile(r"^\s*func\s+(test[A-Z][a-zA-Z0-9_]*)"), lambda m, _next: m.group(1)),
+    (re.compile(r"^\s*#\[(?:tokio::test|test)\]"), lambda _m, _next: _m.group(0).strip()),
+    (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(test_[a-zA-Z0-9_]+)"), lambda m, _next: m.group(1)),
+    (re.compile(r"^\s*@Test\b"), lambda _m, next_l: _extract_method_name(next_l) or "@Test"),
+    (re.compile(r"^\s*\[(?:Fact|Theory|Test)(?:\([^\]]*\))?\]"), lambda m, next_l: _extract_method_name(next_l) or m.group(0).strip()),
+    (re.compile(r"^\s*(?:public\s+)?function\s+(test[A-Z0-9_][a-zA-Z0-9_]*)"), lambda m, _next: m.group(1)),
 ]
 
 
@@ -190,10 +204,78 @@ def _extract_method_name(next_line: str) -> str | None:
     return None
 
 
-def is_test_path(path: str) -> bool:
-    """True if path matches known test directory or file patterns across ecosystems."""
+def shorten_path(path: str, max_chars: int = MAX_PATH_CHARS) -> str:
+    """Shorten long file paths for bounded evidence reporting."""
     norm = path.replace("\\", "/").strip()
-    return bool(_TEST_PATH_RE.search(norm))
+    if len(norm) <= max_chars:
+        return norm
+    parts = norm.split("/")
+    if len(parts) <= 2:
+        return norm[: max_chars - 3] + "..."
+    head, tail = parts[0], parts[-1]
+    if len(head) + len(tail) + 5 <= max_chars:
+        return f"{head}/.../{tail}"
+    return f".../{tail}"[-max_chars:]
+
+
+def decode_git_path(path: str) -> str:
+    """Decode git C-style quoted paths with octal escapes (e.g. \\303\\251 -> UTF-8)."""
+    p = path.strip()
+    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+        inner = p[1:-1]
+        try:
+            def _replace_escape(m: re.Match) -> bytes:
+                seq = m.group(0).decode("latin1")
+                if len(seq) > 1 and seq[1] in "01234567":
+                    return bytes([int(seq[1:], 8)])
+                escapes: dict[str, bytes] = {
+                    "\\\\": b"\\",
+                    '\\"': b'"',
+                    "\\n": b"\n",
+                    "\\t": b"\t",
+                    "\\r": b"\r",
+                    "\\b": b"\b",
+                    "\\f": b"\f",
+                }
+                val = escapes.get(seq)
+                if val is not None:
+                    return val
+                return seq.encode("latin1")
+
+            raw_bytes = re.sub(rb'\\[0-7]{1,3}|\\[\\ntrbf"]', _replace_escape, inner.encode("latin1"))
+            return raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            return inner
+    return p
+
+
+def is_test_path(path: str) -> bool:
+    """
+    True if path matches known test directory or file patterns across ecosystems.
+    Directory names are case-insensitive; *Test suffix patterns are case-sensitive.
+    """
+    norm = path.replace("\\", "/").strip()
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    # Case-insensitive directory matching
+    for d in parts[:-1]:
+        if d.lower() in ("test", "tests", "__tests__", "spec", "specs"):
+            return True
+    filename = parts[-1]
+    # Infix / prefix (case-insensitive)
+    if re.search(r"^(?:test_.+|.+_test)\.[a-zA-Z0-9_]+$", filename, re.IGNORECASE):
+        return True
+    if re.search(r"^.+\.(?:test|spec)\.[a-zA-Z0-9_]+$", filename, re.IGNORECASE):
+        return True
+    if re.search(r"^.+_spec\.rb$", filename, re.IGNORECASE):
+        return True
+    # Suffix patterns (case-sensitive: requires capital Test/Tests after non-empty name)
+    if re.search(r"^[a-zA-Z0-9_]+Test\.(?:java|kt|cs|swift)$", filename):
+        return True
+    if re.search(r"^[a-zA-Z0-9_]+Tests\.[a-zA-Z0-9_]+$", filename):
+        return True
+    return False
 
 
 def is_secret_line(line: str) -> bool:
@@ -205,24 +287,37 @@ def is_secret_line(line: str) -> bool:
 def format_quoted_line(file_path: str, line_num: int | None, line_content: str) -> str:
     """
     Format a quoted line safely:
-    - Never quotes lines matching secret assignments (names file and line instead).
-    - Truncates lines longer than MAX_QUOTE_CHARS (160 characters).
+    - Never quotes lines matching secret assignments or exceeding MAX_QUOTE_CHARS.
+    - Names file and line instead of quoting.
     """
     clean = line_content.strip()
+    sp = shorten_path(file_path)
+    loc = f"{sp}:{line_num}" if line_num is not None else sp
     if is_secret_line(clean):
-        loc = f"{file_path}:{line_num}" if line_num is not None else file_path
         return f"[line omitted: potential secret at {loc}]"
     if len(clean) > MAX_QUOTE_CHARS:
-        return clean[: MAX_QUOTE_CHARS - 3] + "..."
+        return f"[line omitted: exceeds {MAX_QUOTE_CHARS} characters at {loc}]"
     return clean
 
 
+def strip_trailing_comment(line: str) -> str:
+    """Strip trailing # (except Rust #[...]) or // comments outside of string literals."""
+    masked = _mask_strings(line)
+    m = re.search(r"(?:#(?!\[|!\[)|//)", masked)
+    if m:
+        return line[: m.start()].rstrip()
+    return line.rstrip()
+
+
 def is_assertion_line(line: str) -> bool:
-    """True if line matches assertion-like patterns and is not an import."""
+    """True if line matches assertion-like patterns and is not a comment or import."""
     line_cut = line[:MAX_LINE_CHARS]
+    if _COMMENT_LINE_RE.match(line_cut):
+        return False
     if _IMPORT_LINE_RE.match(line_cut):
         return False
-    code_only = _mask_strings(line_cut)
+    stripped = strip_trailing_comment(line_cut)
+    code_only = _mask_strings(stripped)
     return any(p.search(code_only) for p in _ASSERTION_PATTERNS)
 
 
@@ -243,7 +338,8 @@ class _ParsedFileDiff:
 
 def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
     """Parse raw unified diff into file diffs and hunks, up to MAX_SCANNED_LINES."""
-    lines = raw_diff.splitlines()
+    # Split only on \n and strip trailing \r (avoids splitting on form feed \x0c or line separators)
+    lines = [line.rstrip("\r") for line in raw_diff.split("\n")]
     exceeded = len(lines) > MAX_SCANNED_LINES
     if exceeded:
         lines = lines[:MAX_SCANNED_LINES]
@@ -255,7 +351,7 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
     new_line_num = 0
 
     hunk_header_re = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
-    diff_git_re = re.compile(r"^diff --git a/(.*) b/(.*)")
+    diff_git_re = re.compile(r'^diff --git (?:\"a/(.+?)\"|a/(\S+?)) (?:\"b/(.+?)\"|b/(\S+?))$')
 
     for raw_line in lines:
         line = raw_line[:MAX_LINE_CHARS]
@@ -264,7 +360,10 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
             m = diff_git_re.match(line)
             current_hunk = None
             if m:
-                path = m.group(2) if m.group(2) != "/dev/null" else m.group(1)
+                new_raw = m.group(3) or m.group(4) or ""
+                old_raw = m.group(1) or m.group(2) or ""
+                path_raw = new_raw if new_raw != "/dev/null" else old_raw
+                path = decode_git_path('"' + path_raw + '"' if "\\" in path_raw else path_raw)
                 current_file = _ParsedFileDiff(path=path)
                 files.append(current_file)
             else:
@@ -272,16 +371,18 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
             continue
 
         if current_file is None:
-            if line.startswith("--- a/"):
-                current_file = _ParsedFileDiff(path=line[6:].strip())
+            if line.startswith("--- a/") or line.startswith('--- "a/'):
+                p_raw = line[4:].strip()
+                current_file = _ParsedFileDiff(path=decode_git_path(p_raw)[2:])
                 files.append(current_file)
                 continue
             if line == "--- /dev/null":
                 current_file = _ParsedFileDiff(path="")
                 files.append(current_file)
                 continue
-            if line.startswith("+++ b/"):
-                current_file = _ParsedFileDiff(path=line[6:].strip())
+            if line.startswith("+++ b/") or line.startswith('+++ "b/'):
+                p_raw = line[4:].strip()
+                current_file = _ParsedFileDiff(path=decode_git_path(p_raw)[2:])
                 files.append(current_file)
                 continue
             continue
@@ -294,13 +395,14 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
 
         # File headers outside hunks
         if current_hunk is None:
-            if line.startswith("--- a/") or line == "--- /dev/null":
+            if line.startswith("--- a/") or line == "--- /dev/null" or line.startswith('--- "a/'):
                 continue
-            if line.startswith("+++ b/") or line == "+++ /dev/null":
+            if line.startswith("+++ b/") or line == "+++ /dev/null" or line.startswith('+++ "b/'):
                 if line == "+++ /dev/null":
                     current_file.is_deleted = True
-                elif line.startswith("+++ b/"):
-                    current_file.path = line[6:].strip()
+                else:
+                    p_raw = line[4:].strip()
+                    current_file.path = decode_git_path(p_raw)[2:]
                 continue
 
         m_hunk = hunk_header_re.match(line)
@@ -335,9 +437,9 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
     return files, exceeded
 
 
-def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str]]) -> list[str]:
+def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str]]) -> list[tuple[str, int, str]]:
     """Check added lines in a hunk for test functions without assertions (Rule 4)."""
-    reports: list[str] = []
+    reports: list[tuple[str, int, str]] = []
     test_starts: list[tuple[int, int, str]] = []
 
     for idx, (lnum, line) in enumerate(added_lines):
@@ -357,7 +459,7 @@ def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str]]) -> lis
             continue
         has_assert = any(is_assertion_line(text) for _, text in block)
         if not has_assert:
-            reports.append(f"{file_path}:{lnum} {test_name} adds no assertion-like line (heuristic)")
+            reports.append((file_path, lnum, test_name))
 
     return reports
 
@@ -380,21 +482,21 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
             return [f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only"]
         return []
 
-    evidence: list[str] = []
+    # Collect raw candidate actions before expensive formatting/quoting
+    candidates: list[tuple] = []
 
     if exceeded_diff_lines:
-        evidence.append(f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only")
+        candidates.append(("notice", f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only"))
 
     for file_stat in test_files:
         fp = file_stat.path
 
         # Rule 5: A test file whose diff only deletes lines, and a deleted test file
         if file_stat.is_deleted:
-            evidence.append(f"{fp}: test file deleted")
+            candidates.append(("rule5", f"{shorten_path(fp)}: test file deleted"))
         elif file_stat.total_deletions > 0 and file_stat.total_insertions == 0:
-            evidence.append(f"{fp}: test file diff only deletes lines")
+            candidates.append(("rule5", f"{shorten_path(fp)}: test file diff only deletes lines"))
 
-        # Collect all added and removed lines across hunks
         all_added: list[tuple[int, str]] = []
         all_removed: list[tuple[int, str]] = []
         for hunk in file_stat.hunks:
@@ -410,15 +512,7 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
         ]
 
         if len(removed_assertions) > len(added_assertions):
-            sample_lines = [
-                format_quoted_line(fp, lnum, text)
-                for lnum, text in removed_assertions[:3]
-            ]
-            sample_str = ", ".join(f"'{s}'" for s in sample_lines)
-            evidence.append(
-                f"{fp}: {len(removed_assertions)} assertion line(s) removed, "
-                f"{len(added_assertions)} added (removed: {sample_str})"
-            )
+            candidates.append(("rule1", fp, removed_assertions, added_assertions))
 
         # Rule 2: Disabled or skipped added
         skip_matches = [
@@ -427,28 +521,58 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
             if any(p.search(text[:MAX_LINE_CHARS]) for p in _SKIP_PATTERNS)
         ]
         if skip_matches:
-            samples = [
-                f"line {lnum}: '{format_quoted_line(fp, lnum, text)}'"
-                for lnum, text in skip_matches[:3]
-            ]
-            evidence.append(f"{fp}: disabled or skipped test marker(s) added: {', '.join(samples)}")
+            candidates.append(("rule2", fp, skip_matches))
 
         # Rule 3: Global state mutation added
         for lnum, text in all_added:
             text_cut = text[:MAX_LINE_CHARS]
             if any(p.search(text_cut) for p in _GLOBAL_MUTATION_PATTERNS):
-                clean_quote = format_quoted_line(fp, lnum, text)
-                evidence.append(f"{fp}:{lnum}: added global state mutation: {clean_quote}")
+                candidates.append(("rule3", fp, lnum, text))
 
         # Rule 4: New test without assertion lines (heuristic)
         for hunk in file_stat.hunks:
-            hunk_reports = _check_hunk_tests(fp, hunk.added_lines)
-            evidence.extend(hunk_reports)
+            for item in _check_hunk_tests(fp, hunk.added_lines):
+                candidates.append(("rule4", *item))
 
-    # Cap output at MAX_EVIDENCE_LINES (12 lines)
-    if len(evidence) > MAX_EVIDENCE_LINES:
-        remaining = len(evidence) - (MAX_EVIDENCE_LINES - 1)
-        evidence = evidence[: MAX_EVIDENCE_LINES - 1] + [f"... and {remaining} more"]
+    # Apply 12-line cap BEFORE formatting candidates
+    total_candidates = len(candidates)
+    if total_candidates > MAX_EVIDENCE_LINES:
+        to_format = candidates[: MAX_EVIDENCE_LINES - 1]
+        overflow = total_candidates - (MAX_EVIDENCE_LINES - 1)
+    else:
+        to_format = candidates
+        overflow = 0
+
+    evidence: list[str] = []
+    for item in to_format:
+        kind = item[0]
+        if kind in ("notice", "rule5"):
+            evidence.append(item[1])
+        elif kind == "rule1":
+            _k, fp, rem, add = item
+            samples = [format_quoted_line(fp, lnum, text) for lnum, text in rem[:3]]
+            sample_str = ", ".join(f"'{s}'" for s in samples)
+            sp = shorten_path(fp)
+            evidence.append(
+                f"{sp}: {len(rem)} assertion line(s) removed, {len(add)} added (removed: {sample_str})"
+            )
+        elif kind == "rule2":
+            _k, fp, skips = item
+            samples = [f"line {lnum}: '{format_quoted_line(fp, lnum, text)}'" for lnum, text in skips[:3]]
+            sp = shorten_path(fp)
+            evidence.append(f"{sp}: disabled or skipped test marker(s) added: {', '.join(samples)}")
+        elif kind == "rule3":
+            _k, fp, lnum, text = item
+            clean_quote = format_quoted_line(fp, lnum, text)
+            sp = shorten_path(fp)
+            evidence.append(f"{sp}:{lnum}: added global state mutation: {clean_quote}")
+        elif kind == "rule4":
+            _k, fp, lnum, test_name = item
+            sp = shorten_path(fp)
+            evidence.append(f"{sp}:{lnum} {test_name} adds no assertion-like line (heuristic)")
+
+    if overflow > 0:
+        evidence.append(f"... and {overflow} more")
 
     return evidence
 

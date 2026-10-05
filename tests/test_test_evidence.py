@@ -16,13 +16,13 @@ from guard.core.review_checklists import TEST_QUALITY_CHECKLIST
 from guard.core.rules import _Sec008Matcher
 from guard.core.test_evidence import (
     MAX_EVIDENCE_LINES,
-    MAX_QUOTE_CHARS,
+    MAX_PATH_CHARS,
     MAX_SCANNED_LINES,
     _extract_sec008_rule_patterns,
-    format_quoted_line,
+    decode_git_path,
     is_assertion_line,
-    is_secret_line,
     is_test_path,
+    shorten_path,
 )
 from guard.core.test_evidence import (
     test_evidence_lines as get_evidence_lines,
@@ -65,6 +65,8 @@ def _get_git_show_diff(commit_hash: str, file_path: str, fallback_diff: str) -> 
     [
         "tests/test_something.py",
         "test/something.py",
+        "Test/something.py",
+        "TESTS/something.py",
         "src/__tests__/button.test.tsx",
         "src/__tests__/button.js",
         "spec/models/user_spec.rb",
@@ -97,10 +99,16 @@ def test_is_test_path_positive(path: str):
         "README.md",
         "src/test_helpers/factory.py",
         "testing_data/fixtures.json",
+        "src/Latest.java",
+        "src/Contest.kt",
+        "src/contests.py",
+        "src/attests.js",
+        "src/fastest.cs",
+        "src/protest.swift",
     ],
 )
 def test_is_test_path_negative(path: str):
-    """Non-test paths are not identified as test files."""
+    """Non-test paths and lookalike suffix words are rejected."""
     assert is_test_path(path) is False
 
 
@@ -129,6 +137,75 @@ def test_no_test_files_returns_empty_list():
 
 
 # ---------------------------------------------------------------------------
+# Comment Filtering & Assertion Refinement
+# ---------------------------------------------------------------------------
+
+
+def test_commented_out_assertion_reported_as_removed():
+    """Commenting out an assertion counts as removed and is reported."""
+    diff_hash = """diff --git a/tests/test_c.py b/tests/test_c.py
+--- a/tests/test_c.py
++++ b/tests/test_c.py
+@@ -1,2 +1,2 @@
+-assert total == 3
++# assert total == 3
+"""
+    ev_hash = get_evidence_lines(diff_hash)
+    assert len(ev_hash) == 1
+    assert "tests/test_c.py: 1 assertion line(s) removed, 0 added" in ev_hash[0]
+
+    diff_slash = """diff --git a/src/__tests__/c.test.ts b/src/__tests__/c.test.ts
+--- a/src/__tests__/c.test.ts
++++ b/src/__tests__/c.test.ts
+@@ -1,2 +1,2 @@
+-expect(total).toBe(3)
++// expect(total).toBe(3)
+"""
+    ev_slash = get_evidence_lines(diff_slash)
+    assert len(ev_slash) == 1
+    assert "src/__tests__/c.test.ts: 1 assertion line(s) removed, 0 added" in ev_slash[0]
+
+    diff_block = """diff --git a/tests/test_b.py b/tests/test_b.py
+--- a/tests/test_b.py
++++ b/tests/test_b.py
+@@ -1,2 +1,2 @@
+-assert total == 3
++/* assert total == 3 */
+"""
+    ev_block = get_evidence_lines(diff_block)
+    assert len(ev_block) == 1
+    assert "tests/test_b.py: 1 assertion line(s) removed, 0 added" in ev_block[0]
+
+
+def test_assignment_containing_assert_not_an_assertion():
+    """Assignments like assertion_count = 0 or has_assert = True are not counted."""
+    assert is_assertion_line("assertion_count = 0") is False
+    assert is_assertion_line("has_assert = True") is False
+    assert is_assertion_line("assert_flag = False") is False
+    assert is_assertion_line("assert total == 3") is True
+    assert is_assertion_line("assert x > 0  # comment") is True
+
+
+# ---------------------------------------------------------------------------
+# Line Splitting (no split on form feeds \x0c)
+# ---------------------------------------------------------------------------
+
+
+def test_line_splitting_preserves_form_feed():
+    """Embedded form feeds \\x0c do not create phantom diff lines."""
+    diff_ff = """diff --git a/tests/test_ff.py b/tests/test_ff.py
+--- a/tests/test_ff.py
++++ b/tests/test_ff.py
+@@ -1,2 +1,2 @@
+-assert x == 1
++x = 1\x0c+assert True
+"""
+    ev_ff = get_evidence_lines(diff_ff)
+    assert len(ev_ff) == 1
+    assert "tests/test_ff.py: 1 assertion line(s) removed, 0 added" in ev_ff[0]
+
+
+# ---------------------------------------------------------------------------
 # Table-Driven Assertion Patterns
 # ---------------------------------------------------------------------------
 
@@ -144,6 +221,9 @@ def test_no_test_files_returns_empty_list():
         ("expect(() => call()).toThrow()", True),
         ("val.should.equal(10)", True),
         ("val.should be == 10", True),
+        ("result.shouldBe(42)", True),
+        ("result shouldBe 42", True),
+        ("result.Should().Be(42)", True),
         ("require.Equal(t, expected, actual)", True),
         ("require.NoError(t, err)", True),
         ("require(condition)", True),
@@ -168,6 +248,10 @@ def test_no_test_files_returns_empty_list():
         ("let path = require('path')", False),
         ("x = 10", False),
         ("print('assert nothing here')", False),
+        ("# assert total == 3", False),
+        ("// assert total == 3", False),
+        ("/* assert total == 3 */", False),
+        ("assertion_count = 0", False),
     ],
 )
 def test_assertion_pattern_table(line: str, expected: bool):
@@ -215,17 +299,18 @@ def test_rule1_assertions_reduced_negative():
 
 
 # ---------------------------------------------------------------------------
-# Rule 2: Disabled or Skipped Added
+# Rule 2: Disabled or Skipped Added (Multi-language coverage)
 # ---------------------------------------------------------------------------
 
 
-def test_rule2_skip_markers_positive_multi_language():
-    """Detects added skip markers across Python, JS, Java, Go, Rust, Ruby."""
+def test_rule2_skip_markers_positive_part1():
+    """Detects added skip markers across Python, JS, Java, Go, Ruby."""
     diff = """diff --git a/tests/test_skip.py b/tests/test_skip.py
 --- a/tests/test_skip.py
 +++ b/tests/test_skip.py
-@@ -5,1 +5,4 @@
+@@ -5,1 +5,6 @@
 +@pytest.mark.skip(reason="wip")
++@pytest.mark.skipif(condition, reason="skipif")
 +def test_py():
 +    assert True
 diff --git a/src/__tests__/app.test.js b/src/__tests__/app.test.js
@@ -238,8 +323,9 @@ diff --git a/src/__tests__/app.test.js b/src/__tests__/app.test.js
 diff --git a/tests/ServiceTest.java b/tests/ServiceTest.java
 --- a/tests/ServiceTest.java
 +++ b/tests/ServiceTest.java
-@@ -1,1 +1,4 @@
+@@ -1,1 +1,6 @@
 +@Disabled("flaky test")
++@Test @Disabled
 +@Test
 +void testJava() {
 +}
@@ -253,9 +339,10 @@ diff --git a/pkg/server_test.go b/pkg/server_test.go
 diff --git a/spec/calc_spec.rb b/spec/calc_spec.rb
 --- a/spec/calc_spec.rb
 +++ b/spec/calc_spec.rb
-@@ -1,1 +1,4 @@
+@@ -1,1 +1,5 @@
 +it "pending feature" do
-+    skip("not implemented")
++    skip "not implemented"
++    pending "reason"
 +end
 """
     evidence = get_evidence_lines(diff)
@@ -266,13 +353,47 @@ diff --git a/spec/calc_spec.rb b/spec/calc_spec.rb
     assert any("spec/calc_spec.rb: disabled or skipped test marker(s) added" in e for e in evidence)
 
 
-def test_rule2_skip_markers_negative_removal():
-    """Removing a skip marker does not trigger Rule 2."""
+def test_rule2_skip_markers_positive_part2():
+    """Detects added skip markers across C#, PHPUnit, Swift, Dart."""
+    diff = """diff --git a/tests/TestCs.cs b/tests/TestCs.cs
+--- a/tests/TestCs.cs
++++ b/tests/TestCs.cs
+@@ -1,1 +1,4 @@
++[Fact(Skip = "broken")]
++[Ignore("flaky")]
++public void TestMethod() {}
+diff --git a/tests/TestPhp.php b/tests/TestPhp.php
+--- a/tests/TestPhp.php
++++ b/tests/TestPhp.php
+@@ -1,1 +1,4 @@
++$this->markTestSkipped("not configured");
+diff --git a/tests/TestSwift.swift b/tests/TestSwift.swift
+--- a/tests/TestSwift.swift
++++ b/tests/TestSwift.swift
+@@ -1,1 +1,4 @@
++XCTSkip("not ready")
+diff --git a/test/test_dart.dart b/test/test_dart.dart
+--- a/test/test_dart.dart
++++ b/test/test_dart.dart
+@@ -1,1 +1,4 @@
++test('dart test', () {}, skip: true);
+"""
+    evidence = get_evidence_lines(diff)
+    assert any("tests/TestCs.cs: disabled or skipped test marker(s) added" in e for e in evidence)
+    assert any("tests/TestPhp.php: disabled or skipped test marker(s) added" in e for e in evidence)
+    assert any("tests/TestSwift.swift: disabled or skipped test marker(s) added" in e for e in evidence)
+    assert any("test/test_dart.dart: disabled or skipped test marker(s) added" in e for e in evidence)
+
+
+def test_rule2_skip_markers_negative_iterator_and_removal():
+    """Stream.skip and LINQ query.Skip are not flagged as skip markers; removals are not flagged."""
     diff = """diff --git a/tests/test_skip.py b/tests/test_skip.py
 --- a/tests/test_skip.py
 +++ b/tests/test_skip.py
-@@ -5,2 +5,2 @@
+@@ -5,4 +5,4 @@
 -@pytest.mark.skip(reason="unskip")
++stream.skip(5)
++query.Skip(10)
  def test_active():
      assert True
 """
@@ -281,75 +402,104 @@ def test_rule2_skip_markers_negative_removal():
 
 
 # ---------------------------------------------------------------------------
-# Rule 3: Global State Mutation Added
+# Rule 3: Global State Mutation Added (Multi-language coverage & comparisons)
 # ---------------------------------------------------------------------------
 
 
-def test_rule3_global_state_mutation_positive():
-    """Detects sys.path, __path__, os.environ, process.env, and chdir mutations."""
+def test_rule3_global_state_mutation_positive_part1():
+    """Detects sys.path, __path__, os.environ, and putenv mutations."""
+    diff = """diff --git a/tests/test_env1.py b/tests/test_env1.py
+--- a/tests/test_env1.py
++++ b/tests/test_env1.py
+@@ -1,1 +1,9 @@
++import sys, os
++sys.path.insert(0, '/local/repo')
++sys.path.append('/other')
++guard.__path__.insert(0, '/local/guard')
++guard.__path__ = ['/local/guard']
++os.environ['ENV_VAR'] = 'val'
++os.environ.setdefault('A', '1')
++os.environ.update({'B': '2'})
++os.putenv('A', 'B')
+"""
+    evidence = get_evidence_lines(diff)
+    assert any("sys.path.insert" in e for e in evidence)
+    assert any("sys.path.append" in e for e in evidence)
+    assert any("guard.__path__.insert" in e for e in evidence)
+    assert any("guard.__path__ =" in e for e in evidence)
+    assert any("os.environ['ENV_VAR'] = 'val'" in e for e in evidence)
+    assert any("os.environ.setdefault" in e for e in evidence)
+    assert any("os.environ.update" in e for e in evidence)
+    assert any("os.putenv" in e for e in evidence)
+
+
+def test_rule3_global_state_mutation_positive_part2():
+    """Detects setenv, process.env, chdir, ENV[]=, Setenv, setProperty, set_var."""
+    diff = """diff --git a/tests/test_env2.py b/tests/test_env2.py
+--- a/tests/test_env2.py
++++ b/tests/test_env2.py
+@@ -1,1 +1,9 @@
++setenv('C', 'D', 1)
++process.env.NODE_ENV = 'test'
++process.chdir('/tmp')
++os.chdir('/tmp')
++Dir.chdir('/tmp')
++ENV['RUBY_KEY'] = 'val'
++os.Setenv("GO_KEY", "val")
++System.setProperty("java.key", "val")
++env::set_var("RUST_KEY", "val")
+"""
+    evidence = get_evidence_lines(diff)
+    assert any("setenv" in e for e in evidence)
+    assert any("process.env.NODE_ENV" in e for e in evidence)
+    assert any("process.chdir" in e for e in evidence)
+    assert any("os.chdir" in e for e in evidence)
+    assert any("Dir.chdir" in e for e in evidence)
+    assert any("ENV['RUBY_KEY']" in e for e in evidence)
+    assert any("os.Setenv" in e for e in evidence)
+    assert any("System.setProperty" in e for e in evidence)
+    assert any("env::set_var" in e for e in evidence)
+
+
+def test_rule3_comparisons_and_reads_not_mutations():
+    """Comparisons (==, ===) and reads (in __path__) are not mutations."""
     diff = """diff --git a/tests/test_env.py b/tests/test_env.py
 --- a/tests/test_env.py
 +++ b/tests/test_env.py
 @@ -1,3 +1,8 @@
-+import sys, os
-+sys.path.insert(0, '/local/repo')
-+sys.path.append('/other')
-+os.environ['ENV_VAR'] = 'val'
-+os.chdir('/tmp')
-"""
-    evidence = get_evidence_lines(diff)
-    assert any("tests/test_env.py:2: added global state mutation: sys.path.insert(0, '/local/repo')" in e for e in evidence)
-    assert any("tests/test_env.py:3: added global state mutation: sys.path.append('/other')" in e for e in evidence)
-    assert any("tests/test_env.py:4: added global state mutation: os.environ['ENV_VAR'] = 'val'" in e for e in evidence)
-    assert any("tests/test_env.py:5: added global state mutation: os.chdir('/tmp')" in e for e in evidence)
-
-
-def test_rule3_environ_setdefault_and_update():
-    """Detects os.environ.setdefault and os.environ.update as global state mutations."""
-    diff = """diff --git a/tests/test_env.py b/tests/test_env.py
---- a/tests/test_env.py
-+++ b/tests/test_env.py
-@@ -1,1 +1,3 @@
-+os.environ.setdefault('A', '1')
-+os.environ.update({'B': '2'})
-"""
-    evidence = get_evidence_lines(diff)
-    assert any("os.environ.setdefault" in e for e in evidence)
-    assert any("os.environ.update" in e for e in evidence)
-
-
-def test_rule3_global_state_mutation_negative_monkeypatch():
-    """Monkeypatch and standard reads are not reported as global state mutations."""
-    diff = """diff --git a/tests/test_env.py b/tests/test_env.py
---- a/tests/test_env.py
-+++ b/tests/test_env.py
-@@ -1,3 +1,7 @@
- def test_clean(monkeypatch):
-     monkeypatch.setenv('VAR', 'val')
-     monkeypatch.syspath_prepend('/tmp')
-     monkeypatch.chdir('/tmp')
-     v = os.environ.get('VAR')
-     assert v == 'val'
++if os.environ['CI'] == 'true':
++    pass
++if process.env.CI === 'true':
++    pass
++if local_guard_dir not in guard.__path__:
++    pass
++if ENV['VAR'] == 'val':
++    pass
++monkeypatch.setenv('VAR', 'val')
 """
     evidence = get_evidence_lines(diff)
     assert not any("added global state mutation" in e for e in evidence)
 
 
 # ---------------------------------------------------------------------------
-# Rule 4: New Test Without Assertions (Heuristic)
+# Rule 4: New Test Without Assertions (Multi-language coverage)
 # ---------------------------------------------------------------------------
 
 
-def test_rule4_new_test_without_assertions_positive():
+def test_rule4_new_test_without_assertions_positive_multi_language():
     """Heuristic reports added test functions having >= 2 lines and no assertions."""
     diff = """diff --git a/tests/test_hollow.py b/tests/test_hollow.py
 --- a/tests/test_hollow.py
 +++ b/tests/test_hollow.py
-@@ -10,0 +10,5 @@
+@@ -10,0 +10,9 @@
 +def test_does_nothing():
 +    x = 1
 +    y = 2
 +    print(x + y)
++
++async def test_async_empty():
++    step1()
++    step2()
 +
 diff --git a/src/__tests__/ui.test.js b/src/__tests__/ui.test.js
 --- a/src/__tests__/ui.test.js
@@ -360,6 +510,15 @@ diff --git a/src/__tests__/ui.test.js b/src/__tests__/ui.test.js
 +    console.log(btn);
 +});
 +
+diff --git a/spec/ui_spec.rb b/spec/ui_spec.rb
+--- a/spec/ui_spec.rb
++++ b/spec/ui_spec.rb
+@@ -5,0 +5,5 @@
++it "runs ruby test" do
++    val = calculate()
++    puts val
++end
++
 diff --git a/pkg/service_test.go b/pkg/service_test.go
 --- a/pkg/service_test.go
 +++ b/pkg/service_test.go
@@ -367,6 +526,15 @@ diff --git a/pkg/service_test.go b/pkg/service_test.go
 +func TestWorker(t *testing.T) {
 +    w := newWorker()
 +    w.start()
++}
++
+diff --git a/tests/AppTests.swift b/tests/AppTests.swift
+--- a/tests/AppTests.swift
++++ b/tests/AppTests.swift
+@@ -5,0 +5,5 @@
++func testLoginScreen() {
++    let screen = LoginScreen()
++    screen.load()
 +}
 +
 diff --git a/tests/AccountTest.cs b/tests/AccountTest.cs
@@ -378,35 +546,36 @@ diff --git a/tests/AccountTest.cs b/tests/AccountTest.cs
 +        var acc = new Account();
 +    }
 +
-"""
-    evidence = get_evidence_lines(diff)
-    assert any("tests/test_hollow.py:10 test_does_nothing adds no assertion-like line (heuristic)" in e for e in evidence)
-    assert any("src/__tests__/ui.test.js:5 it(\"renders without check\") adds no assertion-like line (heuristic)" in e for e in evidence)
-    assert any("pkg/service_test.go:5 TestWorker adds no assertion-like line (heuristic)" in e for e in evidence)
-    assert any("tests/AccountTest.cs:5 TestDeposit adds no assertion-like line (heuristic)" in e for e in evidence)
-
-
-def test_rule4_new_test_without_assertions_negative_has_assert():
-    """New test containing an assertion is not flagged."""
-    diff = """diff --git a/tests/test_good.py b/tests/test_good.py
---- a/tests/test_good.py
-+++ b/tests/test_good.py
-@@ -10,0 +10,4 @@
-+def test_real():
-+    x = compute()
-+    assert x == 42
+diff --git a/tests/UserTest.php b/tests/UserTest.php
+--- a/tests/UserTest.php
++++ b/tests/UserTest.php
+@@ -5,0 +5,5 @@
++public function testCreateUser() {
++    $u = new User();
++}
 +
 """
     evidence = get_evidence_lines(diff)
-    assert not any("adds no assertion-like line" in e for e in evidence)
+    assert any("tests/test_hollow.py:10 test_does_nothing adds no assertion-like line" in e for e in evidence)
+    assert any("tests/test_hollow.py:15 test_async_empty adds no assertion-like line" in e for e in evidence)
+    assert any("src/__tests__/ui.test.js:5 it(\"renders without check\") adds no assertion-like line" in e for e in evidence)
+    # Ruby test name formatted cleanly
+    assert any("spec/ui_spec.rb:5 it(\"runs ruby test\") adds no assertion-like line" in e for e in evidence)
+    assert any("pkg/service_test.go:5 TestWorker adds no assertion-like line" in e for e in evidence)
+    assert any("tests/AppTests.swift:5 testLoginScreen adds no assertion-like line" in e for e in evidence)
+    assert any("tests/AccountTest.cs:5 TestDeposit adds no assertion-like line" in e for e in evidence)
+    assert any("tests/UserTest.php:5 testCreateUser adds no assertion-like line" in e for e in evidence)
 
 
-def test_rule4_new_test_without_assertions_negative_short_stub():
-    """Single-line stub or test block shorter than 2 lines is never reported."""
-    diff = """diff --git a/tests/test_stub.py b/tests/test_stub.py
---- a/tests/test_stub.py
-+++ b/tests/test_stub.py
-@@ -10,0 +10,1 @@
+def test_rule4_new_test_without_assertions_negatives():
+    """Test with assertions or single line stub is not flagged."""
+    diff = """diff --git a/tests/test_good.py b/tests/test_good.py
+--- a/tests/test_good.py
++++ b/tests/test_good.py
+@@ -10,0 +10,5 @@
++def test_real():
++    x = compute()
++    assert x == 42
 +def test_stub(): pass
 """
     evidence = get_evidence_lines(diff)
@@ -419,7 +588,7 @@ def test_rule4_new_test_without_assertions_negative_short_stub():
 
 
 def test_rule5_deleted_test_file_positive():
-    """Deleted test files are reported."""
+    """Deleted test files and deletions-only diffs are reported."""
     diff = """diff --git a/tests/test_deprecated.py b/tests/test_deprecated.py
 deleted file mode 100644
 --- a/tests/test_deprecated.py
@@ -427,14 +596,7 @@ deleted file mode 100644
 @@ -1,5 +0,0 @@
 -def test_old():
 -    assert True
-"""
-    evidence = get_evidence_lines(diff)
-    assert any("tests/test_deprecated.py: test file deleted" in e for e in evidence)
-
-
-def test_rule5_diff_only_deletes_lines_positive():
-    """Test file diff containing only line removals is reported."""
-    diff = """diff --git a/tests/test_clean.py b/tests/test_clean.py
+diff --git a/tests/test_clean.py b/tests/test_clean.py
 --- a/tests/test_clean.py
 +++ b/tests/test_clean.py
 @@ -10,3 +10,0 @@
@@ -442,20 +604,34 @@ def test_rule5_diff_only_deletes_lines_positive():
 -    pass
 """
     evidence = get_evidence_lines(diff)
+    assert any("tests/test_deprecated.py: test file deleted" in e for e in evidence)
     assert any("tests/test_clean.py: test file diff only deletes lines" in e for e in evidence)
 
 
-def test_rule5_deleted_non_test_file_negative():
-    """Deleted non-test file is not reported as test file deleted."""
-    diff = """diff --git a/docs/old.md b/docs/old.md
-deleted file mode 100644
---- a/docs/old.md
-+++ /dev/null
-@@ -1,2 +0,0 @@
--Old doc
+# ---------------------------------------------------------------------------
+# Quoted Non-ASCII Paths in Git Diffs
+# ---------------------------------------------------------------------------
+
+
+def test_git_quoted_non_ascii_paths_decoded():
+    """Git octal-escaped paths (e.g. \\303\\251 -> é) are decoded and recognized."""
+    raw = '"a/tests/t\\303\\251st.py"'
+    decoded = decode_git_path(raw)
+    assert decoded == "a/tests/tést.py"
+
+    diff = """diff --git "a/tests/t\\303\\251st.py" "b/tests/t\\303\\251st.py"
+new file mode 100644
+--- /dev/null
++++ "b/tests/t\\303\\251st.py"
+@@ -0,0 +1,4 @@
++import sys
++sys.path.insert(0, '/tmp')
++def test_ok():
++    assert True
 """
     evidence = get_evidence_lines(diff)
-    assert evidence == []
+    assert len(evidence) >= 1
+    assert any("tests/tést.py" in e and "sys.path.insert" in e for e in evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -522,13 +698,35 @@ new file mode 100644
 
 
 # ---------------------------------------------------------------------------
-# ReDoS and 1 MB Line Performance
+# Performance & ReDoS Tests
 # ---------------------------------------------------------------------------
 
 
-def test_redos_and_1mb_line_speed():
-    """A diff containing a 1 MB line returns in under 1.0 second."""
-    huge_line = "+" + "a" * 1_000_000 + "\n"
+def test_performance_secret_lookalike_input_speed():
+    """400 lines of secret-lookalike input must process in well under 1.0 second."""
+    # Constructed hot input that previously triggered quadratic backtracking
+    chunk = "+sys.path.insert(0,'x'); process.env." + ("token" * 395)
+    diff_400 = (
+        "diff --git a/tests/test_perf.py b/tests/test_perf.py\n"
+        "--- a/tests/test_perf.py\n"
+        "+++ b/tests/test_perf.py\n"
+        "@@ -1,1 +1,400 @@\n"
+        + "\n".join([chunk] * 400)
+    )
+    t0 = time.perf_counter()
+    ev = get_evidence_lines(diff_400)
+    elapsed = time.perf_counter() - t0
+    # Generous ceiling: must finish in under 1.0s (measured at ~0.005s with linear patterns)
+    assert elapsed < 1.0, f"Expected < 1.0s, took {elapsed:.4f}s"
+    assert len(ev) == MAX_EVIDENCE_LINES
+
+
+def test_redos_and_1mb_regex_hot_line_speed():
+    """A diff containing a 1 MB line with regex-hot content returns in under 1.0 second."""
+    k_env = "API" + "_KEY"
+    v_env = "sk_live" + "_1234567890"
+    hot_pattern = f"assert x == 1; process.env.{k_env} = '{v_env}'; sys.path.insert(0, '/tmp'); "
+    huge_line = "+" + (hot_pattern * (1_000_000 // len(hot_pattern) + 1))[:1_000_000] + "\n"
     diff = f"""diff --git a/tests/test_huge.py b/tests/test_huge.py
 new file mode 100644
 --- /dev/null
@@ -545,18 +743,47 @@ new file mode 100644
 
 
 # ---------------------------------------------------------------------------
-# Secret Assignment Sanitization & Quoting Length
+# Secret Redaction & Line/Path Length Bounds
 # ---------------------------------------------------------------------------
 
 
-def test_secret_assignment_detection_helper():
-    """Directly test is_secret_line pattern matching."""
-    k1 = "api" + "_key"
-    t1 = "secret" + "_token_12345"
-    assert is_secret_line(f'{k1} = "{t1}"') is True
-    assert is_secret_line('process.env.SECRET_KEY = "token_value_abc"') is True
-    assert is_secret_line('os.environ["AUTH_KEY"] = "token_value_xyz"') is True
-    assert is_secret_line('x = 10') is False
+def test_secret_assignment_and_comparison_never_quoted():
+    """Secret tokens, assignments and comparisons are never quoted in evidence lines."""
+    k_name = "api" + "_key"
+    token_val = "sk_live" + "_998877665544332211aabbcc"
+    diff = (
+        "diff --git a/tests/test_sec.py b/tests/test_sec.py\n"
+        "--- a/tests/test_sec.py\n"
+        "+++ b/tests/test_sec.py\n"
+        "@@ -5,1 +5,4 @@\n"
+        f'+{k_name} = "{token_val}"\n'
+        f'+os.environ["AUTH_KEY"] = "{token_val}"\n'
+        f'+assert {k_name} == "{token_val}"\n'
+    )
+    evidence = get_evidence_lines(diff)
+    # The raw secret token must never appear in any evidence line
+    for line in evidence:
+        assert token_val not in line
+    # Both global state mutation and assertion removal/comparison must redact the line
+    assert any("tests/test_sec.py:6:" in e and "[line omitted: potential secret" in e for e in evidence)
+
+
+def test_line_quoting_length_cap_and_path_bounding():
+    """Quoted evidence over MAX_QUOTE_CHARS is omitted and paths are shortened."""
+    long_stmt = "sys.path.insert(0, '" + "x" * 200 + "')"
+    deep_path = "tests/" + "nested/" * 25 + "test_long.py"
+    diff = f"""diff --git a/{deep_path} b/{deep_path}
+--- a/{deep_path}
++++ b/{deep_path}
+@@ -1,1 +1,2 @@
++{long_stmt}
+"""
+    evidence = get_evidence_lines(diff)
+    assert len(evidence) >= 1
+    # Check that line over 160 chars is NOT quoted
+    assert "[line omitted: exceeds 160 characters" in evidence[0]
+    # Check that long path is bounded
+    assert len(shorten_path(deep_path, MAX_PATH_CHARS)) <= MAX_PATH_CHARS
 
 
 def test_extract_sec008_rule_patterns_shapes():
@@ -579,47 +806,13 @@ def test_extract_sec008_rule_patterns_shapes():
         assert any(p.search("mock_sec008_b") for p in extracted)
 
 
-def test_secret_assignment_never_quoted():
-    """Lines looking like secret assignments are never quoted in evidence."""
-    k_name = "api" + "_key"
-    token_val = "secret" + "_payload_token_long_value_123"
-    diff = (
-        "diff --git a/tests/test_sec.py b/tests/test_sec.py\n"
-        "--- a/tests/test_sec.py\n"
-        "+++ b/tests/test_sec.py\n"
-        "@@ -5,1 +5,3 @@\n"
-        f'+{k_name} = "{token_val}"\n'
-        f'+os.environ["AUTH_KEY"] = "{token_val}"\n'
-    )
-    evidence = get_evidence_lines(diff)
-    for line in evidence:
-        assert token_val not in line
-    assert any("tests/test_sec.py:6:" in e and "[line omitted: potential secret" in e for e in evidence)
-
-
-def test_line_quoting_length_cap():
-    """Quoted evidence never exceeds MAX_QUOTE_CHARS (160 chars)."""
-    long_stmt = "sys.path.insert(0, '" + "x" * 200 + "')"
-    diff = f"""diff --git a/tests/test_long.py b/tests/test_long.py
---- a/tests/test_long.py
-+++ b/tests/test_long.py
-@@ -1,1 +1,2 @@
-+{long_stmt}
-"""
-    evidence = get_evidence_lines(diff)
-    assert len(evidence) >= 1
-    quote = format_quoted_line("tests/test_long.py", 1, long_stmt)
-    assert len(quote) <= MAX_QUOTE_CHARS
-    assert quote.endswith("...")
-
-
 # ---------------------------------------------------------------------------
 # Scanned Line Limit (20,000 Lines)
 # ---------------------------------------------------------------------------
 
 
 def test_diff_exceeds_max_scanned_lines_notice():
-    """Diffs exceeding 20,000 lines report that only first 20,000 lines were scanned."""
+    """Diffs exceeding 20,000 lines report notice, even if no test files in the first 20k."""
     dummy_lines = [" context line"] * (MAX_SCANNED_LINES + 500)
     # Case A: Diff with a test file
     diff = (
@@ -679,17 +872,22 @@ def test_tracked_fixture_t1_v1_test_command_target_loads():
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "test_quality" / "t1_v1_test_command_target.txt"
     assert fixture_path.exists()
     content = fixture_path.read_text(encoding="utf-8")
-    assert len(content) > 1000
+    lines = content.splitlines()
+    assert len(lines) >= 280
+
+    # Feed the WHOLE fixture as an added test file diff
     diff = (
         "diff --git a/tests/test_command_target.py b/tests/test_command_target.py\n"
         "new file mode 100644\n--- /dev/null\n+++ b/tests/test_command_target.py\n"
-        "@@ -0,0 +1,50 @@\n"
-        + "\n".join("+" + line for line in content.splitlines()[:50])
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        + "\n".join("+" + line for line in lines)
     )
     evidence = get_evidence_lines(diff)
     assert len(evidence) >= 2
     assert any("guard.__path__" in e for e in evidence)
     assert any("guard.agent.__path__" in e for e in evidence)
+    # Note: test_deeply_nested_shells_limit has its assert inside a loop (which may run zero times),
+    # which cannot be flagged by heuristic rule 4 and is addressed by TEST_QUALITY_CHECKLIST.
 
 
 # ---------------------------------------------------------------------------

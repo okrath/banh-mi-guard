@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+
+# Synthetic additions for defect benchmark c11b (mutates guard.__path__ and guard.agent.__path__):
 import guard
 guard.__path__.insert(0, '/repo/guard')
 guard.agent.__path__.insert(0, '/repo/guard/agent')
