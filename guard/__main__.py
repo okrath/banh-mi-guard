@@ -1,6 +1,8 @@
 """Entry point for python -m guard."""
 
+import sys
+
 from guard.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

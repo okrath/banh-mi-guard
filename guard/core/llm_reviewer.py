@@ -137,14 +137,14 @@ class LLMReviewerEngine:
     def _check_build_and_scope(
         diff_summary: Optional[DiffSummary],
         build_check: Optional[BuildCheckResult],
-    ) -> tuple[float, List[str], List[str]]:
-        deduction = 0.0
+    ) -> tuple[List[float], List[str], List[str]]:
+        penalties: List[float] = []
         tech_notes: List[str] = []
         remediation: List[str] = []
 
         # Check 0: Git diff inspection error
         if diff_summary and diff_summary.error:
-            deduction += 5.0
+            penalties.append(5.0)
             tech_notes.append(f"Diff Inspection Error: {diff_summary.error}")
             remediation.append(f"Resolve Git error preventing diff inspection: {diff_summary.error}")
 
@@ -153,25 +153,25 @@ class LLMReviewerEngine:
             if build_check.passed:
                 tech_notes.append(f"Compile Check: PASSED (`{build_check.command}` in {build_check.duration_s:.1f}s)")
             else:
-                deduction += 4.5
+                penalties.append(4.5)
                 tech_notes.append(f"Compile Check: FAILED with exit code {build_check.exit_code}")
                 remediation.append(f"Fix compilation errors causing `{build_check.command}` to fail:\n{build_check.output[:300]}")
 
         # Check 2: Out of scope files
         if diff_summary and diff_summary.out_of_scope_files:
-            deduction += 2.5 * len(diff_summary.out_of_scope_files)
+            penalties.append(2.5 * len(diff_summary.out_of_scope_files))
             tech_notes.append(f"Scope Compliance: Modified {len(diff_summary.out_of_scope_files)} undeclared files: {', '.join(diff_summary.out_of_scope_files)}")
             remediation.append(f"Revert changes to out-of-scope files: {', '.join(diff_summary.out_of_scope_files)}")
 
-        return deduction, tech_notes, remediation
+        return penalties, tech_notes, remediation
 
     @staticmethod
     def _check_violations(
         violations: List[RuleViolation],
         focus: str,
         diff_summary: Optional[DiffSummary],
-    ) -> tuple[float, List[str], List[str], bool, bool]:
-        deduction = 0.0
+    ) -> tuple[List[float], List[str], List[str], bool, bool]:
+        penalties: List[float] = []
         tech_notes: List[str] = []
         remediation: List[str] = []
 
@@ -179,12 +179,12 @@ class LLMReviewerEngine:
         crit_violations = [v for v in violations if v.severity == "CRITICAL"]
         high_violations = [v for v in violations if v.severity == "HIGH"]
         if crit_violations:
-            deduction += 3.5 * len(crit_violations)
+            penalties.append(3.5 * len(crit_violations))
             for cv in crit_violations:
                 tech_notes.append(f"Security Alert [{cv.rule_id}]: {cv.message} ({cv.file_path})")
                 remediation.append(f"Resolve critical security violation {cv.rule_id} in `{cv.file_path}`")
         if high_violations:
-            deduction += 1.5 * len(high_violations)
+            penalties.append(1.5 * len(high_violations))
             for hv in high_violations:
                 tech_notes.append(f"Stability Warning [{hv.rule_id}]: {hv.message} ({hv.file_path})")
                 remediation.append(f"Resolve stability/performance warning {hv.rule_id} in `{hv.file_path}`")
@@ -193,7 +193,7 @@ class LLMReviewerEngine:
         dead_violations = [v for v in violations if v.rule_id.startswith("DEAD-")]
         if dead_violations:
             weight = 2.0 if focus in ("dead-code", "hygiene") else 0.8
-            deduction += weight * len(dead_violations)
+            penalties.append(weight * len(dead_violations))
             for dv in dead_violations:
                 tech_notes.append(f"Hygiene Alert [{dv.rule_id}]: {dv.message} ({dv.file_path})")
                 remediation.append(f"Clean up code hygiene issue [{dv.rule_id}]: {dv.message} in `{dv.file_path}`")
@@ -202,7 +202,7 @@ class LLMReviewerEngine:
         lazy_violations = [v for v in violations if v.rule_id.startswith("LAZY-")]
         if lazy_violations:
             weight = 2.5 if focus in ("simplicity", "yagni", "lazy") else 1.0
-            deduction += weight * len(lazy_violations)
+            penalties.append(weight * len(lazy_violations))
             for lv in lazy_violations:
                 tech_notes.append(f"Simplicity Alert [{lv.rule_id}]: {lv.message} ({lv.file_path})")
                 remediation.append(f"Apply KISS/YAGNI to resolve [{lv.rule_id}]: {lv.message} in `{lv.file_path}`")
@@ -213,13 +213,13 @@ class LLMReviewerEngine:
 
         hygiene_blocked = focus in ("dead-code", "hygiene") and bool(dead_violations)
         simplicity_blocked = focus in ("simplicity", "yagni", "lazy") and bool(lazy_violations)
-        return deduction, tech_notes, remediation, hygiene_blocked, simplicity_blocked
+        return penalties, tech_notes, remediation, hygiene_blocked, simplicity_blocked
 
     @staticmethod
     def _tally_invariant_deductions(
         invariant_result: Optional[InvariantResult],
-    ) -> tuple[float, List[str], List[str], bool]:
-        deduction = 0.0
+    ) -> tuple[List[float], List[str], List[str], bool]:
+        penalties: List[float] = []
         ux_notes: List[str] = []
         remediation: List[str] = []
         invariant_violated = False
@@ -231,12 +231,12 @@ class LLMReviewerEngine:
             else:
                 invariant_violated = True
                 failed_checks = [c for c in invariant_result.checks if not c.passed]
-                deduction += 3.0 * len(failed_checks)
+                penalties.append(3.0 * len(failed_checks))
                 for fc in failed_checks:
                     ux_notes.append(f"Invariant Violation [{fc.id}]: {fc.description} -> {fc.notes}")
                     remediation.append(f"Restore invariant behavior `{fc.id}`: {fc.description}")
 
-        return deduction, ux_notes, remediation, invariant_violated
+        return penalties, ux_notes, remediation, invariant_violated
 
     def _evaluate_heuristics(
         self,
@@ -246,16 +246,19 @@ class LLMReviewerEngine:
         invariant_result: Optional[InvariantResult],
         focus: str = "all",
     ) -> LLMReviewVerdict:
-        deduction_bs, tech_bs, rem_bs = self._check_build_and_scope(diff_summary, build_check)
-        deduction_v, tech_v, rem_v, hygiene_blocked, simplicity_blocked = self._check_violations(
+        penalties_bs, tech_bs, rem_bs = self._check_build_and_scope(diff_summary, build_check)
+        penalties_v, tech_v, rem_v, hygiene_blocked, simplicity_blocked = self._check_violations(
             violations, focus, diff_summary
         )
-        deduction_inv, ux_notes, rem_inv, invariant_violated = self._tally_invariant_deductions(invariant_result)
+        penalties_inv, ux_notes, rem_inv, invariant_violated = self._tally_invariant_deductions(invariant_result)
 
         tech_notes = tech_bs + tech_v
         remediation = rem_bs + rem_v + rem_inv
 
-        score = max(0.0, min(10.0, 10.0 - deduction_bs - deduction_v - deduction_inv))
+        score = 10.0
+        for penalty in penalties_bs + penalties_v + penalties_inv:
+            score -= penalty
+        score = max(0.0, min(10.0, score))
 
         crit_violations = [v for v in violations if v.severity == "CRITICAL"]
         is_hard_blocked = (
