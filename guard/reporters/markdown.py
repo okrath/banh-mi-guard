@@ -17,13 +17,9 @@ INVARIANT_ICONS = {"passed": "✅", "failed": "❌", "unverified": "⚪", "basel
 
 def snapshot_missing_reason(pre: Optional[PreTaskRecord]) -> Optional[str]:
     """Extract baseline snapshot failure reason recorded at pre, if any."""
-    if not pre or not pre.non_regression_strategy:
+    if not pre:
         return None
-    marker = "Baseline snapshot missing: "
-    if marker in pre.non_regression_strategy:
-        reason = pre.non_regression_strategy.split(marker, 1)[1].rstrip(".")
-        return reason.strip()
-    return None
+    return pre.baseline_snapshot_error
 
 
 def restart_lines(pre: PreTaskRecord) -> list:
@@ -178,7 +174,7 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     if pre.baseline_dirty:
         md.append("\n* **⚠️ Pre-existing modifications (started with --allow-dirty):**")
         if not pre.baseline_snapshot:
-            snapshot_reason = snapshot_missing_reason(pre)
+            snapshot_reason = pre.baseline_snapshot_error
             reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
             md.append(f"  - ⚠️ *Baseline snapshot missing{reason_part}:* post will review the full diff.")
         for f in sorted(pre.baseline_dirty):
@@ -198,25 +194,24 @@ def generate_pre_task_markdown(pre: PreTaskRecord) -> str:
     return "\n".join(md)
 
 
-def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None) -> str:
-    """
-    Generate standard Post-Task Verification report.
-    """
+def _markdown_prelude(pre: Optional[PreTaskRecord]) -> list:
     md = []
-    md.append("### 🧪 POST-TASK VERIFICATION:\n")
-    if pre and (pre.restarts or pre.late_scope):
+    if not pre:
+        return md
+    if pre.restarts or pre.late_scope:
         md.append("* **Session restarts:**")
         md.extend(restart_lines(pre))
         md.append("")
-    if pre:  # what the review judged against, fixed at pre
-        md.extend(owner_lines(pre))
-        md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
-        md.append("* **Baseline Contracts:**")
-        md.extend(contract_lines(pre))
-        md.append("")
+    md.extend(owner_lines(pre))
+    md.append(f"* **Technical Domain:** {_format_domain_description(pre)}")
+    md.append("* **Baseline Contracts:**")
+    md.extend(contract_lines(pre))
+    md.append("")
+    return md
 
-    # Actual Impact Range
-    md.append("* **Actual Impact Range:**")
+
+def _markdown_impact_range(post: PostTaskRecord, pre: Optional[PreTaskRecord]) -> list:
+    md = ["* **Actual Impact Range:**"]
     if post.files_modified:
         for f in post.files_modified:
             if f in post.preexisting_files:
@@ -234,7 +229,7 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         md.append("  - No files were modified.")
 
     if pre and pre.baseline_dirty and not pre.baseline_snapshot:
-        snapshot_reason = snapshot_missing_reason(pre)
+        snapshot_reason = pre.baseline_snapshot_error
         reason_part = f" ({snapshot_reason})" if snapshot_reason else ""
         md.append(f"  - ⚠️ *Baseline snapshot missing{reason_part}:* review covers the full diff.")
     if post.diff_summary:
@@ -242,9 +237,11 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         md.append(f"  - *Diff Statistics:* +{post.diff_summary.total_insertions} lines / -{post.diff_summary.total_deletions} lines across {len(post.diff_summary.files)} files (net {net:+d} LOC, not scored).")
         if post.diff_summary.error:
             md.append(f"  - ⚠️ *Diff inspection error:* {post.diff_summary.error}")
+    return md
 
-    # Build Check
-    md.append("\n* **Build & Project Health Check:**")
+
+def _markdown_build_check(post: PostTaskRecord) -> list:
+    md = ["\n* **Build & Project Health Check:**"]
     if post.build_check:
         icon = "✅" if post.build_check.passed else "❌"
         md.append(f"  - {icon} Command: `{post.build_check.command}` (Exit Code: {post.build_check.exit_code}, Duration: {post.build_check.duration_s:.1f}s)")
@@ -252,8 +249,11 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
             md.append(f"    ```\n    {post.build_check.output[:400]}\n    ```")
     else:
         md.append("  - ℹ️ No automated build command detected.")
+    return md
 
-    # Rule Violations (OCR, Hygiene & Simplicity)
+
+def _markdown_violations_and_invariants(post: PostTaskRecord) -> list:
+    md = []
     if post.rule_violations:
         rule_viols = [v for v in post.rule_violations if not v.rule_id.startswith(("DEAD-", "LAZY-", "OCR-"))]
         dead_viols = [v for v in post.rule_violations if v.rule_id.startswith("DEAD-")]
@@ -288,9 +288,11 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         for c in post.invariant_result.checks:
             icon = INVARIANT_ICONS.get(c.status, "❔")
             md.append(f"  - {icon} `[{c.id}]` {c.description} -> *{c.status.upper()}: {c.notes}*")
+    return md
 
-    # LLM Gate Review Report
-    md.append(f"\n* **Final {gate_label(post)}:**")
+
+def _markdown_gate_and_findings(post: PostTaskRecord) -> list:
+    md = [f"\n* **Final {gate_label(post)}:**"]
     icon = "🤖" if post.review_mode == "llm_deep" else "⚙️"
     md.append(f"  - {icon} **[{post.muse_verdict}]** (Score: {post.muse_score:.1f}/10)")
     if post.muse_notes:
@@ -335,5 +337,17 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
         md.append(f"\n* **Commit:** {commit_instruction(post)}")
     else:
         md.append(f"\n* **Commit:** nothing to commit until the gate approves (commit mode: `{post.commit_mode or 'not set'}`).")
+    return md
 
+
+def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None) -> str:
+    """
+    Generate standard Post-Task Verification report.
+    """
+    md = ["### 🧪 POST-TASK VERIFICATION:\n"]
+    md.extend(_markdown_prelude(pre))
+    md.extend(_markdown_impact_range(post, pre))
+    md.extend(_markdown_build_check(post))
+    md.extend(_markdown_violations_and_invariants(post))
+    md.extend(_markdown_gate_and_findings(post))
     return "\n".join(md)

@@ -71,6 +71,7 @@ class PreTaskRecord(BaseModel):
     base_ref: Optional[str] = None  # HEAD at the first pre; post diffs against it so mid-task commits stay visible
     # `git stash create` of the dirty tree at pre (--allow-dirty): diff against it = exactly the task's edits
     baseline_snapshot: Optional[str] = None
+    baseline_snapshot_error: Optional[str] = None
     late_scope: List[str] = Field(default_factory=list)  # Scope added by a restart after edits began
     restarts: List[Dict[str, str]] = Field(default_factory=list)  # Superseded sessions: id, status, at
     # Recorded by the agent hook (guard agent-event): the user's own words, and files an agent
@@ -146,6 +147,9 @@ class GuardSession(BaseModel):
     llm_rounds: int = 0
     llm_revise_rounds: int = 0
     revise_budget: int = 3
+
+class ApprovalKeyError(RuntimeError):
+    """Raised when the approval key cannot be read, created, or written."""
 
 
 def get_approval_key() -> bytes:
@@ -329,6 +333,7 @@ class SessionManager:
         base_ref: Optional[str] = None,
         late_scope: Optional[List[str]] = None,
         baseline_snapshot: Optional[str] = None,
+        baseline_snapshot_error: Optional[str] = None,
         restarts: Optional[List[Dict[str, str]]] = None,
         user_prompt: Optional[str] = None,
         pre_edit_changes: Optional[List[str]] = None,
@@ -355,6 +360,7 @@ class SessionManager:
             base_ref=base_ref,
             late_scope=late_scope or [],
             baseline_snapshot=baseline_snapshot,
+            baseline_snapshot_error=baseline_snapshot_error,
             restarts=restarts or [],
             user_prompt=user_prompt,
             owner=owner,
@@ -394,11 +400,18 @@ class SessionManager:
 
         # Sign upon successful post approval transition
         if post_rec.all_passed:
-            post_rec.approval_signature = compute_approval_signature(
-                self.repo_path,
-                session.session_id,
-                post_rec.approved_fingerprints,
-            )
+            try:
+                post_rec.approval_signature = compute_approval_signature(
+                    self.repo_path,
+                    session.session_id,
+                    post_rec.approved_fingerprints,
+                )
+            except (OSError, RuntimeError) as e:
+                post_rec.approval_signature = None
+                session.status = SessionStatus.NEEDS_FIX
+                session.post = post_rec
+                self._save(session)
+                raise ApprovalKeyError(f"Approval key in {guard_home()} cannot be created or written: {e}") from e
         else:
             post_rec.approval_signature = None
 

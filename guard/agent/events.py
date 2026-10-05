@@ -526,9 +526,7 @@ def _edit_decision(repo: Path, session, ev: AgentEvent, other: bool = False) -> 
     all_targets = [r for r in (_relative(repo, p) for p in ev.file_paths) if r]
     if any(_is_guard_path(r) for r in all_targets):
         return Decision(action="block", reason="Guard: guard's state is written only by guard commands.")
-    targets = [t for t in all_targets if not (t.replace("\\", "/").strip("/").lower() == ".guard"
-                                              or t.replace("\\", "/").strip("/").lower().startswith(".guard/"))]
-    targets = [t for t in targets if t not in _ignored_by_the_user(repo, targets)]
+    targets = [t for t in all_targets if t not in _ignored_by_the_user(repo, all_targets)]
     if not targets:
         return Decision()
     if other and _active_pre(session):

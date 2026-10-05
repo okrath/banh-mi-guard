@@ -38,11 +38,11 @@ from guard.core.project_invariants import (
 )
 from guard.core.removal_check import check_removed_symbols
 from guard.core.repo_setup import ensure_repo_setup
-from guard.core.session import BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
+from guard.core.session import ApprovalKeyError, BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.domains.detector import detect_build_command, extract_contracts_and_invariants
 from guard.domains.pre_analysis import analyze_task
-from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown, snapshot_missing_reason
+from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
 
 console = Console()
@@ -203,7 +203,7 @@ def _pre_scope_and_baseline(
         }]
         # Expected impact of the scoped files; a restart keeps the first pre's (the task may have edited them since)
         impact = superseded.pre.impact
-        snapshot_error = snapshot_missing_reason(old)
+        snapshot_error = old.baseline_snapshot_error
     else:
         working_files = diff_inspector.get_working_files()
         if not invariants_existed:
@@ -324,13 +324,13 @@ def _pre_save_session(
         contracts=analysis.contracts, invariants=invariants,
         non_regression_strategy=(
             f"Isolate changes to domain {analysis.task_domain.value.upper()}. Maintain 100% existing baseline contracts."
-            + (f" Baseline snapshot missing: {baseline.snapshot_error}." if baseline.snapshot_error else "")
         ),
         domain=analysis.task_domain, repo_domain=analysis.repo_domain,
         domain_source=analysis.domain_source, domain_reason=analysis.domain_reason,
         contracts_source=analysis.contracts_source, baseline_dirty=baseline.baseline_dirty,
         baseline_invariant_status=baseline_status, base_ref=baseline.base_ref,
-        late_scope=baseline.late_scope, baseline_snapshot=baseline.baseline_snapshot, restarts=baseline.restarts,
+        late_scope=baseline.late_scope, baseline_snapshot=baseline.baseline_snapshot,
+        baseline_snapshot_error=baseline.snapshot_error, restarts=baseline.restarts,
     )
     return session
 
@@ -414,9 +414,15 @@ def _post_check_hook_and_session(
             f for f in GitDiffInspector(target_repo).get_working_files()
             if approved.get(f) != _fingerprint(target_repo / f)
         ]
-        if not uncovered and session_mgr.is_approval_verified(session):
-            console.print("[dim]Banh-Mi-Guard: changes match the last approved guard session, skipping.[/dim]")
-            return False, True, None
+        if not uncovered:
+            if session_mgr.is_approval_verified(session):
+                console.print("[dim]Banh-Mi-Guard: changes match the last approved guard session, skipping.[/dim]")
+                return False, True, None
+            console.print(
+                f"[bold red]❌ The last approved guard session ({session.session_id}) is unsigned or from an older version.[/bold red]\n"
+                "Run [bold]guard post[/bold] again to review and sign the approval, or [bold]guard reset[/bold] to stop guarding this work."
+            )
+            return False, False, None
         listing = "\n".join(f"  • {f}" for f in uncovered[:20])
         console.print(
             f"[bold red]❌ {len(uncovered)} changed file(s) are not covered by the last approved guard session "
@@ -517,7 +523,7 @@ def _scan_scope_violations(diff_scope: _PostDiffScope, pre: Optional[Any]) -> Li
     baseline_dirty, snapshot = diff_scope.baseline_dirty, diff_scope.snapshot
     if baseline_dirty:
         attributable = bool(snapshot)
-        snapshot_reason = snapshot_missing_reason(pre)
+        snapshot_reason = pre.baseline_snapshot_error if pre else None
         if attributable:
             message = (
                 f"{len(baseline_dirty)} file(s) were already modified before pre-task (--allow-dirty). "
@@ -848,7 +854,11 @@ def _post_record_and_report(
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
 
-    session_mgr.complete_post_session(post_rec)
+    try:
+        session_mgr.complete_post_session(post_rec)
+    except ApprovalKeyError as e:
+        console.print(f"[bold red]❌ {e}[/bold red]")
+        return False
     post_rec.needs_user = _record_round(session_mgr, review_verdict, post_rec)
 
     render_post_task_terminal(post_rec, pre)
@@ -962,7 +972,6 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
         start_t = time.perf_counter()
         try:
             # detect_build_command returns guard's own fixed commands (never user config); shell=True needed for npm/pnpm on Windows.
-            # Turn into an argument list before ever reading a build command from config.
             p = subprocess.run(
                 build_cmd,
                 shell=True,
