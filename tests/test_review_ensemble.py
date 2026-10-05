@@ -4,26 +4,19 @@ Tests for the review ensemble and review lenses.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from typing import List, Optional
 
 from guard.core.findings import Finding, parse_findings
 from guard.core.review_ensemble import (
     EnsembleResult,
-    FileDiffInfo,
-    _build_part_prompt,
+    _can_merge,
     _candidate_rank,
     _combine_system_prompt,
-    _find_file_info,
     _is_location_verified,
-    _is_same_finding,
-    _lens_rank,
-    _normalize_description,
-    _normalize_path,
-    _output_sort_key,
     _parse_diff,
-    _parse_location,
-    _strip_annotations,
     run_ensemble,
 )
 from guard.core.review_lenses import (
@@ -106,81 +99,50 @@ def test_lens_definitions_and_helpers():
     assert "EXTRA THREAT" in all_lenses[4].instruction
 
 
-def test_ensemble_helpers_direct():
-    """Direct tests for parsing, normalization and ranking helpers."""
-    # _normalize_path
-    assert _normalize_path("./src/foo.py") == "src/foo.py"
-    assert _normalize_path("src\\bar.py") == "src/bar.py"
+def test_location_verification_rule():
+    """Test the diff hunk location verification rule: inside hunks or deleted file."""
+    diff_info = _parse_diff([MULTI_HUNK_DIFF])
+    # Inside removed hunk range (lines 20-29) -> verified
+    assert _is_location_verified("src/auth.py:25", diff_info) is True
+    # Inside deleted file (any line) -> verified
+    assert _is_location_verified("src/legacy.py:100", diff_info) is True
+    # Outside hunk ranges (line 999) -> unverified
+    assert _is_location_verified("src/auth.py:999", diff_info) is False
+    # File not in diff -> unverified
+    assert _is_location_verified("src/other.py:10", diff_info) is False
 
-    # _normalize_description
-    assert _normalize_description("`quoted` text  with 'apostrophe'") == "quoted text with apostrophe"
 
-    # _parse_location
-    file_p, line_n = _parse_location("src/app.py:42")
-    assert file_p == "src/app.py"
-    assert line_n == 42
-    file_p2, line_n2 = _parse_location("src/app.py")
-    assert file_p2 == "src/app.py"
-    assert line_n2 is None
+def test_rule_carrying_helpers():
+    """
+    Test only the private helpers that carry specific review rules:
+    - Rule 1 (_can_merge): candidates from the same lens and part never merge;
+      across lenses, blocking findings merge only when description similarity >= 0.6.
+    - Rule 2 (_candidate_rank): among blocking copies, earliest lens in LENSES order
+      wins regardless of severity; severity ranking applies when neither is blocking.
+    - Rule 3 (_is_location_verified): verified inside hunk ranges or on deleted files.
+    - Rule 4 (_combine_system_prompt): correctness lens preserves base prompt unstripped;
+      lenses with instructions append after a blank line.
+    """
+    f1 = Finding(id="1", severity="high", kind="correctness", location="a.py:1", description="leak")
+    f2 = Finding(id="2", severity="high", kind="correctness", location="a.py:1", description="leak")
+    f_crit = Finding(id="3", severity="critical", kind="correctness", location="a.py:1", description="leak", blocking=True)
+    f_high = Finding(id="4", severity="high", kind="correctness", location="a.py:1", description="leak", blocking=True)
 
-    # _strip_annotations
-    annotated = "Memory leak [location not verified in the diff] [also found by: tests]"
-    assert _strip_annotations(annotated) == "Memory leak"
+    # Rule 1: same lens same part cannot merge; different lens can merge
+    assert _can_merge((f1, LENSES[0], [(LENSES[0], 0)], 0), (f2, LENSES[0], 0, 1)) is False
+    assert _can_merge((f1, LENSES[0], [(LENSES[0], 0)], 0), (f2, LENSES[1], 0, 1)) is True
 
-    # _lens_rank
-    assert _lens_rank("correctness", LENSES) == 0
-    assert _lens_rank("requirements", LENSES) == 1
-    assert _lens_rank("unknown", LENSES) == 9999
+    # Rule 2: earliest lens wins among blocking copies regardless of severity
+    assert _candidate_rank(f_high, LENSES[0], 0) < _candidate_rank(f_crit, LENSES[1], 1)
 
-    # FileDiffInfo dataclass
-    diff_info = FileDiffInfo(is_deleted=True, old_ranges=[(1, 10)], new_ranges=[(1, 5)])
-    assert diff_info.is_deleted is True
-    assert diff_info.old_ranges == [(1, 10)]
+    # Rule 3: location verification
+    diff_info = _parse_diff([MULTI_HUNK_DIFF])
+    assert _is_location_verified("src/auth.py:25", diff_info) is True
+    assert _is_location_verified("src/legacy.py:100", diff_info) is True
 
-    # _find_file_info
-    diff_map = {"src/app.py": diff_info}
-    assert _find_file_info("src/app.py", diff_map) is diff_info
-    assert _find_file_info("app.py", diff_map) is diff_info
-    assert _find_file_info("other.py", diff_map) is None
-
-    # _is_location_verified
-    assert _is_location_verified("src/app.py:5", diff_map) is True
-    assert _is_location_verified("unknown.py:5", diff_map) is False
-    # _candidate_rank
-    finding_crit = Finding(
-        id="c1", severity="critical", kind="correctness", location="a.py:1",
-        description="d1", blocking=True,
-    )
-    finding_low = Finding(
-        id="c2", severity="low", kind="correctness", location="a.py:1",
-        description="d2", blocking=False,
-    )
-    rank_crit = _candidate_rank(finding_crit, LENSES[0], 0, LENSES)
-    rank_low = _candidate_rank(finding_low, LENSES[0], 1, LENSES)
-    assert rank_crit < rank_low  # blocking critical ranks higher (smaller tuple)
-
-    # _is_same_finding
-    assert _is_same_finding(finding_crit, finding_crit) is True
-    finding_diff = Finding(
-        id="c3", severity="low", kind="correctness", location="b.py:1",
-        description="d3", blocking=False,
-    )
-    assert _is_same_finding(finding_crit, finding_diff) is False
-    key_crit = _output_sort_key(finding_crit)
-    key_low = _output_sort_key(finding_low)
-    assert key_crit < key_low
-
-    # _combine_system_prompt
+    # Rule 4: system prompt combination
+    assert _combine_system_prompt("  base  \n", "") == "  base  \n"
     assert _combine_system_prompt("base", "lens") == "base\n\nlens"
-    assert _combine_system_prompt("base", "") == "base"
-    assert _combine_system_prompt("", "lens") == "lens"
-
-    # _build_part_prompt
-    prompt1 = _build_part_prompt("Header", "diff content", 1, 1)
-    assert "Header" in prompt1 and "diff content" in prompt1
-    prompt2 = _build_part_prompt("", "diff content", 1, 2)
-    assert "Diff part 1/2" in prompt2
-
 
 def test_ensemble_union_different_defects():
     """Union of two lenses that each find a different defect."""
@@ -209,6 +171,7 @@ def test_ensemble_union_different_defects():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
@@ -230,286 +193,178 @@ def test_ensemble_union_different_defects():
             assert result.provenance[f.id] == ["requirements"]
 
 
-def test_ensemble_same_defect_merged_with_provenance():
-    """The same defect found by two lenses is merged once with provenance."""
-    lens1 = LENSES[0]  # correctness
-    lens2 = LENSES[1]  # requirements
+def test_ensemble_same_lens_same_part_never_merged():
+    """
+    NEVER merge two candidates that came from the SAME lens (and the same part):
+    one reviewer reported them separately on purpose.
+    Two high|security findings in the same file 2 lines apart with different descriptions
+    must both survive and appear in the output.
+    """
+    lens = LENSES[0]  # single correctness lens
 
-    # Same file, same kind ('correctness'), lines within 3 (12 vs 13)
-    response_1 = (
-        "SCORE: 6.0\nSUMMARY: check 1\nFINDINGS:\n"
-        "- high | correctness | src/auth.py:12 | - | Potential memory leak in auth session\n"
+    # Same lens reports two security findings 2 lines apart (lines 12 and 14)
+    response = (
+        "SCORE: 3.0\nSUMMARY: vulnerabilities\nFINDINGS:\n"
+        "- high | security | src/auth.py:12 | - | SQL injection in user query\n"
+        "- high | security | src/auth.py:14 | - | Insecure password hashing\n"
     )
-    response_2 = (
-        "SCORE: 6.0\nSUMMARY: check 2\nFINDINGS:\n"
-        "- high | correctness | src/auth.py:13 | - | Potential memory leak in auth session\n"
-    )
-
-    def scripted_call(system: str, prompt: str) -> str:
-        if "Requirements" in system:
-            return response_2
-        return response_1
 
     result = run_ensemble(
-        lenses=[lens1, lens2],
-        call=scripted_call,
+        lenses=[lens],
+        call=lambda sys, p: response,
         header="Header",
         parts=[SAMPLE_DIFF],
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
-    assert isinstance(result, EnsembleResult)
-    assert len(result.findings) == 1
-    merged = result.findings[0]
-
-    # Kept finding is from earliest lens in LENSES (correctness)
-    assert "Potential memory leak in auth session" in merged.description
-    assert "[also found by: requirements]" in merged.description
-    assert result.provenance[merged.id] == ["correctness", "requirements"]
-
-
-def test_ensemble_non_transitive_merge_preserves_distinct_findings():
-    """
-    Dedupe is pairwise against the kept representative (non-transitive).
-    Finding A matches B, B matches C, but A and C are distinct (>3 lines and low similarity).
-    A and C must both be preserved.
-    """
-    lens1 = LENSES[0]
-    lens2 = LENSES[1]
-    lens3 = LENSES[2]
-
-    # A: line 10, "Buffer overflow in request parsing"
-    # B: line 12, "Buffer overflow in request parsing" (within 3 lines of A -> matches A)
-    # C: line 15, "Integer underflow in arithmetic logic" (5 lines from A and different wording)
-    resp_a = "SCORE: 5.0\nSUMMARY: A\nFINDINGS:\n- high | correctness | src/auth.py:10 | - | Buffer overflow in parsing\n"
-    resp_b = "SCORE: 5.0\nSUMMARY: B\nFINDINGS:\n- high | correctness | src/auth.py:12 | - | Buffer overflow in parsing\n"
-    resp_c = "SCORE: 5.0\nSUMMARY: C\nFINDINGS:\n- high | correctness | src/auth.py:15 | - | Integer underflow in arithmetic\n"
-
-    def scripted_call(system: str, prompt: str) -> str:
-        if "Requirements" in system:
-            return resp_b
-        if "Contracts" in system:
-            return resp_c
-        return resp_a
-
-    result = run_ensemble(
-        lenses=[lens1, lens2, lens3],
-        call=scripted_call,
-        header="Header",
-        parts=[SAMPLE_DIFF],
-        parse=_make_parse(),
-        max_calls=12,
-        format_reminder=FORMAT_REMINDER,
-    )
-
-    assert result is not None
-    # A and B merged, C remains distinct -> exactly 2 findings
     assert len(result.findings) == 2
     descs = [f.description for f in result.findings]
-    assert any("Buffer overflow" in d for d in descs)
-    assert any("Integer underflow" in d for d in descs)
+    assert any("SQL injection in user query" in d for d in descs)
+    assert any("Insecure password hashing" in d for d in descs)
 
 
-def test_ensemble_raising_lens_recorded_and_rest_used():
-    """A lens that raises is recorded in failed and the rest are used."""
-    lens1 = LENSES[0]  # raises
-    lens2 = LENSES[1]  # succeeds
-    lens3 = LENSES[2]  # succeeds
+def test_ensemble_multipart_same_lens_same_part_never_merged_into_cluster():
+    """
+    On a multi-part diff, findings from the same lens on the same part never merge
+    into the same cluster, even when merging into a representative from another lens.
+    """
+    lens0 = LENSES[0]
+    lens1 = LENSES[1]
 
-    resp_2 = (
-        "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\n"
-        "- high | requirement | src/auth.py:12 | - | Req issue\n"
-    )
-    resp_3 = (
-        "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\n"
-        "- low | maintainability | src/auth.py:14 | - | Contract issue\n"
+    part1 = "diff --git a/src/auth.py b/src/auth.py\n@@ -10,5 +10,5 @@\n+part1\n"
+    part2 = "diff --git a/src/auth.py b/src/auth.py\n@@ -10,5 +10,5 @@\n+part2\n"
+
+    # Lens 0 on part 1 reports finding A (lines within 3 of B and C)
+    resp_l0_p1 = "SCORE: 5.0\nSUMMARY: p1\nFINDINGS:\n- medium | correctness | src/auth.py:10 | - | Leak issue A\n"
+    resp_l0_p2 = "SCORE: 9.0\nSUMMARY: p2\nFINDINGS:\nNone\n"
+
+    # Lens 1 on part 2 reports finding B and finding C (both on part 2)
+    resp_l1_p1 = "SCORE: 9.0\nSUMMARY: p1\nFINDINGS:\nNone\n"
+    resp_l1_p2 = (
+        "SCORE: 5.0\nSUMMARY: p2\nFINDINGS:\n"
+        "- medium | correctness | src/auth.py:11 | - | Leak issue B\n"
+        "- medium | correctness | src/auth.py:12 | - | Leak issue C\n"
     )
 
     def scripted_call(system: str, prompt: str) -> str:
         if "Requirements" in system:
-            return resp_2
-        if "Contracts" in system:
-            return resp_3
-        raise RuntimeError("LLM connection timed out")
+            if "Diff part 2/2" in prompt:
+                return resp_l1_p2
+            return resp_l1_p1
+        if "Diff part 2/2" in prompt:
+            return resp_l0_p2
+        return resp_l0_p1
 
     result = run_ensemble(
-        lenses=[lens1, lens2, lens3],
+        lenses=[lens0, lens1],
         call=scripted_call,
         header="Header",
-        parts=[SAMPLE_DIFF],
+        parts=[part1, part2],
         parse=_make_parse(),
         max_calls=12,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
-    assert result.usable == 2
-    assert result.failed == ["correctness"]
+    # Finding B merges into A, but Finding C CANNOT merge into A because Lens 1 on Part 2 is already in A!
+    # Therefore, exactly 2 findings survive (A+B merged, and C survives separately)
     assert len(result.findings) == 2
 
 
-def test_ensemble_too_few_usable_lenses_returns_none():
-    """When fewer than ceil(N/2) lenses succeed, fail closed and return None."""
-    lens1 = LENSES[0]
-    lens2 = LENSES[1]
-    lens3 = LENSES[2]
+def test_ensemble_across_lenses_two_blocking_merge_only_on_description_similarity():
+    """
+    Across lenses, two BLOCKING findings merge only when normalised-description ratio is >= 0.6.
+    Proximity alone (within 3 lines) may NOT merge two blocking findings.
+    Lens 0 reports SQL injection at line 12, lens 1 reports hard-coded password at line 13:
+    both are blocking and security -> both survive.
+    """
+    lens0 = LENSES[0]
+    lens1 = LENSES[1]
 
-    # 2 out of 3 raise -> only 1 usable < ceil(3/2) = 2 -> None
-    def scripted_call(system: str, prompt: str) -> str:
-        if "Contracts" in system:
-            return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
-        raise ConnectionError("Network down")
-
-    result = run_ensemble(
-        lenses=[lens1, lens2, lens3],
-        call=scripted_call,
-        header="Header",
-        parts=[SAMPLE_DIFF],
-        parse=_make_parse(),
-        max_calls=12,
-        format_reminder=FORMAT_REMINDER,
+    resp0 = (
+        "SCORE: 4.0\nSUMMARY: audit 0\nFINDINGS:\n"
+        "- high | security | src/auth.py:12 | - | SQL injection vulnerability in login\n"
     )
-
-    assert result is None
-
-
-def test_ensemble_max_calls_exceeded_returns_none_zero_calls():
-    """When 2 * len(lenses) * len(parts) > max_calls, return None with zero calls."""
-    calls_made = 0
+    resp1 = (
+        "SCORE: 4.0\nSUMMARY: audit 1\nFINDINGS:\n"
+        "- high | security | src/auth.py:13 | - | Hard-coded database password in login\n"
+    )
 
     def scripted_call(system: str, prompt: str) -> str:
-        nonlocal calls_made
-        calls_made += 1
-        return "SCORE: 10.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+        if "Requirements" in system:
+            return resp1
+        return resp0
 
-    # 3 lenses, 1 part -> worst case is 2 * 3 * 1 = 6 calls. With max_calls=5, aborts before calling.
     result = run_ensemble(
-        lenses=[LENSES[0], LENSES[1], LENSES[2]],
+        lenses=[lens0, lens1],
         call=scripted_call,
-        header="Header",
-        parts=[SAMPLE_DIFF],
-        parse=_make_parse(),
-        max_calls=5,
-        format_reminder=FORMAT_REMINDER,
-    )
-
-    assert result is None
-    assert calls_made == 0
-
-
-def test_ensemble_unverifiable_location_annotated_keeps_blocking():
-    """An unverifiable location is annotated and its blocking value is kept."""
-    lens1 = LENSES[0]
-
-    # Line 999 is outside diff hunk (hunk is 10..21)
-    response = (
-        "SCORE: 4.0\nSUMMARY: bad\nFINDINGS:\n"
-        "- critical | correctness | src/auth.py:999 | - | Hardcoded secret in config\n"
-    )
-
-    result = run_ensemble(
-        lenses=[lens1],
-        call=lambda sys, p: response,
         header="Header",
         parts=[SAMPLE_DIFF],
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    # Both blocking findings must survive because proximity alone does not merge blocking findings
+    assert len(result.findings) == 2
+    descs = [f.description for f in result.findings]
+    assert any("SQL injection" in d for d in descs)
+    assert any("Hard-coded database password" in d for d in descs)
+
+
+def test_ensemble_earliest_lens_wins_among_two_blocking_copies_regardless_of_severity():
+    """
+    Among two BLOCKING copies, earliest lens in LENSES order wins whatever the severity
+    (treat blocking copies as equal candidates; severity ranking applies only when neither is blocking).
+    Lens 0 says high, lens 1 says critical for the same finding: lens 0's id and text are kept.
+    """
+    lens0 = LENSES[0]  # correctness (earlier in LENSES)
+    lens1 = LENSES[1]  # requirements (later in LENSES)
+
+    resp0 = (
+        "SCORE: 5.0\nSUMMARY: 0\nFINDINGS:\n"
+        "- high | correctness | src/auth.py:12 | - | Resource leak in database connection\n"
+    )
+    resp1 = (
+        "SCORE: 5.0\nSUMMARY: 1\nFINDINGS:\n"
+        "- critical | correctness | src/auth.py:12 | - | Resource leak in database connection pool\n"
+    )
+
+    orig0 = parse_findings(resp0, "")
+    assert orig0 is not None and len(orig0) == 1
+    expected_id = orig0[0].id
+    expected_desc = orig0[0].description
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp1
+        return resp0
+
+    result = run_ensemble(
+        lenses=[lens0, lens1],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
     assert len(result.findings) == 1
-    f = result.findings[0]
-    # Location not verified is annotated
-    assert "[location not verified in the diff]" in f.description
-    # Blocking status is strictly preserved (critical correctness is blocking)
-    assert f.blocking is True
-
-
-def test_ensemble_old_side_lines_and_deleted_file_verified():
-    """Old-side lines of a removed block and lines of a deleted file count as verified."""
-    lens1 = LENSES[0]
-
-    # In MULTI_HUNK_DIFF:
-    # auth.py has hunk @@ -20,10 +20,3 @@: old lines 20-29 were removed.
-    # legacy.py is deleted (deleted file mode 100644).
-    response = (
-        "SCORE: 5.0\nSUMMARY: audit\nFINDINGS:\n"
-        "- high | correctness | src/auth.py:25 | - | Removed authorization check without replacement\n"
-        "- high | correctness | src/legacy.py:100 | - | Deleted legacy module references\n"
-    )
-
-    result = run_ensemble(
-        lenses=[lens1],
-        call=lambda sys, p: response,
-        header="Header",
-        parts=[MULTI_HUNK_DIFF],
-        parse=_make_parse(),
-        max_calls=10,
-        format_reminder=FORMAT_REMINDER,
-    )
-
-    assert result is not None
-    assert len(result.findings) == 2
-    for f in result.findings:
-        # Neither should have [location not verified in the diff]
-        assert "[location not verified in the diff]" not in f.description
-
-
-def test_ensemble_diff_parser_ignores_comment_body_lines():
-    """Hunk body lines starting with SQL/Lua comments are not treated as diff headers."""
-    sql_diff = (
-        "diff --git a/schema.sql b/schema.sql\n"
-        "--- a/schema.sql\n"
-        "+++ b/schema.sql\n"
-        "@@ -1,5 +1,5 @@\n"
-        "--- Removed SQL comment\n"
-        "+-- New SQL comment\n"
-        " [file deleted: fake note in body]\n"
-    )
-    diff_info = _parse_diff([sql_diff])
-    assert "schema.sql" in diff_info
-    # Body line with [file deleted: should NOT mark schema.sql as deleted!
-    assert diff_info["schema.sql"].is_deleted is False
-
-
-def test_ensemble_different_kinds_same_place_not_merged():
-    """Two findings with different kinds in the same place are NOT merged."""
-    lens1 = LENSES[0]
-    lens2 = LENSES[1]
-
-    # Same location (src/auth.py:12), but one is correctness and one is security
-    resp_1 = (
-        "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
-        "- high | correctness | src/auth.py:12 | - | Null check omitted\n"
-    )
-    resp_2 = (
-        "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
-        "- high | security | src/auth.py:12 | - | Timing attack vulnerability\n"
-    )
-
-    def scripted_call(system: str, prompt: str) -> str:
-        if "Requirements" in system:
-            return resp_2
-        return resp_1
-
-    result = run_ensemble(
-        lenses=[lens1, lens2],
-        call=scripted_call,
-        header="Header",
-        parts=[SAMPLE_DIFF],
-        parse=_make_parse(),
-        max_calls=10,
-        format_reminder=FORMAT_REMINDER,
-    )
-
-    assert result is not None
-    assert len(result.findings) == 2
-    kinds = {f.kind for f in result.findings}
-    assert kinds == {"correctness", "security"}
+    kept = result.findings[0]
+    # Lens 0's ID and base wording are kept even though Lens 1 reported critical vs high
+    assert kept.id == expected_id
+    assert expected_desc in kept.description
+    assert "[also found by: requirements]" in kept.description
 
 
 def test_ensemble_merged_blocking_keeps_original_id_kind_text():
@@ -546,6 +401,7 @@ def test_ensemble_merged_blocking_keeps_original_id_kind_text():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
@@ -561,12 +417,357 @@ def test_ensemble_merged_blocking_keeps_original_id_kind_text():
     assert f.description == f"{orig_desc} [also found by: requirements]"
 
 
+def test_ensemble_earlier_lens_shorter_description_wins():
+    """
+    Verify that the earlier lens in LENSES order wins, NOT the longest description.
+    Earlier lens has a shorter description, later lens has a much longer description:
+    the earlier lens's shorter copy is kept.
+    """
+    lens0 = LENSES[0]  # earlier lens
+    lens1 = LENSES[1]  # later lens
+
+    short_desc = "Brief leak"
+    long_desc = "Much longer and extremely detailed description of the memory leak in auth session logic"
+
+    resp0 = f"SCORE: 5.0\nSUMMARY: 0\nFINDINGS:\n- high | correctness | src/auth.py:12 | - | {short_desc}\n"
+    resp1 = f"SCORE: 5.0\nSUMMARY: 1\nFINDINGS:\n- medium | correctness | src/auth.py:12 | - | {long_desc}\n"
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp1
+        return resp0
+
+    result = run_ensemble(
+        lenses=[lens0, lens1],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 1
+    # Shorter description from earlier lens was kept, NOT the longer one
+    assert short_desc in result.findings[0].description
+    assert long_desc not in result.findings[0].description
+
+
+def test_ensemble_correctness_prompt_reproduction():
+    """
+    The prompt for the correctness lens must reproduce the single reviewer's prompt exactly:
+    base system prompt is unstripped, and part prompt always has the Git Diff fence.
+    """
+    lens = LENSES[0]  # correctness
+    captured_sys: List[str] = []
+    captured_prompt: List[str] = []
+
+    base_sys = "  You are the Lead Architect.  \n"  # contains leading/trailing whitespace
+    part = "diff --git a/a.py b/a.py\nGit Diff:\n```\n+code\n```\n"
+
+    def scripted_call(system: str, prompt: str) -> str:
+        captured_sys.append(system)
+        captured_prompt.append(prompt)
+        return "SCORE: 9.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+
+    run_ensemble(
+        lenses=[lens],
+        call=scripted_call,
+        header="Header",
+        parts=[part],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt=base_sys,
+    )
+
+    assert len(captured_sys) == 1
+    # System prompt is NOT stripped for correctness lens
+    assert captured_sys[0] == base_sys
+    # Prompt wraps with standard Git Diff fence without special-case skipping
+    assert "Git Diff:\n```\n" in captured_prompt[0]
+
+
+def test_ensemble_same_defect_merged_with_provenance():
+    """The same defect found by two lenses is merged once with provenance."""
+    lens1 = LENSES[0]  # correctness
+    lens2 = LENSES[1]  # requirements
+
+    response_1 = (
+        "SCORE: 6.0\nSUMMARY: check 1\nFINDINGS:\n"
+        "- high | correctness | src/auth.py:12 | - | Potential memory leak in auth session\n"
+    )
+    response_2 = (
+        "SCORE: 6.0\nSUMMARY: check 2\nFINDINGS:\n"
+        "- high | correctness | src/auth.py:12 | - | Potential memory leak in auth session\n"
+    )
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return response_2
+        return response_1
+
+    result = run_ensemble(
+        lenses=[lens1, lens2],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 1
+    merged = result.findings[0]
+
+    # Kept finding is from earliest lens in LENSES (correctness)
+    assert "Potential memory leak in auth session" in merged.description
+    assert "[also found by: requirements]" in merged.description
+    assert result.provenance[merged.id] == ["correctness", "requirements"]
+
+
+def test_ensemble_non_transitive_merge_preserves_distinct_findings():
+    """
+    Dedupe is pairwise against the kept representative (non-transitive).
+    Finding A matches B, B matches C, but A and C are distinct (>3 lines and low similarity).
+    A and C must both be preserved.
+    """
+    lens1 = LENSES[0]
+    lens2 = LENSES[1]
+    lens3 = LENSES[2]
+
+    resp_a = "SCORE: 5.0\nSUMMARY: A\nFINDINGS:\n- high | correctness | src/auth.py:10 | - | Buffer overflow in parsing\n"
+    resp_b = "SCORE: 5.0\nSUMMARY: B\nFINDINGS:\n- high | correctness | src/auth.py:12 | - | Buffer overflow in parsing\n"
+    resp_c = "SCORE: 5.0\nSUMMARY: C\nFINDINGS:\n- high | correctness | src/auth.py:15 | - | Integer underflow in arithmetic\n"
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp_b
+        if "Contracts" in system:
+            return resp_c
+        return resp_a
+
+    result = run_ensemble(
+        lenses=[lens1, lens2, lens3],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=12,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 2
+    descs = [f.description for f in result.findings]
+    assert any("Buffer overflow" in d for d in descs)
+    assert any("Integer underflow" in d for d in descs)
+
+
+def test_ensemble_raising_lens_recorded_and_rest_used():
+    """A lens that raises is recorded in failed and the rest are used."""
+    lens1 = LENSES[0]  # raises
+    lens2 = LENSES[1]  # succeeds
+    lens3 = LENSES[2]  # succeeds
+
+    resp_2 = (
+        "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\n"
+        "- high | requirement | src/auth.py:12 | - | Req issue\n"
+    )
+    resp_3 = (
+        "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\n"
+        "- low | maintainability | src/auth.py:14 | - | Contract issue\n"
+    )
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp_2
+        if "Contracts" in system:
+            return resp_3
+        raise RuntimeError("LLM connection timed out")
+
+    result = run_ensemble(
+        lenses=[lens1, lens2, lens3],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=12,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert result.usable == 2
+    assert result.failed == ["correctness"]
+    assert len(result.findings) == 2
+
+
+def test_ensemble_too_few_usable_lenses_returns_none():
+    """When fewer than ceil(N/2) lenses succeed, fail closed and return None."""
+    lens1 = LENSES[0]
+    lens2 = LENSES[1]
+    lens3 = LENSES[2]
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Contracts" in system:
+            return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+        raise ConnectionError("Network down")
+
+    result = run_ensemble(
+        lenses=[lens1, lens2, lens3],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=12,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is None
+
+
+def test_ensemble_max_calls_exceeded_returns_none_zero_calls():
+    """When 2 * len(lenses) * len(parts) > max_calls, return None with zero calls."""
+    calls_made = 0
+
+    def scripted_call(system: str, prompt: str) -> str:
+        nonlocal calls_made
+        calls_made += 1
+        return "SCORE: 10.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+
+    result = run_ensemble(
+        lenses=[LENSES[0], LENSES[1], LENSES[2]],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=5,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is None
+    assert calls_made == 0
+
+
+def test_ensemble_unverifiable_location_annotated_keeps_blocking():
+    """An unverifiable location is annotated and its blocking value is kept."""
+    lens1 = LENSES[0]
+
+    response = (
+        "SCORE: 4.0\nSUMMARY: bad\nFINDINGS:\n"
+        "- critical | correctness | src/auth.py:999 | - | Hardcoded secret in config\n"
+    )
+
+    result = run_ensemble(
+        lenses=[lens1],
+        call=lambda sys, p: response,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 1
+    f = result.findings[0]
+    assert "[location not verified in the diff]" in f.description
+    assert f.blocking is True
+
+
+def test_ensemble_old_side_lines_and_deleted_file_verified():
+    """Old-side lines of a removed block and lines of a deleted file count as verified."""
+    lens1 = LENSES[0]
+
+    response = (
+        "SCORE: 5.0\nSUMMARY: audit\nFINDINGS:\n"
+        "- high | correctness | src/auth.py:25 | - | Removed authorization check without replacement\n"
+        "- high | correctness | src/legacy.py:100 | - | Deleted legacy module references\n"
+    )
+
+    result = run_ensemble(
+        lenses=[lens1],
+        call=lambda sys, p: response,
+        header="Header",
+        parts=[MULTI_HUNK_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 2
+    for f in result.findings:
+        assert "[location not verified in the diff]" not in f.description
+
+
+def test_ensemble_diff_parser_ignores_comment_body_lines():
+    """Hunk body lines starting with SQL/Lua comments are not treated as diff headers."""
+    sql_diff = (
+        "diff --git a/schema.sql b/schema.sql\n"
+        "--- a/schema.sql\n"
+        "+++ b/schema.sql\n"
+        "@@ -1,5 +1,5 @@\n"
+        "--- Removed SQL comment\n"
+        "+-- New SQL comment\n"
+        " [file deleted: fake note in body]\n"
+    )
+    diff_info = _parse_diff([sql_diff])
+    assert "schema.sql" in diff_info
+    assert diff_info["schema.sql"].is_deleted is False
+
+
+def test_ensemble_different_kinds_same_place_not_merged():
+    """Two findings with different kinds in the same place are NOT merged."""
+    lens1 = LENSES[0]
+    lens2 = LENSES[1]
+
+    resp_1 = (
+        "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
+        "- high | correctness | src/auth.py:12 | - | Null check omitted\n"
+    )
+    resp_2 = (
+        "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
+        "- high | security | src/auth.py:12 | - | Timing attack vulnerability\n"
+    )
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp_2
+        return resp_1
+
+    result = run_ensemble(
+        lenses=[lens1, lens2],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 2
+    kinds = {f.kind for f in result.findings}
+    assert kinds == {"correctness", "security"}
+
+
 def test_ensemble_output_order_independent_of_completion_order():
     """Output order is independent of completion order (varying sleeps in call)."""
     lens1 = LENSES[0]  # correctness
     lens2 = LENSES[1]  # requirements
 
-    # Defect on auth.py vs defect on config.py
     resp_auth = (
         "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
         "- high | correctness | src/auth.py:12 | - | Auth defect\n"
@@ -583,11 +784,10 @@ def test_ensemble_output_order_independent_of_completion_order():
         "@@ -10,5 +10,5 @@\n+config\n"
     )
 
-    # Run 1: lens1 sleeps 0.05s, lens2 returns immediately
     def call_run1(system: str, prompt: str) -> str:
         if "Requirements" in system:
             return resp_config
-        time.sleep(0.05)
+        time.sleep(0.04)
         return resp_auth
 
     res1 = run_ensemble(
@@ -598,12 +798,12 @@ def test_ensemble_output_order_independent_of_completion_order():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
-    # Run 2: lens2 sleeps 0.05s, lens1 returns immediately
     def call_run2(system: str, prompt: str) -> str:
         if "Requirements" in system:
-            time.sleep(0.05)
+            time.sleep(0.04)
             return resp_config
         return resp_auth
 
@@ -615,10 +815,10 @@ def test_ensemble_output_order_independent_of_completion_order():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert res1 is not None and res2 is not None
-    # Findings must be in identical order across both runs
     assert [f.id for f in res1.findings] == [f.id for f in res2.findings]
 
 
@@ -627,15 +827,13 @@ def test_ensemble_merge_order_preserves_lens_priority_over_completion_order():
     lens1 = LENSES[0]  # correctness
     lens2 = LENSES[1]  # requirements
 
-    # Both find the exact same issue at src/auth.py:12
     resp_1 = "SCORE: 6.0\nSUMMARY: 1\nFINDINGS:\n- high | correctness | src/auth.py:12 | - | Lens 1 wording of issue\n"
     resp_2 = "SCORE: 6.0\nSUMMARY: 2\nFINDINGS:\n- high | correctness | src/auth.py:12 | - | Lens 2 wording of issue\n"
 
-    # Lens 1 sleeps, Lens 2 completes first
     def scripted_call(system: str, prompt: str) -> str:
         if "Requirements" in system:
             return resp_2
-        time.sleep(0.05)
+        time.sleep(0.04)
         return resp_1
 
     result = run_ensemble(
@@ -646,13 +844,50 @@ def test_ensemble_merge_order_preserves_lens_priority_over_completion_order():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
     assert len(result.findings) == 1
-    # Even though lens 2 completed first, lens 1 wording must be kept (earliest in LENSES)
     assert "Lens 1 wording of issue" in result.findings[0].description
     assert "[also found by: requirements]" in result.findings[0].description
+
+
+def test_ensemble_equal_sort_keys_order_preserved():
+    """Non-duplicates with equal sort keys (same file, line, severity) preserve lens order."""
+    lens1 = LENSES[0]  # correctness
+    lens2 = LENSES[1]  # requirements
+
+    resp_1 = (
+        "SCORE: 5.0\nSUMMARY: 1\nFINDINGS:\n"
+        "- critical | correctness | src/auth.py:12 | - | Null pointer dereference\n"
+    )
+    resp_2 = (
+        "SCORE: 5.0\nSUMMARY: 2\nFINDINGS:\n"
+        "- critical | security | src/auth.py:12 | - | Secret token leak\n"
+    )
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            return resp_2
+        time.sleep(0.04)
+        return resp_1
+
+    result = run_ensemble(
+        lenses=[lens1, lens2],
+        call=scripted_call,
+        header="Header",
+        parts=[SAMPLE_DIFF],
+        parse=_make_parse(),
+        max_calls=10,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert len(result.findings) == 2
+    assert result.findings[0].kind == "correctness"
+    assert result.findings[1].kind == "security"
 
 
 def test_ensemble_chars_sent_and_calls_exact():
@@ -705,6 +940,7 @@ def test_ensemble_n1_correctness_one_call_per_part():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
@@ -726,7 +962,6 @@ def test_ensemble_retry_on_unparseable_output():
     def scripted_call(system: str, prompt: str) -> str:
         call_prompts.append(prompt)
         if len(call_prompts) == 1:
-            # First answer cannot be parsed
             return "Sure, here are some thoughts on your code: looks fine!"
         return good_resp
 
@@ -738,12 +973,12 @@ def test_ensemble_retry_on_unparseable_output():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
     assert result.calls == 2
     assert len(call_prompts) == 2
-    # Second attempt had format reminder appended
     assert FORMAT_REMINDER in call_prompts[1]
     assert len(result.findings) == 1
 
@@ -756,7 +991,6 @@ def test_ensemble_retry_exhaustion_fails_lens():
     def scripted_call(system: str, prompt: str) -> str:
         if "Requirements" in system:
             return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
-        # Lens 1 always returns unparseable text
         return "I am an unparseable response"
 
     result = run_ensemble(
@@ -767,6 +1001,7 @@ def test_ensemble_retry_exhaustion_fails_lens():
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
+        system_prompt="",
     )
 
     assert result is not None
@@ -801,7 +1036,6 @@ def test_ensemble_prompt_focus_lens_order_pinned():
     assert len(captured_systems) == 1
     system_text = captured_systems[0]
 
-    # Verify strictly that base_prompt precedes focus, and focus precedes lens instruction
     idx_base = system_text.index(base_prompt_body)
     idx_focus = system_text.index(focus_directive)
     idx_lens = system_text.index(ADVERSARY_INSTRUCTION)
@@ -810,33 +1044,126 @@ def test_ensemble_prompt_focus_lens_order_pinned():
 
 
 def test_ensemble_stage_timeout_handles_hung_lens():
-    """A lens still running at expiry is recorded in failed, and cancelled flag stops extra calls."""
+    """
+    A lens still running at expiry is recorded in failed, and cancelled flag stops extra calls.
+    Multi-part diff: verifies that a hung thread does NOT make extra calls on subsequent parts.
+    """
     lens1 = LENSES[0]  # fast
-    lens2 = LENSES[1]  # hung / slow
-    hung_calls_after_timeout = 0
+    lens2 = LENSES[1]  # hung on part 1
+    lens2_call_count = 0
+
+    part1 = "diff --git a/a.py b/a.py\n@@ -1,5 +1,5 @@\n+1\n"
+    part2 = "diff --git a/b.py b/b.py\n@@ -1,5 +1,5 @@\n+2\n"
 
     def scripted_call(system: str, prompt: str) -> str:
-        nonlocal hung_calls_after_timeout
+        nonlocal lens2_call_count
         if "Requirements" in system:
-            time.sleep(0.3)
-            hung_calls_after_timeout += 1
+            lens2_call_count += 1
+            time.sleep(0.5)
             return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
         return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
 
-    # Timeout after 0.05s
     result = run_ensemble(
         lenses=[lens1, lens2],
         call=scripted_call,
         header="Header",
-        parts=[SAMPLE_DIFF],
+        parts=[part1, part2],
         parse=_make_parse(),
         max_calls=10,
         format_reminder=FORMAT_REMINDER,
-        stage_timeout_s=0.05,
+        system_prompt="",
+        stage_timeout_s=0.2,
     )
 
     assert result is not None
     assert result.usable == 1
     assert "requirements" in result.failed
-    # Wait briefly to let hung thread exit cleanly without continuing to make calls
-    time.sleep(0.35)
+    # Lens 1 finished both parts (2 calls).
+    assert result.calls >= 2
+    time.sleep(0.55)  # wait for thread 2 sleep to finish
+    # Confirm lens 2 never made a second call on part 2 after timeout cancelled the stage
+    assert lens2_call_count == 1
+
+
+def test_ensemble_daemon_threads_do_not_block_process_exit():
+    """
+    Subprocess test: running run_ensemble with a call sleeping 8s and stage_timeout_s=0.5
+    must exit in under 3s because daemon threads are abandoned without joining at interpreter exit.
+    """
+    code = """
+import time
+from guard.core.findings import parse_findings
+from guard.core.review_ensemble import run_ensemble
+from guard.core.review_lenses import LENSES
+
+def slow_call(sys, p):
+    if "Requirements" in sys:
+        time.sleep(8.0)
+    return "SCORE: 9.0\\nSUMMARY: ok\\nFINDINGS:\\nNone\\n"
+
+part = "diff --git a/a.py b/a.py\\n@@ -1,5 +1,5 @@\\n+1\\n"
+res = run_ensemble(
+    lenses=[LENSES[0], LENSES[1]],
+    call=slow_call,
+    header="Header",
+    parts=[part],
+    parse=lambda t: parse_findings(t, ""),
+    max_calls=10,
+    format_reminder="reminder",
+    system_prompt="",
+    stage_timeout_s=0.5,
+)
+assert res is not None
+"""
+    start_t = time.perf_counter()
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
+    elapsed = time.perf_counter() - start_t
+
+    assert proc.returncode == 0, f"Process failed with stderr: {proc.stderr}"
+    assert elapsed < 3.0, f"Process took {elapsed:.2f}s, expected < 3.0s"
+
+
+def test_ensemble_partial_lens_findings_preserved_when_quorum_met():
+    """
+    When a lens succeeds on part 1 but fails on part 2, its part 1 findings
+    are preserved with annotation '[from a lens that failed on a later part]'
+    as long as fail-closed quorum is met by other lenses.
+    """
+    lens0 = LENSES[0]  # succeeds on both parts
+    lens1 = LENSES[1]  # succeeds on part 1, raises on part 2
+    lens2 = LENSES[2]  # succeeds on both parts (2 usable lenses >= ceil(3/2) = 2)
+
+    part1 = "diff --git a/a.py b/a.py\n@@ -1,5 +1,5 @@\n+1\n"
+    part2 = "diff --git a/b.py b/b.py\n@@ -1,5 +1,5 @@\n+2\n"
+
+    resp_lens1_part1 = (
+        "SCORE: 6.0\nSUMMARY: p1\nFINDINGS:\n"
+        "- high | requirement | a.py:1 | - | Missing auth check on endpoint A\n"
+    )
+
+    def scripted_call(system: str, prompt: str) -> str:
+        if "Requirements" in system:
+            if "Diff part 2/2" in prompt:
+                raise RuntimeError("Failed on part 2")
+            return resp_lens1_part1
+        return "SCORE: 9.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+
+    result = run_ensemble(
+        lenses=[lens0, lens1, lens2],
+        call=scripted_call,
+        header="Header",
+        parts=[part1, part2],
+        parse=_make_parse(),
+        max_calls=16,
+        format_reminder=FORMAT_REMINDER,
+        system_prompt="",
+    )
+
+    assert result is not None
+    assert result.usable == 2
+    assert "requirements" in result.failed
+    # Lens 1's finding on part 1 is preserved with annotation
+    assert len(result.findings) == 1
+    f = result.findings[0]
+    assert "Missing auth check on endpoint A" in f.description
+    assert "[from a lens that failed on a later part]" in f.description

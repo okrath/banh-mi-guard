@@ -1,18 +1,19 @@
 """
 Review ensemble runner for banh-mi-guard.
 
-Runs a panel of independent review lenses concurrently over diff parts,
-merges results in lens-then-part order, checks locations against diff hunks,
+Runs a panel of independent review lenses concurrently over diff parts on daemon
+threads, merges results in lens-then-part order, checks locations against diff hunks,
 deduplicates findings with provenance tracking, and enforces fail-closed semantics.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import difflib
 import math
+import queue
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -62,14 +63,11 @@ def _normalize_description(text: str) -> str:
     return " ".join(cleaned.lower().split())
 
 
-def _lens_rank(lens_key: str, lenses: Sequence[Lens]) -> int:
+def _lens_rank(lens_key: str) -> int:
     """Determine ranking priority for a lens in LENSES order."""
     for idx, base_lens in enumerate(LENSES):
         if base_lens.key == lens_key:
             return idx
-    for idx, extra_lens in enumerate(lenses):
-        if extra_lens.key == lens_key:
-            return 1000 + idx
     return 9999
 
 
@@ -114,7 +112,8 @@ def _parse_diff(parts: Sequence[str]) -> Dict[str, FileDiffInfo]:
                 after = line[len("diff --git a/"):]
                 if " b/" in after:
                     p_old, p_new = after.split(" b/", 1)
-                    current_files = [p_old.strip(), p_new.strip()]
+                    s_old, s_new = p_old.strip(), p_new.strip()
+                    current_files = [s_old] if s_old == s_new else [s_old, s_new]
                     for fp in current_files:
                         get_or_create(fp)
                 continue
@@ -204,38 +203,55 @@ def _is_location_verified(location: str, diff_files: Dict[str, FileDiffInfo]) ->
     return in_new or in_old
 
 
-def _strip_annotations(desc: str) -> str:
-    """Remove location and provenance annotations before description comparison."""
-    cleaned = re.sub(r"\s*\[location not verified in the diff\]", "", desc)
-    cleaned = re.sub(r"\s*\[also found by: [^\]]+\]", "", cleaned)
-    return cleaned.strip()
-
-
-def _is_same_finding(f1: Finding, f2: Finding) -> bool:
-    """
-    Two findings are the same only when they have the same file AND same kind
-    AND (lines within 3 OR normalized sequence matcher ratio >= 0.6).
-    """
-    file1, _ = _parse_location(f1.location)
-    file2, _ = _parse_location(f2.location)
+def _is_same_file(file1: str, file2: str) -> bool:
+    """Check if two file paths resolve to the same file in diff context."""
     clean1 = _normalize_path(file1)
     clean2 = _normalize_path(file2)
     if not clean1 or not clean2:
         return False
-    if clean1 != clean2 and not clean1.endswith("/" + clean2) and not clean2.endswith("/" + clean1):
+    if clean1 == clean2:
+        return True
+    return clean1.endswith("/" + clean2) or clean2.endswith("/" + clean1)
+
+
+def _can_merge(
+    rep_item: Tuple[Finding, Lens, List[Tuple[Lens, int]], int],
+    cand_item: Tuple[Finding, Lens, int, int],
+) -> bool:
+    """
+    Determine if candidate B should merge into representative A:
+    1. NEVER merge if candidate's (lens.key, part_idx) is already present in cluster_members.
+    2. Same file and same kind required.
+    3. Across lenses: two blocking findings merge ONLY when normalized description
+       similarity ratio is >= 0.6. Proximity within 3 lines merges only when at least
+       one copy is NOT blocking.
+    """
+    rep_f, _, cluster_members, _ = rep_item
+    cand_f, cand_lens, cand_part, _ = cand_item
+
+    # 1. Never merge if candidate came from the same lens and same part as any member in this cluster
+    if any(cl_lens.key == cand_lens.key and cl_part == cand_part for cl_lens, cl_part in cluster_members):
         return False
-    if f1.kind.strip().lower() != f2.kind.strip().lower():
+
+    # 2. Same file and same kind
+    file_rep, line_rep = _parse_location(rep_f.location)
+    file_cand, line_cand = _parse_location(cand_f.location)
+    if not _is_same_file(file_rep, file_cand):
+        return False
+    if rep_f.kind.strip().lower() != cand_f.kind.strip().lower():
         return False
 
-    _, line1 = _parse_location(f1.location)
-    _, line2 = _parse_location(f2.location)
-    line_match = line1 is not None and line2 is not None and abs(line1 - line2) <= 3
+    # 3. Match rules
+    line_match = line_rep is not None and line_cand is not None and abs(line_rep - line_cand) <= 3
+    norm_rep = _normalize_description(rep_f.description)
+    norm_cand = _normalize_description(cand_f.description)
+    desc_match = difflib.SequenceMatcher(None, norm_rep, norm_cand).ratio() >= 0.6
 
-    norm1 = _normalize_description(_strip_annotations(f1.description))
-    norm2 = _normalize_description(_strip_annotations(f2.description))
-    ratio = difflib.SequenceMatcher(None, norm1, norm2).ratio()
-    desc_match = ratio >= 0.6
+    if rep_f.blocking and cand_f.blocking:
+        # Two blocking findings merge ONLY when descriptions match closely
+        return desc_match
 
+    # At least one copy is not blocking: proximity or description similarity merges
     return line_match or desc_match
 
 
@@ -243,48 +259,50 @@ def _candidate_rank(
     finding: Finding,
     lens: Lens,
     original_idx: int,
-    lenses: Sequence[Lens],
 ) -> Tuple[int, int, int, int]:
     """
     Sorting key for deduplication candidate priority:
-    1. Blocking copies first (0 < 1)
-    2. Highest severity (critical 0 < high 1 < medium 2 < low 3)
-    3. Earliest lens in LENSES order
-    4. Original index
+    Among two blocking copies, earliest lens in LENSES order wins whatever the severity.
+    Severity ranking applies only when neither is blocking.
     """
-    blocking_rank = 0 if finding.blocking else 1
+    lens_rank = _lens_rank(lens.key)
+    if finding.blocking:
+        return (0, lens_rank, 0, original_idx)
     sev_rank = SEVERITY_ORDER.get(finding.severity.strip().lower(), 99)
-    lens_rank = _lens_rank(lens.key, lenses)
-    return (blocking_rank, sev_rank, lens_rank, original_idx)
+    return (1, sev_rank, lens_rank, original_idx)
 
 
-def _output_sort_key(f: Finding) -> Tuple[int, str, int, str]:
-    """Sort output findings by severity, then file, then line, then id."""
+def _output_sort_key(item: Tuple[Finding, int]) -> Tuple[int, str, int, int, str]:
+    """Sort output findings by severity, then file, then line, then lens order index, then id."""
+    f, order_idx = item
     sev = SEVERITY_ORDER.get(f.severity.strip().lower(), 99)
     file_path, line_num = _parse_location(f.location)
-    return (sev, _normalize_path(file_path), line_num if line_num is not None else 0, f.id)
+    return (sev, _normalize_path(file_path), line_num if line_num is not None else 0, order_idx, f.id)
 
 
 def _combine_system_prompt(base_prompt: str, lens_instruction: str) -> str:
-    """Combine base system prompt (including focus) and lens instruction."""
+    """
+    Combine base system prompt (including focus) and lens instruction.
+    For the correctness lens (empty lens_instruction), returns base_prompt without stripping.
+    """
+    if not lens_instruction:
+        return base_prompt
     base = base_prompt.strip()
     lens = lens_instruction.strip()
-    if base and lens:
-        return f"{base}\n\n{lens}"
     if base:
-        return base
+        return f"{base}\n\n{lens}"
     return lens
 
 
 def _build_part_prompt(header: str, part: str, part_index: int, total_parts: int) -> str:
-    """Format the review prompt for a single diff part."""
+    """Format the review prompt for a single diff part exactly as the single reviewer does."""
     part_indicator = (
         f"Diff part {part_index}/{total_parts} (other parts are reviewed separately; judge only this part):\n"
         if total_parts > 1
         else ""
     )
-    diff_block = part if "Git Diff:\n```" in part else f"Git Diff:\n```\n{part}\n```\n"
-    if header.strip():
+    diff_block = f"Git Diff:\n```\n{part}\n```\n"
+    if header:
         return f"{header}\n{part_indicator}{diff_block}"
     return f"{part_indicator}{diff_block}"
 
@@ -298,11 +316,11 @@ def run_ensemble(
     *,
     max_calls: int,
     format_reminder: str,
-    system_prompt: str = "",
+    system_prompt: str,
     stage_timeout_s: float = 900.0,
 ) -> Optional[EnsembleResult]:
     """
-    Run an opt-in panel of independent review lenses over diff parts.
+    Run an opt-in panel of independent review lenses over diff parts on daemon threads.
 
     Returns the union of evidence-checked findings, or None if the worst-case
     call budget exceeds max_calls or too few lenses produce a parseable answer.
@@ -317,6 +335,7 @@ def run_ensemble(
 
     counter_lock = threading.Lock()
     cancelled = threading.Event()
+    semaphore = threading.Semaphore(3)
     calls_made = 0
     chars_sent = 0
 
@@ -327,131 +346,160 @@ def run_ensemble(
         with counter_lock:
             if cancelled.is_set():
                 raise RuntimeError("ensemble stage cancelled")
-            if calls_made >= max_calls:
-                raise RuntimeError("max_calls exceeded")
             calls_made += 1
             chars_sent += len(system) + len(prompt)
         return call(system, prompt)
 
-    def evaluate_lens(lens: Lens) -> Tuple[Lens, Optional[List[List[Finding]]]]:
-        combined_system = _combine_system_prompt(system_prompt, lens.instruction)
-        findings_per_part: List[List[Finding]] = []
+    result_queue: queue.Queue[
+        Tuple[Lens, Optional[List[List[Finding]]], List[List[Finding]]]
+    ] = queue.Queue()
 
-        for i, part in enumerate(parts, start=1):
-            if cancelled.is_set():
-                return lens, None
-
-            prompt_text = _build_part_prompt(header, part, i, len(parts))
-            parsed_findings: Optional[List[Finding]] = None
-
-            for attempt in range(2):
+    def lens_worker(lens_obj: Lens) -> None:
+        try:
+            with semaphore:
                 if cancelled.is_set():
-                    return lens, None
-                used_prompt = prompt_text if attempt == 0 else prompt_text + format_reminder
-                try:
-                    response = make_call(combined_system, used_prompt)
-                except Exception:
-                    return lens, None
+                    result_queue.put((lens_obj, None, []))
+                    return
 
-                parsed = parse(response)
-                if parsed is not None:
-                    parsed_findings = parsed
-                    break
+                combined_system = _combine_system_prompt(system_prompt, lens_obj.instruction)
+                completed_findings: List[List[Finding]] = []
 
-            if parsed_findings is None:
-                return lens, None
+                for i, part in enumerate(parts, start=1):
+                    if cancelled.is_set():
+                        break
 
-            findings_per_part.append(parsed_findings)
+                    prompt_text = _build_part_prompt(header, part, i, len(parts))
+                    parsed_findings: Optional[List[Finding]] = None
 
-        return lens, findings_per_part
+                    for attempt in range(2):
+                        if cancelled.is_set():
+                            break
+                        used_prompt = prompt_text if attempt == 0 else prompt_text + format_reminder
+                        try:
+                            response = make_call(combined_system, used_prompt)
+                        except Exception:
+                            break
 
-    max_workers = min(3, max(1, len(lenses)))
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    failed_keys: set[str] = set()
-    lens_part_findings: Dict[str, List[List[Finding]]] = {}
-    not_done: set[concurrent.futures.Future[Tuple[Lens, Optional[List[List[Finding]]]]]] = set()
+                        parsed = parse(response)
+                        if parsed is not None:
+                            parsed_findings = parsed
+                            break
 
-    try:
-        future_to_lens = {executor.submit(evaluate_lens, lens): lens for lens in lenses}
-        done, not_done = concurrent.futures.wait(future_to_lens.keys(), timeout=stage_timeout_s)
+                    if parsed_findings is None:
+                        break
 
-        for f in not_done:
-            timed_out_lens = future_to_lens[f]
-            failed_keys.add(timed_out_lens.key)
+                    completed_findings.append(parsed_findings)
 
-        if not_done:
-            cancelled.set()
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        for f in done:
-            completed_lens = future_to_lens[f]
-            try:
-                _, part_results = f.result()
-                if part_results is None:
-                    failed_keys.add(completed_lens.key)
+                if len(completed_findings) == len(parts):
+                    result_queue.put((lens_obj, completed_findings, []))
                 else:
-                    lens_part_findings[completed_lens.key] = part_results
-            except Exception:
-                failed_keys.add(completed_lens.key)
-    finally:
-        if not not_done:
-            executor.shutdown(wait=True)
+                    result_queue.put((lens_obj, None, completed_findings))
+        except Exception:
+            result_queue.put((lens_obj, None, []))
+
+    for lens in lenses:
+        worker_thread = threading.Thread(target=lens_worker, args=(lens,), daemon=True)
+        worker_thread.start()
+
+    deadline = time.monotonic() + stage_timeout_s
+    lens_results: Dict[str, List[List[Finding]]] = {}
+    partial_results: Dict[str, List[List[Finding]]] = {}
+    failed_keys: set[str] = set()
+    completed_lens_keys: set[str] = set()
+
+    for _ in range(len(lenses)):
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        try:
+            res_lens, completed_parts, partial_parts = result_queue.get(timeout=remaining)
+            completed_lens_keys.add(res_lens.key)
+            if completed_parts is not None:
+                lens_results[res_lens.key] = completed_parts
+            else:
+                failed_keys.add(res_lens.key)
+                if partial_parts:
+                    partial_results[res_lens.key] = partial_parts
+        except queue.Empty:
+            break
+
+    # Record timed-out lenses that did not complete before deadline
+    for lens in lenses:
+        if lens.key not in completed_lens_keys:
+            failed_keys.add(lens.key)
+
+    if len(completed_lens_keys) < len(lenses):
+        cancelled.set()
 
     with counter_lock:
         final_calls = calls_made
         final_chars = chars_sent
 
-    failed = [lens.key for lens in lenses if lens.key in failed_keys]
-    usable = len(lens_part_findings)
+    usable = len(lens_results)
 
     # Fail closed: must produce a parseable answer for EVERY part from ceil(len(lenses)/2) lenses
     quorum = math.ceil(len(lenses) / 2)
     if usable < quorum:
+        cancelled.set()
         return None
 
     # Merge candidates in lens order, then part order (never completion order)
-    raw_candidates: List[Tuple[Finding, Lens, int]] = []
+    raw_candidates: List[Tuple[Finding, Lens, int, int]] = []
     candidate_idx = 0
     for lens in lenses:
-        if lens.key in lens_part_findings:
-            parts_findings = lens_part_findings[lens.key]
-            for part_findings in parts_findings:
+        if lens.key in lens_results:
+            parts_findings = lens_results[lens.key]
+            for part_idx, part_findings in enumerate(parts_findings):
                 for f in part_findings:
-                    raw_candidates.append((f.model_copy(), lens, candidate_idx))
+                    raw_candidates.append((f.model_copy(), lens, part_idx, candidate_idx))
                     candidate_idx += 1
-
-    # Location check: annotate unverified locations without changing blocking value
-    diff_info = _parse_diff(parts)
-    for f, _, _ in raw_candidates:
-        if not _is_location_verified(f.location, diff_info):
-            if " [location not verified in the diff]" not in f.description:
-                f.description = f"{f.description} [location not verified in the diff]"
+        elif lens.key in partial_results:
+            parts_findings = partial_results[lens.key]
+            for part_idx, part_findings in enumerate(parts_findings):
+                for f in part_findings:
+                    f_copy = f.model_copy()
+                    f_copy.description = f"{f_copy.description} [from a lens that failed on a later part]"
+                    raw_candidates.append((f_copy, lens, part_idx, candidate_idx))
+                    candidate_idx += 1
 
     # Pairwise deduplication against kept representative (non-transitive)
     sorted_candidates = sorted(
         raw_candidates,
-        key=lambda item: _candidate_rank(item[0], item[1], item[2], lenses),
+        key=lambda item: _candidate_rank(item[0], item[1], item[3]),
     )
 
-    representatives: List[Tuple[Finding, Lens, List[Lens]]] = []
-    for cand_finding, cand_lens, _ in sorted_candidates:
+    representatives: List[Tuple[Finding, Lens, List[Tuple[Lens, int]], int]] = []
+    for cand_item in sorted_candidates:
+        cand_f, cand_lens, cand_part, cand_order = cand_item
         matched = False
-        for rep_finding, _rep_lens, cluster_lenses in representatives:
-            if _is_same_finding(rep_finding, cand_finding):
-                if not any(cl.key == cand_lens.key for cl in cluster_lenses):
-                    cluster_lenses.append(cand_lens)
+        for rep_item in representatives:
+            if _can_merge(rep_item, cand_item):
+                rep_item[2].append((cand_lens, cand_part))
                 matched = True
                 break
         if not matched:
-            representatives.append((cand_finding.model_copy(), cand_lens, [cand_lens]))
+            representatives.append((cand_f.model_copy(), cand_lens, [(cand_lens, cand_part)], cand_order))
 
-    deduped_findings: List[Finding] = []
+    # Location check and provenance applied AFTER dedupe
+    diff_info = _parse_diff(parts)
+    deduped_findings_with_order: List[Tuple[Finding, int]] = []
     provenance: Dict[str, List[str]] = {}
 
-    for kept_finding, winner_lens, cluster_lenses in representatives:
+    for kept_finding, winner_lens, cluster_members, rep_order in representatives:
+        if not _is_location_verified(kept_finding.location, diff_info):
+            if " [location not verified in the diff]" not in kept_finding.description:
+                kept_finding.description = f"{kept_finding.description} [location not verified in the diff]"
+
+        unique_lenses: List[Lens] = []
+        seen_keys: set[str] = set()
+        for cl_lens, _ in cluster_members:
+            if cl_lens.key not in seen_keys:
+                seen_keys.add(cl_lens.key)
+                unique_lenses.append(cl_lens)
+
         sorted_cluster_lenses = sorted(
-            cluster_lenses,
-            key=lambda lens_item: _lens_rank(lens_item.key, lenses),
+            unique_lenses,
+            key=lambda lens_item: _lens_rank(lens_item.key),
         )
         provenance[kept_finding.id] = [lens_item.key for lens_item in sorted_cluster_lenses]
 
@@ -465,14 +513,16 @@ def run_ensemble(
                 f"{kept_finding.description} [also found by: {', '.join(other_lens_names)}]"
             )
 
-        deduped_findings.append(kept_finding)
+        deduped_findings_with_order.append((kept_finding, rep_order))
 
-    final_findings = sorted(deduped_findings, key=_output_sort_key)
+    final_findings = [
+        f for f, _ in sorted(deduped_findings_with_order, key=_output_sort_key)
+    ]
 
     return EnsembleResult(
         findings=final_findings,
         usable=usable,
-        failed=failed,
+        failed=[lens.key for lens in lenses if lens.key in failed_keys],
         calls=final_calls,
         chars_sent=final_chars,
         provenance=provenance,
