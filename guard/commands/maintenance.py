@@ -21,6 +21,7 @@ from guard.core.ocr_engine import GitDiffInspector, OCRRulebookRunner
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.core.updater import (
     UpdateSecurityStatus,
+    VersionCheckResult,
     check_guard_self_update,
     check_ocr_update,
     perform_ocr_upgrade,
@@ -130,18 +131,8 @@ def update_cmd(
             raise typer.Exit(code=1)
 
 
-@app.command("doctor")
-def doctor_cmd(
-    check_updates: bool = typer.Option(True, "--updates/--no-updates", help="Check npm for Alibaba OCR updates with supply-chain quarantine"),
-    quarantine_days: float = typer.Option(3.0, "--quarantine-days", "-q", help="Cooling period in days (default 3 days) to protect against zero-day backdoors"),
-):
-    """
-    Check system health and audit Alibaba OCR supply-chain security updates.
-    """
-    from guard.commands.setup import print_setup_health  # at call time: groups register in order
-    console.print("[bold cyan]🩺 BANH-MI-GUARD SYSTEM DOCTOR[/bold cyan]\n")
-    
-    # 1. Environment Table
+def _doctor_env_table() -> Table:
+    """Build the system environment and engines status table."""
     table = Table(title="💻 System Environment & Engines", show_header=True, header_style="bold magenta")
     table.add_column("Component", style="bold")
     table.add_column("Status", justify="center")
@@ -195,7 +186,78 @@ def doctor_cmd(
     else:
         table.add_row("Alibaba OCR CLI", "ℹ️ Optional", "Run 'npm install -g @alibaba-group/open-code-review'")
 
-    console.print(table)
+    return table
+
+
+def _doctor_supply_chain_table(guard_check: VersionCheckResult, ocr_check: VersionCheckResult) -> Table:
+    """Build the supply-chain security and update quarantine status table."""
+    sec_table = Table(show_header=True, header_style="bold cyan")
+    sec_table.add_column("Software Component", style="bold", width=34)
+    sec_table.add_column("Installed", width=12)
+    sec_table.add_column("Latest Release", width=18)
+    sec_table.add_column("Status", justify="center", width=22)
+    sec_table.add_column("Recommendation & Action")
+
+    # Row 1: Banh-Mi-Guard
+    g_inst = f"v{guard_check.installed_version}" if guard_check.installed_version else "v" + __version__
+    g_latest = f"v{guard_check.latest_version}" if guard_check.latest_version else "N/A"
+    if guard_check.status == UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE:
+        g_badge = "[bold white on blue]⬆️ UPDATE AVAILABLE[/bold white on blue]"
+    elif guard_check.status == UpdateSecurityStatus.UP_TO_DATE:
+        g_badge = "[bold green]✅ UP TO DATE[/bold green]"
+    else:
+        g_badge = "[yellow]⚠️ CHECK FAILED[/yellow]"
+    sec_table.add_row(f"{guard_check.package_name} ({guard_check.registry})", g_inst, g_latest, g_badge, guard_check.recommendation)
+
+    # Row 2: Alibaba OCR
+    inst_str = ocr_check.installed_version or "(not installed)"
+    latest_str = f"v{ocr_check.latest_version}" if ocr_check.latest_version else "N/A"
+    if ocr_check.age_days is not None:
+        latest_str += f" ({ocr_check.age_days:.1f}d)"
+
+    if ocr_check.status == UpdateSecurityStatus.QUARANTINE_HOLD:
+        status_badge = "[bold white on red]🛡️ QUARANTINE HOLD[/bold white on red]"
+    elif ocr_check.status == UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE:
+        status_badge = "[bold white on blue]⬆️ SAFE UPDATE[/bold white on blue]"
+    elif ocr_check.status == UpdateSecurityStatus.UP_TO_DATE:
+        status_badge = "[bold green]✅ UP TO DATE[/bold green]"
+    elif ocr_check.status == UpdateSecurityStatus.NOT_INSTALLED:
+        status_badge = "[dim]⚪ NOT INSTALLED[/dim]"
+    else:
+        status_badge = "[yellow]⚠️ CHECK FAILED[/yellow]"
+
+    sec_table.add_row(f"{ocr_check.package_name} ({ocr_check.registry})", inst_str, latest_str, status_badge, ocr_check.recommendation)
+    return sec_table
+
+
+def _doctor_supply_chain_audit(quarantine_days: float) -> None:
+    """Run release checks and render the supply-chain quarantine audit."""
+    console.print(f"\n[bold yellow]🛡️  RELEASES & SUPPLY-CHAIN AUDIT (Alibaba OCR Quarantine: {quarantine_days:.0f} days)[/bold yellow]")
+    with console.status("[cyan]Checking GitHub & npm for releases...[/cyan]"):
+        guard_check = check_guard_self_update(force=True)
+        ocr_check = check_ocr_update(quarantine_days=quarantine_days)
+
+    sec_table = _doctor_supply_chain_table(guard_check, ocr_check)
+    console.print(sec_table)
+    console.print(
+        f"[dim]💡 Safety principle: Newly published Alibaba OCR releases < {quarantine_days:.0f} days are automatically placed "
+        "on QUARANTINE HOLD to protect against npm supply-chain backdoors.[/dim]\n"
+    )
+
+
+@app.command("doctor")
+def doctor_cmd(
+    check_updates: bool = typer.Option(True, "--updates/--no-updates", help="Check npm for Alibaba OCR updates with supply-chain quarantine"),
+    quarantine_days: float = typer.Option(3.0, "--quarantine-days", "-q", help="Cooling period in days (default 3 days) to protect against zero-day backdoors"),
+):
+    """
+    Check system health and audit Alibaba OCR supply-chain security updates.
+    """
+    from guard.commands.setup import print_setup_health  # at call time: groups register in order
+    console.print("[bold cyan]🩺 BANH-MI-GUARD SYSTEM DOCTOR[/bold cyan]\n")
+
+    # 1. Environment Table
+    console.print(_doctor_env_table())
 
     # Installation & repository setup: what is missing after installing/upgrading, and how to fix it
     console.print()
@@ -205,54 +267,7 @@ def doctor_cmd(
 
     # 2. Supply-Chain Security & Update Quarantine Table (Focused on Alibaba OCR)
     if check_updates:
-        console.print(f"\n[bold yellow]🛡️  RELEASES & SUPPLY-CHAIN AUDIT (Alibaba OCR Quarantine: {quarantine_days:.0f} days)[/bold yellow]")
-        with console.status("[cyan]Checking GitHub & npm for releases...[/cyan]"):
-            guard_check = check_guard_self_update(force=True)
-            ocr_check = check_ocr_update(quarantine_days=quarantine_days)
-
-        sec_table = Table(show_header=True, header_style="bold cyan")
-        sec_table.add_column("Software Component", style="bold", width=34)
-        sec_table.add_column("Installed", width=12)
-        sec_table.add_column("Latest Release", width=18)
-        sec_table.add_column("Status", justify="center", width=22)
-        sec_table.add_column("Recommendation & Action")
-
-        # Row 1: Banh-Mi-Guard
-        g_inst = f"v{guard_check.installed_version}" if guard_check.installed_version else "v" + __version__
-        g_latest = f"v{guard_check.latest_version}" if guard_check.latest_version else "N/A"
-        if guard_check.status == UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE:
-            g_badge = "[bold white on blue]⬆️ UPDATE AVAILABLE[/bold white on blue]"
-        elif guard_check.status == UpdateSecurityStatus.UP_TO_DATE:
-            g_badge = "[bold green]✅ UP TO DATE[/bold green]"
-        else:
-            g_badge = "[yellow]⚠️ CHECK FAILED[/yellow]"
-        sec_table.add_row(f"{guard_check.package_name} ({guard_check.registry})", g_inst, g_latest, g_badge, guard_check.recommendation)
-
-        # Row 2: Alibaba OCR
-        inst_str = ocr_check.installed_version or "(not installed)"
-        latest_str = f"v{ocr_check.latest_version}" if ocr_check.latest_version else "N/A"
-        if ocr_check.age_days is not None:
-            latest_str += f" ({ocr_check.age_days:.1f}d)"
-
-        if ocr_check.status == UpdateSecurityStatus.QUARANTINE_HOLD:
-            status_badge = "[bold white on red]🛡️ QUARANTINE HOLD[/bold white on red]"
-        elif ocr_check.status == UpdateSecurityStatus.SAFE_UPDATE_AVAILABLE:
-            status_badge = "[bold white on blue]⬆️ SAFE UPDATE[/bold white on blue]"
-        elif ocr_check.status == UpdateSecurityStatus.UP_TO_DATE:
-            status_badge = "[bold green]✅ UP TO DATE[/bold green]"
-        elif ocr_check.status == UpdateSecurityStatus.NOT_INSTALLED:
-            status_badge = "[dim]⚪ NOT INSTALLED[/dim]"
-        else:
-            status_badge = "[yellow]⚠️ CHECK FAILED[/yellow]"
-
-        sec_table.add_row(f"{ocr_check.package_name} ({ocr_check.registry})", inst_str, latest_str, status_badge, ocr_check.recommendation)
-
-        console.print(sec_table)
-        console.print(
-            f"[dim]💡 Safety principle: Newly published Alibaba OCR releases < {quarantine_days:.0f} days are automatically placed "
-            "on QUARANTINE HOLD to protect against npm supply-chain backdoors.[/dim]\n"
-        )
-
+        _doctor_supply_chain_audit(quarantine_days)
 
 @app.command("laya", context_settings={"allow_extra_args": True, "ignore_unknown_options": True}, hidden=True)
 def laya_removed_cmd(ctx: typer.Context):
