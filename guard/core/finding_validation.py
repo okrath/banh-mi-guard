@@ -1,5 +1,16 @@
 """
 Cross-part finding validation: validates blocking findings against the full diff.
+
+Note on diff partitioning:
+The reviewer passes the full raw diff to validate_findings. Because review part
+boundaries are not present in a raw diff, cross-part validation within the same file
+cannot be reliably distinguished from adjacent author-controlled edits. Therefore,
+validation strictly enforces cross-file verification paired with provenance:
+a finding is only refuted by evidence that the author could not have fabricated,
+specifically:
+  (a) an unchanged context line in a file other than the finding's own file, or
+  (b) an added (+) line in another file whose exact text was moved verbatim from
+      a removed (-) line in the finding's file (the content already existed at the base commit).
 """
 
 from __future__ import annotations
@@ -63,10 +74,10 @@ class Validation:
 
 
 # Internal types:
-# DiffLine: (line_type, content, raw_line, file_path, part_id, hunk_id)
-# DiffHunk: (file_path, part_id, hunk_id, full_text, old_start, old_count, new_start, new_count)
-_DiffLineTuple = tuple[str, str, str, str, int, int]
-_DiffHunkTuple = tuple[str, int, int, str, int, int, int, int]
+# DiffLine: (line_type, content, raw_line, file_path)
+# DiffHunk: (file_path, full_text, old_start, old_count, new_start, new_count)
+_DiffLineTuple = tuple[str, str, str, str]
+_DiffHunkTuple = tuple[str, str, int, int, int, int]
 
 
 def _norm_path(path: str) -> str:
@@ -74,6 +85,38 @@ def _norm_path(path: str) -> str:
     if p.startswith("a/") or p.startswith("b/"):
         p = p[2:]
     return p.lower()
+
+
+def resolve_finding_file(location: str, diff_files: set[str]) -> Optional[str]:
+    """
+    Normalise finding.location and resolve it to exactly ONE file present in the diff.
+    Strips backticks, quotes, leading ./, :line, :line-range, #L3, ' line 3', ' (L3)', and trailing prose.
+    If the location does not resolve to exactly one file in diff_files, returns None (fail-safe).
+    """
+    if not location or not location.strip():
+        return None
+
+    # Remove quotes and backticks anywhere in the string:
+    s = location.replace("`", "").replace("'", "").replace('"', "").strip()
+    if s.startswith("./") or s.startswith(".\\"):
+        s = s[2:]
+
+    # Take candidate path before first colon, hash, parenthesis, or whitespace
+    candidate = re.split(r"[:#(\s]", s)[0].strip()
+    candidate_norm = _norm_path(candidate)
+    if not candidate_norm:
+        return None
+
+    # Check 1: Exact match in diff_files
+    if candidate_norm in diff_files:
+        return candidate_norm
+
+    # Check 2: Path suffix on a '/' boundary (e.g. 'auth.py' matches 'src/auth.py')
+    matches = [f for f in diff_files if f.endswith("/" + candidate_norm)]
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
 
 
 def _is_comment_or_docstring_line(line: str) -> bool:
@@ -97,14 +140,38 @@ def _matches_secret_pattern(line: str) -> bool:
     return False
 
 
+def _flush_hunk(
+    diff_hunks: list[_DiffHunkTuple],
+    current_file: str,
+    current_file_headers: list[str],
+    current_hunk_header: str,
+    current_hunk_lines: list[str],
+    current_old_start: int,
+    current_old_count: int,
+    current_new_start: int,
+    current_new_count: int,
+) -> None:
+    """Append completed hunk to diff_hunks if header and file are valid."""
+    if current_hunk_header and current_file:
+        full_text = "\n".join(current_file_headers) + "\n" + current_hunk_header + "\n" + "\n".join(current_hunk_lines)
+        diff_hunks.append(
+            (
+                current_file,
+                full_text.strip(),
+                current_old_start,
+                current_old_count,
+                current_new_start,
+                current_new_count,
+            )
+        )
+
+
 def _parse_diff(full_diff: str) -> tuple[list[_DiffLineTuple], list[_DiffHunkTuple]]:
-    """Parse unified diff into lines and hunks with file, part, and line numbering."""
+    """Parse unified diff into lines and hunks with file headers and line numbering."""
     diff_lines: list[_DiffLineTuple] = []
     diff_hunks: list[_DiffHunkTuple] = []
 
-    current_part = 1
     current_file = ""
-    current_hunk_id = 0
     in_hunk = False
 
     current_file_headers: list[str] = []
@@ -115,57 +182,37 @@ def _parse_diff(full_diff: str) -> tuple[list[_DiffLineTuple], list[_DiffHunkTup
     current_new_start = 0
     current_new_count = 0
 
-    def _flush_hunk() -> None:
-        nonlocal in_hunk, current_hunk_header, current_hunk_lines
-        if current_hunk_header and current_file:
-            full_text = "\n".join(current_file_headers) + "\n" + current_hunk_header + "\n" + "\n".join(current_hunk_lines)
-            diff_hunks.append(
-                (
-                    current_file,
-                    current_part,
-                    current_hunk_id,
-                    full_text.strip(),
-                    current_old_start,
-                    current_old_count,
-                    current_new_start,
-                    current_new_count,
-                )
-            )
-        current_hunk_lines = []
-        current_hunk_header = ""
-        in_hunk = False
-
     for line in full_diff.splitlines():
-        # Check if line is a part marker:
-        is_part_marker = (
-            line.strip() == "[continued: next part of this file's diff]"
-            or bool(re.match(r"^(?:---\s*|===\s*)?diff\s+part\s+(\d+)\b", line.strip(), re.IGNORECASE))
-        )
-
-        # Inside a hunk: any line that is not a diff content marker (+, -, space, \)
-        # or that is an unquoted part marker ends the hunk.
-        if in_hunk:
-            if not line or line[0] not in ("+", "-", " ", "\\") or (is_part_marker and not line.startswith("+")):
-                _flush_hunk()
-
-        # Outside hunks: check part boundaries
-        if not in_hunk:
-            if line.strip() == "[continued: next part of this file's diff]":
-                current_part += 1
-                continue
-            part_m = re.match(r"^(?:---\s*|===\s*)?diff\s+part\s+(\d+)\b", line.strip(), re.IGNORECASE)
-            if part_m:
-                current_part = int(part_m.group(1))
-                continue
-
-        # Check diff --git header: ends any previous hunk/file
+        # Check diff --git header: ends previous file/hunk
         git_m = re.match(r"^diff --git a/(.*?)\s+b/(.*)", line)
         if git_m:
-            _flush_hunk()
+            _flush_hunk(
+                diff_hunks, current_file, current_file_headers, current_hunk_header,
+                current_hunk_lines, current_old_start, current_old_count,
+                current_new_start, current_new_count,
+            )
+            current_hunk_lines = []
+            current_hunk_header = ""
             current_file = _norm_path(git_m.group(2))
-            current_hunk_id = 0
             current_file_headers = [line]
             in_hunk = False
+            continue
+
+        # Check hunk header: ends previous hunk, starts new hunk
+        hunk_m = re.match(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@", line)
+        if hunk_m:
+            _flush_hunk(
+                diff_hunks, current_file, current_file_headers, current_hunk_header,
+                current_hunk_lines, current_old_start, current_old_count,
+                current_new_start, current_new_count,
+            )
+            current_hunk_lines = []
+            current_hunk_header = line
+            current_old_start = int(hunk_m.group(1))
+            current_old_count = int(hunk_m.group(2)) if hunk_m.group(2) else 1
+            current_new_start = int(hunk_m.group(3))
+            current_new_count = int(hunk_m.group(4)) if hunk_m.group(4) else 1
+            in_hunk = True
             continue
 
         # Check --- / +++ file headers: only outside hunks
@@ -180,37 +227,38 @@ def _parse_diff(full_diff: str) -> tuple[list[_DiffLineTuple], list[_DiffHunkTup
                     current_file = _norm_path(plus_m.group(1))
                 continue
 
-        # Check hunk header
-        hunk_m = re.match(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@", line)
-        if hunk_m:
-            _flush_hunk()
-            current_hunk_id += 1
-            current_hunk_header = line
-            current_old_start = int(hunk_m.group(1))
-            current_old_count = int(hunk_m.group(2)) if hunk_m.group(2) else 1
-            current_new_start = int(hunk_m.group(3))
-            current_new_count = int(hunk_m.group(4)) if hunk_m.group(4) else 1
-            in_hunk = True
-            continue
-
         # Content lines inside hunks
         if in_hunk:
             if line.startswith("+"):
-                diff_lines.append(("+", line[1:].strip(), line, current_file, current_part, current_hunk_id))
+                diff_lines.append(("+", line[1:].strip(), line, current_file))
                 current_hunk_lines.append(line)
             elif line.startswith("-"):
-                diff_lines.append(("-", line[1:].strip(), line, current_file, current_part, current_hunk_id))
+                diff_lines.append(("-", line[1:].strip(), line, current_file))
                 current_hunk_lines.append(line)
             elif line.startswith(" "):
-                diff_lines.append((" ", line[1:].strip(), line, current_file, current_part, current_hunk_id))
+                diff_lines.append((" ", line[1:].strip(), line, current_file))
+                current_hunk_lines.append(line)
+            elif line.startswith("\\"):
                 current_hunk_lines.append(line)
             else:
-                current_hunk_lines.append(line)
+                # Line does not start with '+', '-', ' ' or '\\': ends the current hunk
+                _flush_hunk(
+                    diff_hunks, current_file, current_file_headers, current_hunk_header,
+                    current_hunk_lines, current_old_start, current_old_count,
+                    current_new_start, current_new_count,
+                )
+                current_hunk_lines = []
+                current_hunk_header = ""
+                in_hunk = False
         else:
             if current_file:
                 current_file_headers.append(line)
 
-    _flush_hunk()
+    _flush_hunk(
+        diff_hunks, current_file, current_file_headers, current_hunk_header,
+        current_hunk_lines, current_old_start, current_old_count,
+        current_new_start, current_new_count,
+    )
     return diff_lines, diff_hunks
 
 
@@ -221,14 +269,20 @@ def select_for_validation(findings: list[Finding]) -> list[Finding]:
 
 def relevant_context(finding: Finding, full_diff: str, max_chars: int = 12000) -> str:
     """
-    From the whole diff, take every hunk (from every file) that shares at least
-    two distinctive identifiers with the finding's description or location file name,
-    most overlapping first, trimmed to max_chars.
-    If nothing matches, falls back to the finding's own file diff only.
+    From the whole diff, take hunks relevant to the finding, trimmed to max_chars:
+    1. Finding's own file hunks are placed FIRST to defeat context padding attacks.
+    2. Each hunk is capped at 2,500 characters so no single hunk can starve the context.
+    3. Other hunks sharing at least two distinctive identifiers are ranked by overlap.
+    4. Loop uses continue (not break) so smaller qualifying hunks still fit.
     """
     _, diff_hunks = _parse_diff(full_diff)
+    diff_files = {h[0] for h in diff_hunks}
+    finding_file = resolve_finding_file(finding.location, diff_files)
 
-    finding_file = _norm_path(finding.location.split(":", 1)[0]) if finding.location else ""
+    # Separate own-file hunks from other hunks, capping each hunk text at 2500 characters
+    own_file_hunks: list[str] = []
+    other_hunks: list[tuple[int, int, str]] = []
+
     query_text = f"{finding.description} {finding.location}"
     query_tokens = {
         tok.lower()
@@ -236,46 +290,46 @@ def relevant_context(finding: Finding, full_diff: str, max_chars: int = 12000) -
         if tok.lower() not in STOP_WORDS
     }
 
-    scored_hunks: list[tuple[int, int, str]] = []
-    for idx, hunk in enumerate(diff_hunks):
-        hunk_text = hunk[3]
-        hunk_tokens = {
-            tok.lower()
-            for tok in re.findall(r"[a-zA-Z0-9_]{4,}", hunk_text)
-            if tok.lower() not in STOP_WORDS
-        }
-        overlap = len(query_tokens.intersection(hunk_tokens))
-        if overlap >= 2:
-            scored_hunks.append((overlap, idx, hunk_text))
+    for idx, (h_file, h_text, _, _, _, _) in enumerate(diff_hunks):
+        capped_text = h_text[:2500].rstrip() + "\n... [diff hunk trimmed for length]" if len(h_text) > 2500 else h_text
+        if finding_file and h_file == finding_file:
+            own_file_hunks.append(capped_text)
+        else:
+            hunk_tokens = {
+                tok.lower()
+                for tok in re.findall(r"[a-zA-Z0-9_]{4,}", capped_text)
+                if tok.lower() not in STOP_WORDS
+            }
+            overlap = len(query_tokens.intersection(hunk_tokens))
+            if overlap >= 2:
+                other_hunks.append((overlap, idx, capped_text))
 
-    # Sort descending by overlap, then ascending by original index (stable)
-    scored_hunks.sort(key=lambda item: (-item[0], item[1]))
+    # Sort other hunks descending by overlap (stable)
+    other_hunks.sort(key=lambda item: (-item[0], item[1]))
 
-    if scored_hunks:
-        selected_texts: list[str] = []
-        current_len = 0
-        for _, _, hunk_text in scored_hunks:
-            text = hunk_text.strip()
-            if not text:
-                continue
-            add_len = len(text) + (1 if selected_texts else 0)
-            if current_len + add_len <= max_chars:
-                selected_texts.append(text)
-                current_len += add_len
-            elif not selected_texts:
-                selected_texts.append(text[:max_chars])
-                break
-            else:
-                break
+    # Prioritize finding's own file hunks first, then qualifying other hunks
+    candidate_hunks: list[str] = list(own_file_hunks) + [h[2] for h in other_hunks]
+
+    selected_texts: list[str] = []
+    current_len = 0
+    for text in candidate_hunks:
+        text_clean = text.strip()
+        if not text_clean:
+            continue
+        add_len = len(text_clean) + (2 if selected_texts else 0)
+        if current_len + add_len <= max_chars:
+            selected_texts.append(text_clean)
+            current_len += add_len
+        elif not selected_texts:
+            selected_texts.append(text_clean[:max_chars])
+            current_len = max_chars
+        # continue (do not break) so smaller subsequent hunks can still fit
+
+    if selected_texts:
         return "\n\n".join(selected_texts)
 
-    # Fallback to finding's own file diff only
+    # Fallback to finding's file, or full_diff capped
     if finding_file:
-        file_hunk_texts = [h[3].strip() for h in diff_hunks if h[0] == finding_file and h[3].strip()]
-        if file_hunk_texts:
-            return "\n\n".join(file_hunk_texts)[:max_chars]
-
-        # Linear scan for file in raw diff if parser had no hunks
         file_lines: list[str] = []
         capturing = False
         for line in full_diff.splitlines():
@@ -316,24 +370,39 @@ Diff Context:
 
 
 def parse_validation(text: str, finding_id: str) -> Optional[Validation]:
-    """Parse validation LLM response into Validation dataclass."""
+    """
+    Parse validation LLM response into Validation dataclass.
+    Ambiguous answers (more than one VERDICT, EVIDENCE, or REASON line) fail safe and return None.
+    Supports markdown bold and bullet formatting.
+    """
     if not text or not text.strip():
         return None
 
-    verdict_m = re.search(r"(?im)^\s*VERDICT:\s*(confirmed|refuted|unsure)\b", text)
-    if not verdict_m:
-        return None
-    verdict = verdict_m.group(1).lower()
+    verdict_matches = list(re.finditer(r"(?im)^[ \t*#-]*\**VERDICT\**:[ \t*]*(confirmed|refuted|unsure)\b", text))
+    if len(verdict_matches) != 1:
+        return None  # Missing, or more than one VERDICT line -> ambiguous -> fail safe!
 
-    evidence_m = re.search(r"(?im)^\s*EVIDENCE:\s*(.*)$", text)
+    verdict = verdict_matches[0].group(1).lower()
+
+    evidence_matches = list(re.finditer(r"(?im)^[ \t*#-]*\**EVIDENCE\**:[ \t*]*(.*)$", text))
+    if len(evidence_matches) > 1:
+        return None  # More than one EVIDENCE line -> ambiguous -> fail safe!
+
     evidence = ""
-    if evidence_m:
-        raw_evidence = evidence_m.group(1).strip()
+    if len(evidence_matches) == 1:
+        raw_evidence = evidence_matches[0].group(1).strip()
+        raw_evidence = re.sub(r"\**$", "", raw_evidence).strip()
         if raw_evidence.lower() not in ("none", "<none>", "none.", "n/a", "no evidence", '""', "''"):
             evidence = raw_evidence
 
-    reason_m = re.search(r"(?im)^\s*REASON:\s*(.*)$", text)
-    reason = reason_m.group(1).strip() if reason_m else ""
+    reason_matches = list(re.finditer(r"(?im)^[ \t*#-]*\**REASON\**:[ \t*]*(.*)$", text))
+    if len(reason_matches) > 1:
+        return None  # More than one REASON line -> ambiguous -> fail safe!
+
+    reason = ""
+    if len(reason_matches) == 1:
+        raw_reason = reason_matches[0].group(1).strip()
+        reason = re.sub(r"\**$", "", raw_reason).strip()
 
     return Validation(
         finding_id=finding_id,
@@ -348,9 +417,14 @@ def _check_evidence_in_diff(
     evidence: str, finding: Finding, full_diff: str
 ) -> tuple[bool, bool]:
     """
-    Verify if evidence appears in full_diff as a whole line (+ or context, never -).
-    Also checks Condition 4: whether it comes from a different part or file than the finding.
-    Returns (verified, cross_part_verified).
+    Verify if evidence appears in full_diff as a whole line, satisfying PROVENANCE:
+    The quote must be a line the agent could not have invented, specifically:
+      (a) an unchanged context line (' ') of a file other than the finding's own file, OR
+      (b) an added (+) line in another file whose exact text was moved verbatim from a
+          removed (-) line in the finding's file (the content was moved from existing code).
+    A (+) line with no matching (-) line is never evidence.
+    A (-) line alone is never evidence.
+    Returns (evidence_verified, cross_part_verified).
     """
     if not evidence or not evidence.strip():
         return False, False
@@ -359,61 +433,45 @@ def _check_evidence_in_diff(
     if "\n" in ev_trimmed:
         return False, False
 
-    if ev_trimmed.startswith("+") and len(ev_trimmed) > 1 and (ev_trimmed[1].isspace() or ev_trimmed[1] not in "+"):
-        ev_clean = ev_trimmed[1:].strip()
-    else:
-        ev_clean = ev_trimmed
-
     diff_lines, diff_hunks = _parse_diff(full_diff)
     if not diff_lines:
         return False, False
 
-    # Parse finding location
-    finding_file = _norm_path(finding.location.split(":", 1)[0]) if finding.location else ""
+    diff_files = {h[0] for h in diff_hunks}
+    finding_file = resolve_finding_file(finding.location, diff_files)
+
+    # If finding location does not resolve to exactly one file in the diff, fail safe!
     if not finding_file:
-        # Finding has no file location: cannot safely determine cross-part/cross-file context. Fail safe!
-        has_any = any(
-            (dl[1] == ev_clean or dl[1] == ev_trimmed or dl[2].strip() == ev_trimmed) and dl[0] in ("+", " ")
-            for dl in diff_lines
-        )
-        return has_any, False
+        return False, False
 
-    finding_line: Optional[int] = None
-    if finding.location and ":" in finding.location:
-        line_m = re.search(r":(\d+)", finding.location)
-        if line_m:
-            finding_line = int(line_m.group(1))
+    matching_plus_files: set[str] = set()
+    matching_minus_files: set[str] = set()
+    matching_context_files: set[str] = set()
 
-    # Identify finding part (checking both old-side and new-side line ranges: start <= line < start + count)
-    finding_part = 1
-    for h_file, h_part, _, _, h_old_s, h_old_c, h_new_s, h_new_c in diff_hunks:
-        if h_file == finding_file:
-            if finding_line is not None:
-                in_new = h_new_s <= finding_line < h_new_s + max(1, h_new_c)
-                in_old = h_old_s <= finding_line < h_old_s + max(1, h_old_c)
-                if in_new or in_old:
-                    finding_part = h_part
-                    break
-            else:
-                finding_part = h_part
-                break
+    for line_type, line_content, _, file_path in diff_lines:
+        if line_content == ev_trimmed:
+            if line_type == "+":
+                matching_plus_files.add(file_path)
+            elif line_type == "-":
+                matching_minus_files.add(file_path)
+            elif line_type == " ":
+                matching_context_files.add(file_path)
 
-    has_valid_line = False
-    cross_part_verified = False
+    # 1. evidence_verified: must literally exist as an added or context line
+    if not matching_plus_files and not matching_context_files:
+        return False, False
 
-    for dline_type, dline_content, dline_raw, dline_file, dline_part, _ in diff_lines:
-        if dline_content == ev_clean or dline_content == ev_trimmed or dline_raw.strip() == ev_trimmed:
-            if dline_type in ("+", " "):
-                has_valid_line = True
-                if dline_file != finding_file:
-                    cross_part_verified = True
-                else:
-                    # Same file: must come from a DIFFERENT part in a multi-part diff
-                    file_parts = {h[1] for h in diff_hunks if h[0] == finding_file}
-                    if len(file_parts) > 1 and dline_part != finding_part:
-                        cross_part_verified = True
+    # 2. PROVENANCE check for cross_part_verified:
+    # (a) Unchanged context line in another file:
+    context_in_other = any(f != finding_file for f in matching_context_files)
+    # (b) Moved code: added in another file AND removed from the finding's file:
+    moved_from_finding_file = any(f != finding_file for f in matching_plus_files) and (finding_file in matching_minus_files)
 
-    return has_valid_line, cross_part_verified
+    if context_in_other or moved_from_finding_file:
+        return True, True
+
+    # If the quote matches added lines only without provenance or in the same file:
+    return True, False
 
 
 def apply_validations(
@@ -423,23 +481,29 @@ def apply_validations(
     """
     Apply validations to findings. Only blocking findings can be demoted.
     A finding is demoted when ALL 6 conditions hold:
-    1. verdict is 'refuted' and evidence_verified is true (+ or context line, never -);
+    1. verdict is 'refuted' and evidence_verified is true;
     2. quote is 12 to 160 characters after trimming;
     3. finding kind is NOT 'security';
-    4. quote comes from a different part or file than the finding (cross_part_verified);
-    5. quote is not a comment, docstring, or string literal;
+    4. quote has valid cross-file provenance (cross_part_verified is true);
+    5. quote is not a comment or docstring line;
     6. quote does not match a secret pattern.
+    Two findings with the same ID do not share one validation result: each copy
+    consumes exactly one validation result from the queue.
     Fails safe: on any error, doubt, or missing evidence, findings stay untouched.
     """
-    val_map = {v.finding_id: v for v in validations}
+    val_queue_by_id: dict[str, list[Validation]] = {}
+    for v in validations:
+        val_queue_by_id.setdefault(v.finding_id, []).append(v)
+
     updated_findings: list[Finding] = []
 
     for finding in findings:
-        if finding.id not in val_map:
+        v_list = val_queue_by_id.get(finding.id)
+        if not v_list:
             updated_findings.append(finding)
             continue
 
-        v = val_map[finding.id]
+        v = v_list.pop(0)  # consume one validation result for this finding copy
 
         # Only blocking findings can be demoted
         if not finding.blocking:
@@ -463,7 +527,7 @@ def apply_validations(
             updated_findings.append(finding)
             continue
 
-        # Condition 4: different part of diff or different file
+        # Condition 4: cross-file provenance verified
         if not v.cross_part_verified:
             updated_findings.append(finding)
             continue
@@ -505,8 +569,10 @@ def validate_findings(
     Validate at most max_validations blocking findings against full_diff using call.
     Returns (updated_findings, validations).
     Deterministic and fails safe.
+    Clamps max_validations to max(0, n).
     """
-    to_validate = select_for_validation(findings)[:max_validations]
+    effective_max = max(0, max_validations)
+    to_validate = select_for_validation(findings)[:effective_max]
     validations: list[Validation] = []
 
     for finding in to_validate:
