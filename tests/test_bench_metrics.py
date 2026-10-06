@@ -12,11 +12,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from bench.__main__ import main
-from bench.metrics import ItemList, case_outcome, compare, match_defects, summarise, to_markdown
+from bench.metrics import case_outcome, compare, match_defects, summarise, to_markdown
 from bench.runner import (
     ReviewResult,
     default_review_fn,
     estimate_case_worst_calls,
+    load_cases_from_path,
     make_dry_run_review_fn,
     run_case,
     run_corpus,
@@ -178,9 +179,9 @@ def test_case_outcome_defect_case():
     assert out["case_id"] == "c01"
     assert out["label"] == "defect"
     assert out["verdict"] == "REVISE"
-    assert out["caught_blocking"] == ["d1"]
-    assert out["caught"] == ["d1"]
-    assert out["missed"] == ["d2"]
+    assert out["caught_blocking"] == [("c01", "d1")]
+    assert out["caught"] == [("c01", "d1")]
+    assert out["missed"] == [("c01", "d2")]
     assert out["defects_total"] == 2
     assert out["false_block"] is False
     assert out["calls"] == 2
@@ -427,50 +428,50 @@ def test_summarise_no_llm_and_skipped_exclusion():
 
 def test_compare_clause_a_gained_defects():
     # Baseline caught c01, variant caught c01 and c02 (gained 1 defect)
-    base = {"caught_blocking": ["c01"], "false_blocks": 0, "calls": 10}
-    var = {"caught_blocking": ["c01", "c02"], "false_blocks": 0, "calls": 12}
+    base = {"caught_blocking": [("c01", "c01")], "false_blocks": 0, "calls": 10}
+    var = {"caught_blocking": [("c01", "c01"), ("c02", "c02")], "false_blocks": 0, "calls": 12}
     res = compare(base, var)
-    assert res["gained"] == ["c02"]
+    assert res["gained"] == [("c02", "c02")]
     assert res["lost"] == []
-    assert res["new_false_blocks"] == 0
+    assert res["new_false_blocks"] == []
     assert res["adopt"] is True
 
 
 def test_compare_clause_a_removed_false_block():
     # Baseline had a false block on n01; variant removed it
-    base = {"caught_blocking": ["c01"], "false_block_cases": ["n01"], "calls": 10}
-    var = {"caught_blocking": ["c01"], "false_block_cases": [], "calls": 10}
+    base = {"caught_blocking": [("c01", "c01")], "false_block_cases": ["n01"], "calls": 10}
+    var = {"caught_blocking": [("c01", "c01")], "false_block_cases": [], "calls": 10}
     res = compare(base, var)
     assert res["gained"] == []
     assert res["lost"] == []
-    assert res["new_false_blocks"] == 0
+    assert res["new_false_blocks"] == []
     assert res["adopt"] is True
 
 
 def test_compare_clause_a_fail_no_gain():
     # Variant caught the exact same defect, removed no false blocks
-    base = {"caught_blocking": ["c01"], "false_blocks": 0, "calls": 10}
-    var = {"caught_blocking": ["c01"], "false_blocks": 0, "calls": 10}
+    base = {"caught_blocking": [("c01", "c01")], "false_blocks": 0, "calls": 10}
+    var = {"caught_blocking": [("c01", "c01")], "false_blocks": 0, "calls": 10}
     res = compare(base, var)
     assert res["adopt"] is False
 
 
 def test_compare_clause_b_lost_defect():
     # Baseline caught c01 and c02; variant gained c03 but lost c01
-    base = {"caught_blocking": ["c01", "c02"], "false_blocks": 0, "calls": 10}
-    var = {"caught_blocking": ["c02", "c03"], "false_blocks": 0, "calls": 15}
+    base = {"caught_blocking": [("c01", "c01"), ("c02", "c02")], "false_blocks": 0, "calls": 10}
+    var = {"caught_blocking": [("c02", "c02"), ("c03", "c03")], "false_blocks": 0, "calls": 15}
     res = compare(base, var)
-    assert res["gained"] == ["c03"]
-    assert res["lost"] == ["c01"]
+    assert res["gained"] == [("c03", "c03")]
+    assert res["lost"] == [("c01", "c01")]
     assert res["adopt"] is False
 
 
 def test_compare_clause_c_new_false_block():
     # Variant gained c02, but raised a new false block on n02
-    base = {"caught_blocking": ["c01"], "false_block_cases": [], "calls": 10}
-    var = {"caught_blocking": ["c01", "c02"], "false_block_cases": ["n02"], "calls": 12}
+    base = {"caught_blocking": [("c01", "c01")], "false_block_cases": [], "calls": 10}
+    var = {"caught_blocking": [("c01", "c01"), ("c02", "c02")], "false_block_cases": ["n02"], "calls": 12}
     res = compare(base, var)
-    assert res["gained"] == ["c02"]
+    assert res["gained"] == [("c02", "c02")]
     assert res["new_false_blocks"] == ["n02"]
     assert res["adopt"] is False
 
@@ -485,29 +486,22 @@ def test_compare_clause_d_call_ratio_over_2():
     assert res_std["call_ratio"] == 2.5
     assert res_std["adopt"] is False
 
-    # Under opt-in-by-design (the panel), clause (d) is not applied!
+    # Under opt-in-by-design (the panel), adopt is ALWAYS False and recommendation is reported
     res_opt = compare(base, var, opt_in_by_design=True)
     assert res_opt["call_ratio"] == 2.5
-    assert res_opt["adopt"] is True
-    # Extra calls: 25 - 10 = 15; recall gained: 1.0 - 0.5 = 0.5; per call = 0.5 / 15
+    assert res_opt["adopt"] is False
+    assert "keep as opt-in" in res_opt["recommendation"]
     assert "recall_gained_per_extra_call" in res_opt
     assert pytest.approx(res_opt["recall_gained_per_extra_call"], 0.001) == 0.5 / 15
 
 
-def test_item_list_comparison():
-    items = ItemList(["a", "b"])
-    assert items == ["a", "b"]
-    assert items == 2
-    assert len(items) == 2
-    assert bool(items) is True
-
-    empty = ItemList()
-    assert empty == []
-    assert empty == 0
-    assert len(empty) == 0
-    assert not empty
-
-
+def test_compare_returns_plain_lists():
+    base = {"caught_blocking": ["c01"], "calls": 10}
+    var = {"caught_blocking": ["c01", "c02"], "calls": 10}
+    res = compare(base, var)
+    assert type(res["gained"]) is list
+    assert type(res["lost"]) is list
+    assert type(res["new_false_blocks"]) is list
 # ============================================================================
 # Group 5: run_corpus tests
 # ============================================================================
@@ -518,8 +512,11 @@ def test_estimate_case_worst_calls():
     assert estimate_case_worst_calls("diff --git a/x b/x", repeats=1) == 2
     # Small diff with 3 repeats -> 6 calls
     assert estimate_case_worst_calls("diff", repeats=3) == 6
-    # Diff of 90,000 chars -> 2 parts, 1 reviewer -> 4 calls
-    assert estimate_case_worst_calls("a" * 90000, repeats=1) == 4
+    diff_2files = (
+        "diff --git a/f1.py b/f1.py\n--- a/f1.py\n+++ b/f1.py\n@@ -1,1 +1,1 @@\n" + ("+x\n" * 15000) +
+        "diff --git a/f2.py b/f2.py\n--- a/f2.py\n+++ b/f2.py\n@@ -1,1 +1,1 @@\n" + ("+x\n" * 15000)
+    )
+    assert estimate_case_worst_calls(diff_2files, repeats=1) == 4
     # With validate_findings=True -> +5 calls
     assert estimate_case_worst_calls("diff", variant={"validate_findings": True}, repeats=1) == 7
 
@@ -645,7 +642,7 @@ def test_cli_smoke_compare_and_report(tmp_path: Path, capsys: pytest.CaptureFixt
     assert cmp_out.exists()
     cmp_res = json.loads(cmp_out.read_text(encoding="utf-8"))
     assert cmp_res["adopt"] is True
-    assert cmp_res["gained"] == ["c02"]
+    assert cmp_res["gained"] == [["case", "c02"]]
 
     rc_rep = main(["report", str(var_file)])
     assert rc_rep == 0
@@ -820,7 +817,7 @@ def test_internal_metrics_helpers():
             {"case_id": "n1", "caught_blocking": [], "false_block": True},
         ]
     }
-    assert _extract_caught_defects(summary) == {"d1"}
+    assert _extract_caught_defects(summary) == {("c1", "d1")}
     assert _extract_false_block_cases(summary) == {"n1"}
 
 
@@ -854,9 +851,9 @@ def test_summarise_per_case_missed_defects():
             "case_id": "c1",
             "label": "defect",
             "verdict": "REVISE",
-            "caught_blocking": ["d1"],
-            "caught": ["d1"],
-            "missed": ["d2"],
+            "caught_blocking": [("c1", "d1")],
+            "caught": [("c1", "d1")],
+            "missed": [("c1", "d2")],
             "defects_total": 2,
             "calls": 1,
             "chars_sent": 50,
@@ -866,8 +863,8 @@ def test_summarise_per_case_missed_defects():
     ]
     s = summarise(outcomes)
     row = s["per_case_rows"][0]
-    assert row["missed"] == ["d2"]
-    assert row["caught_blocking"] == ["d1"]
+    assert row["missed"] == [("c1", "d2")]
+    assert row["caught_blocking"] == [("c1", "d1")]
 
 
 def test_compare_with_empty_caught_blocking_lists():
@@ -878,3 +875,298 @@ def test_compare_with_empty_caught_blocking_lists():
     assert res["adopt"] is False
     assert res["gained"] == []
     assert res["lost"] == []
+
+
+def test_compare_critical_lost_defect_across_cases():
+    """Critical 1: Baseline catching c03 only in c03 and variant catching only in m02 must not adopt."""
+    base = {
+        "per_case_rows": [
+            {
+                "case_id": "c03",
+                "label": "defect",
+                "verdict": "REVISE",
+                "caught_blocking": [("c03", "c03")],
+                "no_llm": False,
+                "skipped": False,
+            },
+            {
+                "case_id": "m02",
+                "label": "defect",
+                "verdict": "APPROVED",
+                "caught_blocking": [],
+                "no_llm": False,
+                "skipped": False,
+            },
+        ],
+        "calls": 10,
+    }
+    var = {
+        "per_case_rows": [
+            {
+                "case_id": "c03",
+                "label": "defect",
+                "verdict": "APPROVED",
+                "caught_blocking": [],
+                "no_llm": False,
+                "skipped": False,
+            },
+            {
+                "case_id": "m02",
+                "label": "defect",
+                "verdict": "REVISE",
+                "caught_blocking": [("m02", "c03")],
+                "no_llm": False,
+                "skipped": False,
+            },
+        ],
+        "calls": 10,
+    }
+    res = compare(base, var)
+    assert ("c03", "c03") in res["lost"]
+    assert ("m02", "c03") in res["gained"]
+    assert res["adopt"] is False
+
+
+def test_budget_overshoot_3x41k():
+    """Critical 2: 3 files of ~41k chars estimate 6 calls, and max_calls=4 stops without exceeding 4."""
+    content_41k = ("+x" * 20500) + "\n"
+    diff_3x41k = (
+        "diff --git a/f1.py b/f1.py\n--- a/f1.py\n+++ b/f1.py\n@@ -1,1 +1,1 @@\n" + content_41k +
+        "diff --git a/f2.py b/f2.py\n--- a/f2.py\n+++ b/f2.py\n@@ -1,1 +1,1 @@\n" + content_41k +
+        "diff --git a/f3.py b/f3.py\n--- a/f3.py\n+++ b/f3.py\n@@ -1,1 +1,1 @@\n" + content_41k
+    )
+    est = estimate_case_worst_calls(diff_3x41k, variant={"reviewers": 1}, repeats=1)
+    assert est == 6
+
+    case = {"id": "c_large", "label": "defect", "diff": diff_3x41k, "defects": []}
+    calls_made = 0
+
+    def counting_mock(c, variant=None, **kwargs):
+        nonlocal calls_made
+        b = kwargs.get("budget_remaining") or (variant or {}).get("_budget_remaining")
+        if b is not None and calls_made >= b:
+            from bench.runner import BudgetExceeded
+
+            raise BudgetExceeded("Budget exceeded")
+        calls_made += 1
+        return ReviewResult(verdict="APPROVED", calls=1)
+
+    s1 = run_corpus([case], counting_mock, max_calls=4)
+    assert s1["skipped_count"] == 1
+    assert s1["calls"] == 0
+
+    from bench.runner import BudgetExceeded
+
+    calls_made = 0
+    with pytest.raises(BudgetExceeded):
+        for _ in range(10):
+            counting_mock(case, budget_remaining=4)
+    assert calls_made == 4
+
+    # Mid-case BudgetExceeded captures calls already made in summary totals and budget_remaining
+    def mid_review_mock(c, variant=None, **kwargs):
+        from bench.runner import BudgetExceeded
+
+        raise BudgetExceeded("Blown mid-case", calls=4, chars_sent=400)
+
+    case_small = {"id": "c_small", "label": "defect", "diff": "diff", "defects": []}
+    s2 = run_corpus([case_small], mid_review_mock, max_calls=10)
+    assert s2["skipped_count"] == 1
+    assert s2["calls"] == 4
+    assert s2["chars_sent"] == 400
+    assert s2["budget_remaining"] == 6
+
+    # Later repeat raises BudgetExceeded: earlier repeat's calls are preserved
+    rep_counter = 0
+
+    def multi_rep_mock(c, variant=None, **kwargs):
+        nonlocal rep_counter
+        curr = rep_counter
+        rep_counter += 1
+        if curr == 0:
+            return ReviewResult(verdict="APPROVED", calls=2, chars_sent=200)
+        from bench.runner import BudgetExceeded
+
+        raise BudgetExceeded("Exceeded on repeat 1", calls=1, chars_sent=100)
+
+    s3 = run_corpus([case_small], multi_rep_mock, repeats=3, max_calls=10)
+    assert s3["calls"] == 3  # 2 from repeat 0 + 1 from repeat 1
+    assert s3["chars_sent"] == 300
+    assert s3["budget_remaining"] == 7  # 10 - 3
+def test_compare_exclusions():
+    """High 3: no-llm, unlabelled, and skipped cases must not leak into compare."""
+    # 1) no-llm defect case does not count as gained
+    base = {
+        "per_case_rows": [
+            {"case_id": "c1", "label": "defect", "verdict": "no-llm", "no_llm": True, "caught_blocking": []}
+        ],
+        "calls": 0,
+    }
+    var = {
+        "per_case_rows": [
+            {"case_id": "c1", "label": "defect", "verdict": "REVISE", "no_llm": False, "caught_blocking": [("c1", "d1")]}
+        ],
+        "calls": 2,
+    }
+    res = compare(base, var)
+    assert res["gained"] == []
+
+    # 2) unlabelled case marked REVISE does not count as false block
+    base2 = {
+        "per_case_rows": [
+            {"case_id": "u1", "label": "unlabelled", "verdict": "APPROVED", "false_block": False}
+        ],
+        "calls": 1,
+    }
+    var2 = {
+        "per_case_rows": [
+            {"case_id": "u1", "label": "unlabelled", "verdict": "REVISE", "false_block": True}
+        ],
+        "calls": 1,
+    }
+    res2 = compare(base2, var2)
+    assert res2["new_false_blocks"] == []
+
+    # 3) baseline case skipped for budget does not turn variant catch into gained
+    base3 = {
+        "per_case_rows": [
+            {"case_id": "c2", "label": "defect", "verdict": "skipped (budget)", "skipped": True, "caught_blocking": []}
+        ],
+        "calls": 0,
+    }
+    var3 = {
+        "per_case_rows": [
+            {"case_id": "c2", "label": "defect", "verdict": "REVISE", "skipped": False, "caught_blocking": [("c2", "d2")]}
+        ],
+        "calls": 2,
+    }
+    res3 = compare(base3, var3)
+    assert res3["gained"] == []
+
+
+def test_cli_max_calls_required_for_real_runs(tmp_path: Path):
+    """High 4: --max-calls is required when not in dry-run mode."""
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+    (cases_dir / "c1.json").write_text(json.dumps({"id": "c1", "label": "clean"}), encoding="utf-8")
+    rc = main(["run", "--cases", str(cases_dir)])
+    assert rc == 2
+
+
+def test_verdict_enum_value_and_clean_false_block():
+    """Medium 5: Verdict enum value stored as string and clean REVISE is false block."""
+    from guard.core.llm_reviewer import ReviewVerdict
+
+    case = {"id": "n01", "label": "clean", "defects": []}
+    out = case_outcome(case, verdict=ReviewVerdict.REVISE, findings=[])
+    assert out["verdict"] == "REVISE"
+    assert out["false_block"] is True
+
+
+def test_variant_validation():
+    """Medium 6: Validate reviewers in 1..5."""
+    from bench.runner import validate_variant
+
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": 0})
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": 6})
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": -1})
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": 1.5})
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": True})
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": "1.5"})
+    from decimal import Decimal
+
+    with pytest.raises(ValueError, match="reviewers"):
+        validate_variant({"reviewers": Decimal("1.5")})
+    assert validate_variant({"reviewers": 3})["reviewers"] == 3
+
+
+def test_cli_missing_files_usage_error(tmp_path: Path):
+    """Low 8: Missing files in compare/report exit with code 2."""
+    rc1 = main(["compare", str(tmp_path / "no_base.json"), str(tmp_path / "no_var.json")])
+    assert rc1 == 2
+    rc2 = main(["report", str(tmp_path / "no_res.json")])
+    assert rc2 == 2
+
+
+def test_location_matching_rules():
+    """Low 9: Location matching with basename ambiguity, directory suffix, and Windows paths."""
+    # Bare events.py with 1 file in diff matches
+    defects = [{"id": "d1", "file": "sub/events.py", "keywords": ["leak"]}]
+    findings = [{"location": "events.py:10", "description": "leak found", "blocking": True}]
+    res1 = match_defects(findings, defects, case_files={"sub/events.py"})
+    assert res1["caught"] == ["d1"]
+
+    # Bare events.py with 2 files in diff does NOT match (ambiguous)
+    res2 = match_defects(findings, defects, case_files={"sub/events.py", "other/events.py"})
+    assert res2["caught"] == []
+
+    # Directory part: must equal or be suffix on / boundary
+    findings_dir = [{"location": "sub/events.py:10", "description": "leak found", "blocking": True}]
+    res3 = match_defects(findings_dir, defects, case_files={"sub/events.py", "other/events.py"})
+    assert res3["caught"] == ["d1"]
+
+    findings_wrong_dir = [{"location": "wrong/events.py:10", "description": "leak found", "blocking": True}]
+    res4 = match_defects(findings_wrong_dir, defects, case_files={"sub/events.py", "other/events.py"})
+    assert res4["caught"] == []
+
+    # Windows drive path C:\repo\x.py:3 must parse as file C:\repo\x.py
+    defects_win = [{"id": "d2", "file": "repo/x.py", "keywords": ["leak"]}]
+    findings_win = [{"location": "C:\\repo\\x.py:3", "description": "leak found", "blocking": True}]
+    res5 = match_defects(findings_win, defects_win, case_files={"repo/x.py"})
+    assert res5["caught"] == ["d2"]
+
+
+def test_corrupt_case_file_marked_invalid(tmp_path: Path):
+    """Low 10: Corrupt case file appears as invalid in result."""
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+    (cases_dir / "good.json").write_text(json.dumps({"id": "good", "label": "clean"}), encoding="utf-8")
+    (cases_dir / "bad.json").write_text("{corrupt json content...", encoding="utf-8")
+    cases = load_cases_from_path(cases_dir)
+    assert any(c.get("label") == "invalid" and c.get("id") == "bad" for c in cases)
+    s = run_corpus(cases, make_dry_run_review_fn(), repeats=1, max_calls=10)
+    assert s["invalid_count"] == 1
+    assert any(r.get("label") == "invalid" and r.get("case_id") == "bad" for r in s["per_case_rows"])
+
+
+def test_real_reviewer_call_llm_path(monkeypatch: pytest.MonkeyPatch):
+    """Low 12: Exercise real reviewer's call path with scripted fake at guard.core.llm_reviewer.call_llm."""
+    import guard.core.llm_reviewer as reviewer_mod
+    from guard.core.config import GuardConfig, LLMConfig, LLMProtocol
+
+    dummy_key = "".join(["m", "o", "c", "k"])
+    cfg = GuardConfig(
+        llm=LLMConfig(
+            protocol=LLMProtocol.OPENAI,
+            base_url="https://api.mock.test/v1",
+            api_key=dummy_key,
+            model="mock-model",
+        )
+    )
+    monkeypatch.setattr("guard.core.config.load_config", lambda *args, **kwargs: cfg)
+
+    call_llm_invoked = False
+
+    def fake_call_llm(*args, **kwargs):
+        nonlocal call_llm_invoked
+        call_llm_invoked = True
+        return "SCORE: 9.0\nVERDICT: APPROVED\nSUMMARY: Passed\nFINDINGS:\nnone\n"
+
+    monkeypatch.setattr(reviewer_mod, "call_llm", fake_call_llm)
+
+    case = {
+        "id": "c_real",
+        "prompt": "Test prompt",
+        "domain": "backend",
+        "diff": "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    }
+    res = default_review_fn(case)
+    assert call_llm_invoked is True
+    assert res.verdict == "APPROVED"
+    assert res.calls == 1

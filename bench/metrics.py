@@ -6,18 +6,49 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Set
 
-
-class ItemList(list):
-    """A list that also compares equal to its length when compared to an int."""
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, int):
-            return len(self) == other
-        return super().__eq__(other)
+# For backwards compatibility with callers importing ItemList
+ItemList = list
 
 
 def _normalize_path(path: str) -> str:
     return path.replace("\\", "/").strip().lower()
+
+
+def _extract_location_file(location: str) -> str:
+    """Extract file path from finding location, handling Windows drive letters and line numbers."""
+    loc = location.strip()
+    if not loc:
+        return ""
+    # Windows drive letter e.g. C:\repo\x.py:3 or C:/repo/x.py:3
+    if len(loc) >= 2 and loc[1] == ":" and loc[0].isalpha():
+        drive = loc[:2]
+        rest = loc[2:]
+        if ":" in rest:
+            file_part, _ = rest.rsplit(":", 1)
+            return drive + file_part
+        return loc
+    # Standard path:line
+    if ":" in loc:
+        file_part, _ = loc.rsplit(":", 1)
+        return file_part
+    return loc
+
+
+def _extract_diff_files(raw_diff: str) -> set[str]:
+    """Extract touched target file paths from a unified diff."""
+    files: set[str] = set()
+    if not raw_diff:
+        return files
+    for line in raw_diff.splitlines():
+        if line.startswith("diff --git "):
+            parts = line[len("diff --git ") :].split(" ")
+            if len(parts) >= 2:
+                b_part = parts[-1].strip()
+                if b_part.startswith("b/"):
+                    files.add(b_part[2:].strip('"'))
+                elif b_part.startswith('"b/'):
+                    files.add(b_part[3:].rstrip('"'))
+    return files
 
 
 def _path_suffix_match(p1: str, p2: str) -> bool:
@@ -33,11 +64,41 @@ def _path_suffix_match(p1: str, p2: str) -> bool:
     return False
 
 
+def _matches_location(finding_loc: str, defect_file: str, case_files: Optional[set[str]] = None) -> bool:
+    """
+    Match finding location to defect file.
+    A location with no directory part matches only when exactly one file of the case's diff
+    has that basename; with a directory part it must equal the defect path or be a suffix on a '/' boundary.
+    """
+    f_file = _normalize_path(_extract_location_file(finding_loc))
+    d_file = _normalize_path(defect_file)
+    if not f_file or not d_file:
+        return False
+
+    has_dir = "/" in f_file
+    if not has_dir:
+        # Bare basename (e.g. events.py)
+        if case_files:
+            matching = [
+                cf for cf in case_files
+                if _normalize_path(cf) == f_file or _normalize_path(cf).endswith("/" + f_file)
+            ]
+            if len(matching) == 1:
+                norm_match = _normalize_path(matching[0])
+                return norm_match == d_file or norm_match.endswith("/" + d_file) or d_file.endswith("/" + norm_match)
+            return False
+        d_base = d_file.rsplit("/", 1)[-1]
+        return d_base == f_file
+    else:
+        # Directory part present: must equal or be a suffix on '/' boundary
+        return _path_suffix_match(f_file, d_file)
+
 def _get_finding_id(f: dict) -> str:
     if f.get("id"):
         return str(f["id"])
     try:
         from guard.core.findings import finding_id
+
         kind = str(f.get("kind", "other"))
         loc = str(f.get("location", ""))
         desc = str(f.get("description", ""))
@@ -46,7 +107,12 @@ def _get_finding_id(f: dict) -> str:
         return str(f.get("location", "unknown"))
 
 
-def match_defects(findings: list[dict], defects: list[dict]) -> dict:
+def match_defects(
+    findings: list[dict],
+    defects: list[dict],
+    *,
+    case_files: Optional[set[str]] = None,
+) -> dict:
     """
     Match findings to known defects.
 
@@ -68,10 +134,9 @@ def match_defects(findings: list[dict], defects: list[dict]) -> dict:
         matching_findings = []
         for idx, f in enumerate(findings):
             f_loc = str(f.get("location", ""))
-            f_file = f_loc.split(":", 1)[0].strip() if ":" in f_loc else f_loc.strip()
             desc = str(f.get("description", "")).lower()
 
-            if _path_suffix_match(f_file, d_file) and keywords and any(kw in desc for kw in keywords):
+            if _matches_location(f_loc, d_file, case_files) and keywords and any(kw in desc for kw in keywords):
                 matching_findings.append(f)
                 matched_finding_indices.add(idx)
 
@@ -100,7 +165,7 @@ def match_defects(findings: list[dict], defects: list[dict]) -> dict:
 
 def case_outcome(
     case: dict | Any,
-    verdict: str,
+    verdict: Any,
     findings: list[dict],
     *,
     calls: int = 0,
@@ -120,15 +185,22 @@ def case_outcome(
     raw_defects = case.get("defects", []) if isinstance(case, dict) else getattr(case, "defects", [])
     defects = list(raw_defects) if raw_defects else []
 
-    no_llm = verdict == "no-llm" or bool(llm_error)
+    # Store verdict string value (from enum or str)
+    verdict_str = verdict.value if hasattr(verdict, "value") else str(verdict)
+    no_llm = verdict_str == "no-llm" or bool(llm_error)
     blocking_finding_ids = [_get_finding_id(f) for f in findings if f.get("blocking", False)]
     advisory_count = sum(1 for f in findings if not f.get("blocking", False))
     blocking_count = sum(1 for f in findings if f.get("blocking", False))
 
+    diff_text = case.get("diff", "") if isinstance(case, dict) else getattr(case, "diff", "")
+    case_files = _extract_diff_files(diff_text)
+    if not case_files and defects:
+        case_files = {str(d.get("file", "")) for d in defects if d.get("file")}
+
     outcome: dict = {
         "case_id": case_id,
         "label": label,
-        "verdict": verdict,
+        "verdict": verdict_str,
         "no_llm": no_llm,
         "llm_error": llm_error,
         "calls": calls,
@@ -137,23 +209,26 @@ def case_outcome(
         "blocking_count": blocking_count,
         "advisory_count": advisory_count,
         "blocking_finding_ids": blocking_finding_ids,
+        "invalid": (label == "invalid" or verdict_str == "invalid"),
     }
 
     if label == "defect":
-        matched = match_defects(findings, defects)
+        matched = match_defects(findings, defects, case_files=case_files)
+        # Key defects by (case_id, defect_id) tuples
         outcome.update(
             {
-                "caught_blocking": matched["caught_blocking"],
-                "caught_advisory": matched["caught_advisory"],
-                "caught": matched["caught"],
-                "missed": matched["missed"],
+                "caught_blocking": [(case_id, d_id) for d_id in matched["caught_blocking"]],
+                "caught_advisory": [(case_id, d_id) for d_id in matched["caught_advisory"]],
+                "caught": [(case_id, d_id) for d_id in matched["caught"]],
+                "missed": [(case_id, d_id) for d_id in matched["missed"]],
                 "extra_blocking": matched["extra_blocking"],
                 "defects_total": len(defects),
                 "false_block": False,
             }
         )
-    else:  # clean, unlabelled, approximate
-        is_false_block = verdict == "REVISE" or bool(blocking_finding_ids)
+    else:  # clean, unlabelled, approximate, invalid
+        # Clean-case false block is REVISE or any blocking finding
+        is_false_block = (verdict_str == "REVISE") or bool(blocking_finding_ids)
         outcome.update(
             {
                 "caught_blocking": [],
@@ -188,6 +263,7 @@ def summarise(outcomes: list[dict]) -> dict:
     false_blocks = 0
     no_llm_count = 0
     skipped_count = 0
+    invalid_count = 0
     total_calls = 0
     total_chars = 0
     total_seconds = 0.0
@@ -196,16 +272,18 @@ def summarise(outcomes: list[dict]) -> dict:
     case_stabilities: list[float] = []
 
     for cid, runs in by_case.items():
-        if all(r.get("skipped") or r.get("verdict") == "skipped (budget)" for r in runs):
-            skipped_count += 1
-            first = runs[0]
+        first = runs[0]
+        label = first.get("label", "unlabelled")
+
+        if all(r.get("invalid") or r.get("verdict") == "invalid" or r.get("label") == "invalid" for r in runs):
+            invalid_count += 1
             per_case_rows.append(
                 {
                     "case_id": cid,
-                    "label": first.get("label", "unlabelled"),
-                    "verdict": "skipped (budget)",
+                    "label": "invalid",
+                    "verdict": "invalid",
                     "repeats": len(runs),
-                    "defects": first.get("defects_total", 0),
+                    "defects": 0,
                     "caught_blocking": [],
                     "caught_any": [],
                     "missed": [],
@@ -215,7 +293,38 @@ def summarise(outcomes: list[dict]) -> dict:
                     "chars_sent": 0,
                     "seconds": 0.0,
                     "no_llm": False,
+                    "skipped": False,
+                    "invalid": True,
+                }
+            )
+            continue
+
+        if all(r.get("skipped") or r.get("verdict") == "skipped (budget)" for r in runs):
+            skipped_count += 1
+            case_calls = sum(r.get("calls", 0) for r in runs)
+            case_chars = sum(r.get("chars_sent", 0) for r in runs)
+            case_seconds = sum(r.get("seconds", 0.0) for r in runs)
+            total_calls += case_calls
+            total_chars += case_chars
+            total_seconds += case_seconds
+            per_case_rows.append(
+                {
+                    "case_id": cid,
+                    "label": label,
+                    "verdict": "skipped (budget)",
+                    "repeats": len(runs),
+                    "defects": first.get("defects_total", 0),
+                    "caught_blocking": [],
+                    "caught_any": [],
+                    "missed": [],
+                    "false_block": False,
+                    "stability": 1.0,
+                    "calls": case_calls,
+                    "chars_sent": case_chars,
+                    "seconds": round(case_seconds, 2),
+                    "no_llm": False,
                     "skipped": True,
+                    "invalid": False,
                 }
             )
             continue
@@ -232,17 +341,20 @@ def summarise(outcomes: list[dict]) -> dict:
         for r in runs:
             sig = (
                 r.get("verdict"),
-                frozenset(r.get("caught", [])),
+                frozenset(
+                    tuple(x) if isinstance(x, (list, tuple)) else (cid, str(x))
+                    for x in r.get("caught", [])
+                ),
                 frozenset(r.get("blocking_finding_ids", [])),
             )
             sig_counts[sig] = sig_counts.get(sig, 0) + 1
         case_stability = max(sig_counts.values()) / len(runs) if runs else 1.0
         case_stabilities.append(case_stability)
 
-        first = runs[0]
-        label = first.get("label", "unlabelled")
-
         for r in runs:
+            if r.get("invalid") or r.get("verdict") == "invalid":
+                invalid_count += 1
+                continue
             if r.get("no_llm"):
                 no_llm_count += 1
                 continue
@@ -259,10 +371,27 @@ def summarise(outcomes: list[dict]) -> dict:
                 if r.get("false_block"):
                     false_blocks += 1
 
-        all_caught_blocking = sorted(set().union(*(r.get("caught_blocking", []) for r in runs)))
-        all_caught_any = sorted(set().union(*(r.get("caught", []) for r in runs)))
-        missed_sets = [set(r.get("missed", [])) for r in runs]
+        all_caught_blocking = sorted(
+            {
+                tuple(x) if isinstance(x, (list, tuple)) else (cid, str(x))
+                for r in runs for x in r.get("caught_blocking", [])
+            }
+        )
+        all_caught_any = sorted(
+            {
+                tuple(x) if isinstance(x, (list, tuple)) else (cid, str(x))
+                for r in runs for x in r.get("caught", [])
+            }
+        )
+        missed_sets = [
+            {
+                tuple(x) if isinstance(x, (list, tuple)) else (cid, str(x))
+                for x in r.get("missed", [])
+            }
+            for r in runs
+        ]
         all_missed = sorted(set.intersection(*missed_sets)) if missed_sets else []
+
         any_false_block = any(r.get("false_block", False) for r in runs)
         verdicts = [r.get("verdict", "") for r in runs]
         verdict_summary = verdicts[0] if len(set(verdicts)) == 1 else ", ".join(verdicts)
@@ -284,6 +413,7 @@ def summarise(outcomes: list[dict]) -> dict:
                 "seconds": round(case_seconds, 2),
                 "no_llm": any(r.get("no_llm", False) for r in runs),
                 "skipped": False,
+                "invalid": False,
             }
         )
 
@@ -301,6 +431,7 @@ def summarise(outcomes: list[dict]) -> dict:
         "clean_total": clean_total,
         "no_llm_count": no_llm_count,
         "skipped_count": skipped_count,
+        "invalid_count": invalid_count,
         "calls": total_calls,
         "chars_sent": total_chars,
         "seconds": round(total_seconds, 2),
@@ -310,19 +441,39 @@ def summarise(outcomes: list[dict]) -> dict:
     }
 
 
-def _extract_caught_defects(s: dict) -> Set[str]:
+def _normalize_case_defect(item: Any, default_case_id: str) -> tuple[str, str]:
+    """Normalize defect representation to a (case_id, defect_id) tuple."""
+    if isinstance(item, (tuple, list)) and len(item) == 2:
+        return (str(item[0]), str(item[1]))
+    if isinstance(item, str):
+        if ":" in item:
+            parts = item.split(":", 1)
+            return (parts[0], parts[1])
+        return (default_case_id, item)
+    return (default_case_id, str(item))
+
+
+def _extract_caught_defects(s: dict) -> Set[tuple[str, str]]:
+    """Extract set of (case_id, defect_id) tuples from summary or raw dict."""
+    res: Set[tuple[str, str]] = set()
+    rows = s.get("per_case_rows", s.get("rows", []))
+    if rows:
+        for row in rows:
+            cid = str(row.get("case_id", ""))
+            for key in ("caught_blocking", "caught_any", "caught"):
+                val = row.get(key)
+                if isinstance(val, (set, list, tuple)):
+                    for item in val:
+                        res.add(_normalize_case_defect(item, cid))
+                    break
+        return res
+
     for key in ("caught_blocking", "caught_defects", "caught"):
         val = s.get(key)
         if isinstance(val, (set, list, tuple)):
-            return {str(x) for x in val}
-    rows = s.get("per_case_rows", s.get("rows", []))
-    res: Set[str] = set()
-    for row in rows:
-        for key in ("caught_blocking", "caught_any", "caught"):
-            val = row.get(key)
-            if isinstance(val, (set, list, tuple)):
-                res.update(str(x) for x in val)
-                break
+            for item in val:
+                res.add(_normalize_case_defect(item, "case"))
+            return res
     return res
 
 
@@ -349,45 +500,90 @@ def _to_int(val: Any) -> int:
         return 0
 
 
+def _is_valid_llm_case_row(row: dict) -> bool:
+    """True if row is labelled (defect/clean) and ran with an LLM (not no-llm, skipped, or invalid)."""
+    label = str(row.get("label", "")).lower()
+    if label not in ("defect", "clean"):
+        return False
+    if row.get("no_llm") or row.get("verdict") == "no-llm" or bool(row.get("llm_error")):
+        return False
+    if row.get("skipped") or row.get("verdict") == "skipped (budget)":
+        return False
+    if row.get("invalid") or row.get("verdict") == "invalid":
+        return False
+    return True
+
+
 def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) -> dict:
     """
     Judge variant against baseline using the decision rule in plan.md.
 
     gained, lost, new_false_blocks, call_ratio, adopt: bool.
-    call_ratio divides by max(baseline calls, 1), never by zero.
-    With opt_in_by_design (the panel) clause (d) is not applied;
-    the result reports recall gained per extra call instead.
+    Only considers cases that are labelled AND ran with an LLM in BOTH runs.
+    Keyed by (case_id, defect_id).
+    With opt_in_by_design (the panel), adopt is ALWAYS False and recommendation is reported.
     """
     baseline_calls = _to_int(baseline.get("calls", 0))
     variant_calls = _to_int(variant.get("calls", 0))
     call_ratio = variant_calls / max(baseline_calls, 1)
 
-    b_caught_set = _extract_caught_defects(baseline)
-    v_caught_set = _extract_caught_defects(variant)
+    b_rows_list = baseline.get("per_case_rows", baseline.get("rows", []))
+    v_rows_list = variant.get("per_case_rows", variant.get("rows", []))
+    b_rows = {str(r.get("case_id", "")): r for r in b_rows_list}
+    v_rows = {str(r.get("case_id", "")): r for r in v_rows_list}
 
-    if b_caught_set or v_caught_set:
+    if b_rows and v_rows:
+        # Consider ONLY cases that are labelled AND ran with an LLM in BOTH runs
+        valid_cids = {
+            cid for cid in b_rows
+            if cid in v_rows
+            and _is_valid_llm_case_row(b_rows[cid])
+            and _is_valid_llm_case_row(v_rows[cid])
+        }
+
+        b_caught: Set[tuple[str, str]] = set()
+        v_caught: Set[tuple[str, str]] = set()
+        b_fb_cases: Set[str] = set()
+        v_fb_cases: Set[str] = set()
+
+        for cid in valid_cids:
+            b_r = b_rows[cid]
+            v_r = v_rows[cid]
+            lbl = b_r.get("label")
+            if lbl == "defect":
+                for item in b_r.get("caught_blocking", b_r.get("caught", [])):
+                    b_caught.add(_normalize_case_defect(item, cid))
+                for item in v_r.get("caught_blocking", v_r.get("caught", [])):
+                    v_caught.add(_normalize_case_defect(item, cid))
+            elif lbl == "clean":
+                if b_r.get("false_block"):
+                    b_fb_cases.add(cid)
+                if v_r.get("false_block"):
+                    v_fb_cases.add(cid)
+
+        gained = sorted(v_caught - b_caught)
+        lost = sorted(b_caught - v_caught)
+        new_fb = sorted(v_fb_cases - b_fb_cases)
+        fb_removed = len(b_fb_cases - v_fb_cases)
+    else:
+        # Fallback for simple crafted dicts without per-case rows (e.g. unit tests):
+        b_caught_set = _extract_caught_defects(baseline)
+        v_caught_set = _extract_caught_defects(variant)
         gained = sorted(v_caught_set - b_caught_set)
         lost = sorted(b_caught_set - v_caught_set)
-    else:
-        b_count = _to_int(baseline.get("caught_blocking", baseline.get("caught", 0)))
-        v_count = _to_int(variant.get("caught_blocking", variant.get("caught", 0)))
-        gained_count = max(0, v_count - b_count)
-        lost_count = max(0, b_count - v_count)
-        gained = [f"defect_{i+1}" for i in range(gained_count)]
-        lost = [f"defect_{i+1}" for i in range(lost_count)]
 
-    b_fb_set = _extract_false_block_cases(baseline)
-    v_fb_set = _extract_false_block_cases(variant)
-    b_fb_count = _to_int(baseline.get("false_blocks", len(b_fb_set)))
-    v_fb_count = _to_int(variant.get("false_blocks", len(v_fb_set)))
+        b_fb_set = _extract_false_block_cases(baseline)
+        v_fb_set = _extract_false_block_cases(variant)
+        b_fb_count = _to_int(baseline.get("false_blocks", len(b_fb_set)))
+        v_fb_count = _to_int(variant.get("false_blocks", len(v_fb_set)))
 
-    if b_fb_set or v_fb_set:
-        new_fb = sorted(v_fb_set - b_fb_set)
-        fb_removed = len(b_fb_set - v_fb_set)
-    else:
-        new_fb_count = max(0, v_fb_count - b_fb_count)
-        fb_removed = max(0, b_fb_count - v_fb_count)
-        new_fb = [f"fb_{i+1}" for i in range(new_fb_count)]
+        if b_fb_set or v_fb_set:
+            new_fb = sorted(v_fb_set - b_fb_set)
+            fb_removed = len(b_fb_set - v_fb_set)
+        else:
+            new_fb_count = max(0, v_fb_count - b_fb_count)
+            fb_removed = max(0, b_fb_count - v_fb_count)
+            new_fb = [f"fb_{i+1}" for i in range(new_fb_count)]
 
     # Decision rule:
     # (a) catches at least one more known defect or removes at least one false block
@@ -399,11 +595,6 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     # (d) costs at most 2x baseline calls (skipped if opt_in_by_design)
     clause_d = bool(call_ratio <= 2.0)
 
-    if opt_in_by_design:
-        adopt = bool(clause_a and clause_b and clause_c)
-    else:
-        adopt = bool(clause_a and clause_b and clause_c and clause_d)
-
     b_recall = float(baseline.get("recall_blocking", baseline.get("recall_any", 0.0)))
     v_recall = float(variant.get("recall_blocking", variant.get("recall_any", 0.0)))
     extra_calls = variant_calls - baseline_calls
@@ -413,12 +604,32 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     else:
         recall_gained_per_extra_call = 0.0
 
+    if opt_in_by_design:
+        # The panel is opt-in by design: adopt must ALWAYS be False
+        adopt = False
+        if clause_a and clause_b and clause_c:
+            recommendation = (
+                f"keep as opt-in (panel gained {len(gained)} defect(s) "
+                f"at {recall_gained_per_extra_call:.4f} recall/call, 0 lost, 0 new false blocks)"
+            )
+        elif not clause_a:
+            recommendation = "remove (panel showed no gain over baseline)"
+        else:
+            recommendation = (
+                f"do not adopt (panel regression: {len(lost)} lost defect(s), "
+                f"{len(new_fb)} new false block(s))"
+            )
+    else:
+        adopt = bool(clause_a and clause_b and clause_c and clause_d)
+        recommendation = "adopt (default-on)" if adopt else "do not adopt"
+
     result: dict = {
-        "gained": ItemList(gained),
-        "lost": ItemList(lost),
-        "new_false_blocks": ItemList(new_fb),
+        "gained": list(gained),
+        "lost": list(lost),
+        "new_false_blocks": list(new_fb),
         "call_ratio": round(call_ratio, 3),
         "adopt": adopt,
+        "recommendation": recommendation,
         "clause_a": clause_a,
         "clause_b": clause_b,
         "clause_c": clause_c,
@@ -428,6 +639,7 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
         result["recall_gained_per_extra_call"] = recall_gained_per_extra_call
 
     return result
+
 
 def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
     """Format benchmark summary and comparison into a Markdown report."""
@@ -452,6 +664,8 @@ def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
 
     if summary.get("skipped_count", 0) > 0:
         lines.append(f"| Skipped (Budget) | {summary.get('skipped_count', 0)} |")
+    if summary.get("invalid_count", 0) > 0:
+        lines.append(f"| Invalid Case Files | {summary.get('invalid_count', 0)} |")
 
     if compare:
         lines.extend([
@@ -465,6 +679,8 @@ def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
             f"| (d) Cost Ratio <= 2.0x | {'PASS' if compare.get('clause_d', compare.get('call_ratio', 0) <= 2.0) else 'FAIL'} | {compare.get('call_ratio', 0):.2f}x |",
             f"| **Adopt (Default-On)** | **{'YES' if compare.get('adopt') else 'NO'}** | |",
         ])
+        if "recommendation" in compare:
+            lines.append(f"| Recommendation | **{compare['recommendation']}** | |")
         if "recall_gained_per_extra_call" in compare:
             lines.append(f"| Recall Gain / Extra Call | {compare['recall_gained_per_extra_call']:.6f} | |")
 
