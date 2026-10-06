@@ -16,9 +16,9 @@
       "visible_in_diff": true,
       "summary": "`tests/test_cli_command_order.py` parses coloured help text, fails on CI where colour is on",
       "keywords": [
-        "registered",
-        "commands",
-        "rich",
+        "colored help output",
+        "expected_registered_commands",
+        "rich box",
         "ansi"
       ]
     }

@@ -46,24 +46,24 @@ REQUIRED_DEFECT_FIELDS = (
 VALID_LABELS = ("defect", "clean", "unlabelled")
 
 # Curated high-precision keywords for the benchmark defects.
-# All tokens are lowercase and distinctive to avoid inflating recall.
+# All tokens are lowercase and distinctive to describe the specific defect
+# without matching unrelated findings in the same file.
 DEFECT_KEYWORDS: dict[str, list[str]] = {
     "c01": ["approved_fingerprints", "unverified", "forged", "signature"],
-    "c01b": ["startswith", "__init__", "__tests__", "real paths"],
+    "c01b": ["startswith", "top-level", "__init__.py", "__tests__/"],
     "c01c": ["early return", "session.json", "commit detection", "skipped"],
     "c01d": ["forgery", "zero hashes", "already refused", "tampered"],
     "c02": ["fallback", "unstaged", "silent", "partial diff"],
     "c02b": ["invalidurl", "httpx", "ping probe", "unhandled"],
     "c02c": ["unexpected error", "agent cli", "escapes", "fallback"],
-    "c03": ["# [error:", "+# [error", "diff error", "startswith"],
+    "c03": ["# [error:", "+# [error", "diff error", "line-prefix check"],
     "c04": ["commands.config", "commands.invariants", "command order", "reorder"],
-    "c05": ["registered", "commands", "rich", "ansi"],
-    "c06": ["deduction_bs", "deduction_v", "10.0 -", "bit-identical"],
-    "c06b": ["sys.path.insert", "guard.__path__", "cwd", "main_module"],
-    "c07": ["argument list", "build command", "comment", "deleted"],
-    "c09": ["python.exe", "cd sub", "shlex", "session_notice"],
-    "c11": ["commandtarget", "command_targets", "commit_directories", "is_git_commit"],
-    "c11b": ["command_target", "commandtarget", "_norm_path", "test_command"],
+    "c05": ["colored help output", "expected_registered_commands", "rich box", "ansi"],
+    "c06": ["deduction", "rounding", "floating", "precision", "bit-identical"],
+    "c06b": ["sys.path.insert", "guard.__path__.insert", "unrestored path", "test_main_module"],
+    "c07": ["argument list", "build command", "dropped comment line", "shell=true"],
+    "c09": ["python.exe", "session_notice", "windows path", "launcher"],
+    "c11": ["command_targets", "wrong directory", "git aliases", "dropped commits"],
 }
 
 
@@ -177,10 +177,9 @@ def validate_case(case: dict[str, Any], repo: Path | str | None = None) -> list[
                         f"Case '{case_id}' defect '{defect_id}' keyword '{kw}' cannot be file name alone"
                     )
 
-        # Visibility validation
+        # Visibility validation: file must appear in diff when visible_in_diff is True
         visible = defect.get("visible_in_diff")
         if visible is True:
-            # File must appear in diff
             norm_file = defect_file.replace("\\", "/")
             norm_diff = diff_text.replace("\\", "/")
             if norm_file not in norm_diff:
@@ -192,7 +191,6 @@ def validate_case(case: dict[str, Any], repo: Path | str | None = None) -> list[
                     f"Case '{case_id}' defect '{defect_id}' has no matching keyword in diff"
                 )
         elif visible is False:
-            # File must exist at case's ref (git cat-file -e <ref>:<file>)
             ref = case.get("ref")
             if not ref:
                 problems.append(
@@ -257,7 +255,11 @@ def _clean_commit_body(body: str) -> str:
 
 
 def _parse_label_table(labels_content: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse defects table and clean cases table from labels markdown text."""
+    """
+    Parse defects table and clean cases table from labels markdown text.
+
+    bench/labels.md is the single source of truth for case labels.
+    """
     lines = labels_content.splitlines()
     in_clean_section = False
     defect_rows: list[dict[str, Any]] = []
@@ -314,8 +316,8 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
     """
     Read label table and build labelled benchmark cases using git show and fixtures.
 
-    Groups rows with the same commit into ONE case holding multiple defects.
-    Reads fixture files from bench/fixtures/ for fixture-based rows.
+    bench/labels.md is the single source of truth: rows in the first table become
+    defect cases, and rows in the second table become clean cases.
     """
     labels_path = Path(labels_md)
     repo_path = Path(repo)
@@ -329,11 +331,9 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
     defect_rows, clean_rows = _parse_label_table(labels_content)
 
     # Group defect rows into cases
-    # Commit -> list of rows
     grouped_defects: dict[str, list[dict[str, Any]]] = {}
     for row in defect_rows:
         ref = row["commit_ref"]
-        # Group fixtures together under "fixtures/t1-v1"
         group_key = "fixtures/t1-v1" if ref.startswith("fixtures/") else ref
         grouped_defects.setdefault(group_key, []).append(row)
 
@@ -342,67 +342,50 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
     # Build defect cases
     for group_key, rows in grouped_defects.items():
         first_row = rows[0]
-        # Base case ID is taken from the first row's case_id (e.g. c01, c02, c11)
         m = re.match(r"^([a-zA-Z]+\d+)", first_row["case_id"])
         case_id = m.group(1) if m else first_row["case_id"]
 
         defects_list: list[dict[str, Any]] = []
         named_files: list[str] = []
 
-        # Special handling for c10: in d477e26, operational facts were moved to
-        # docs/cli-reference.md rather than being lost. d477e26 was a known false
-        # block during session review (review in parts could not see content had moved).
-        # It is explicitly handled as a clean standalone case here; the multi-part
-        # movement is tested in composite m01.
-        if case_id == "c10" or group_key == "d477e26":
-            pass  # c10 will have defects_list = [] and label = "clean"
-        else:
-            for r in rows:
-                d_id = r["case_id"]
-                if d_id == "c11b":
-                    continue
-                d_kind = r["kind"]
-                d_severity = r["severity"]
-                d_text = r["defect_text"]
+        for r in rows:
+            d_id = r["case_id"]
+            d_kind = r["kind"]
+            d_severity = r["severity"]
+            d_text = r["defect_text"]
 
-                # Check for omission
-                is_omission = "OMISSION:" in d_text
-                visible = not is_omission
+            is_omission = "OMISSION:" in d_text
+            visible = not is_omission
 
-                # Extract file path from defect_text
-                file_match = re.search(r"([a-zA-Z0-9_./-]+\.(?:py|md|json|yml|yaml|txt|patch))", d_text)
-                if file_match:
-                    d_file = file_match.group(1).strip("`")
-                elif "docs:" in d_text:
-                    d_file = "README.md"
-                elif group_key == "fixtures/t1-v1":
-                    if d_id == "c11":
-                        d_file = "guard/agent/bash.py"
-                    else:
-                        d_file = "tests/test_command_target.py"
-                else:
-                    d_file = "unknown"
+            file_match = re.search(r"([a-zA-Z0-9_./-]+\.(?:py|md|json|yml|yaml|txt|patch))", d_text)
+            if file_match:
+                d_file = file_match.group(1).strip("`")
+            elif "docs:" in d_text:
+                d_file = "README.md"
+            elif group_key == "fixtures/t1-v1":
+                d_file = "guard/agent/bash.py"
+            else:
+                d_file = "unknown"
 
-                if visible and d_file != "unknown" and d_file not in named_files:
-                    named_files.append(d_file)
+            if visible and d_file != "unknown" and d_file not in named_files:
+                named_files.append(d_file)
 
-                summary = d_text
-                keywords = DEFECT_KEYWORDS.get(d_id) or _extract_fallback_keywords(d_text, d_file)
+            summary = d_text
+            keywords = DEFECT_KEYWORDS.get(d_id) or _extract_fallback_keywords(d_text, d_file)
 
-                defects_list.append(
-                    {
-                        "id": d_id,
-                        "file": d_file,
-                        "kind": d_kind,
-                        "severity": d_severity,
-                        "visible_in_diff": visible,
-                        "summary": summary,
-                        "keywords": keywords,
-                    }
-                )
+            defects_list.append(
+                {
+                    "id": d_id,
+                    "file": d_file,
+                    "kind": d_kind,
+                    "severity": d_severity,
+                    "visible_in_diff": visible,
+                    "summary": summary,
+                    "keywords": keywords,
+                }
+            )
 
         if group_key == "fixtures/t1-v1":
-            # Build from fixtures
             bash_patch_path = fixtures_dir / "t1-v1-bash.patch"
             with open(bash_patch_path, "r", encoding="utf-8") as f_bash:
                 diff_text = f_bash.read()
@@ -426,59 +409,78 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
                 }
             )
         else:
-            # Build from git commit
             commit = group_key
             sub_res = subprocess.run(
                 ["git", "log", "-1", "--format=%s", commit],
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if sub_res.returncode != 0:
                 raise RuntimeError(f"git log failed for commit '{commit}': {sub_res.stderr}")
-            subject = sub_res.stdout.strip()
+            subject = (sub_res.stdout or "").strip()
 
             body_res = subprocess.run(
                 ["git", "log", "-1", "--format=%b", commit],
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if body_res.returncode != 0:
                 raise RuntimeError(f"git log failed for commit '{commit}': {body_res.stderr}")
-            body = _clean_commit_body(body_res.stdout.strip())
+            body = _clean_commit_body((body_res.stdout or "").strip())
 
             files_res = subprocess.run(
                 ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if files_res.returncode != 0:
                 raise RuntimeError(f"git diff-tree failed for commit '{commit}': {files_res.stderr}")
-            all_changed_files = [f.strip() for f in files_res.stdout.splitlines() if f.strip()]
-            if named_files and case_id != "c10":
+            all_changed_files = [f.strip() for f in (files_res.stdout or "").splitlines() if f.strip()]
+
+            # Restrict diff to named files if specified
+            if named_files:
                 diff_cmd = ["git", "show", "--format=", commit, "--"] + named_files
-                diff_res = subprocess.run(diff_cmd, cwd=str(repo_path), capture_output=True, text=True)
+                diff_res = subprocess.run(
+                    diff_cmd,
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
                 if diff_res.returncode != 0:
                     raise RuntimeError(f"git show restricted failed for '{commit}': {diff_res.stderr}")
-                diff_text = diff_res.stdout
+                diff_text = diff_res.stdout or ""
             else:
                 diff_cmd = ["git", "show", "--format=", commit]
-                diff_res = subprocess.run(diff_cmd, cwd=str(repo_path), capture_output=True, text=True)
+                diff_res = subprocess.run(
+                    diff_cmd,
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
                 if diff_res.returncode != 0:
                     raise RuntimeError(f"git show failed for commit '{commit}': {diff_res.stderr}")
-                diff_text = diff_res.stdout
+                diff_text = diff_res.stdout or ""
 
             title = subject
-            if case_id == "c10":
-                title = f"{subject} (single-commit view; cross-part movement evaluated in m01)"
-            elif len(diff_text) > 120000 and named_files:
+            if len(diff_text) > 120000 and named_files:
                 title = f"{subject} (restricted to {', '.join(named_files)})"
 
             prompt_body = f"\n\n{body}" if body else ""
             prompt = f"{subject}{prompt_body}\n\nFiles changed: {', '.join(all_changed_files)}"
-            label = "defect" if defects_list else "clean"
+
             cases.append(
                 {
                     "id": case_id,
@@ -488,12 +490,12 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
                     "domain": "backend",
                     "diff": diff_text,
                     "ref": commit,
-                    "label": label,
+                    "label": "defect",
                     "defects": defects_list,
                 }
             )
 
-    # Build clean cases
+    # Build clean cases from clean_rows in bench/labels.md
     for r in clean_rows:
         case_id = r["case_id"]
         commit = r["commit_ref"]
@@ -503,40 +505,52 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
             cwd=str(repo_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if sub_res.returncode != 0:
             raise RuntimeError(f"git log failed for commit '{commit}': {sub_res.stderr}")
-        subject = sub_res.stdout.strip()
+        subject = (sub_res.stdout or "").strip()
 
         body_res = subprocess.run(
             ["git", "log", "-1", "--format=%b", commit],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if body_res.returncode != 0:
             raise RuntimeError(f"git log failed for commit '{commit}': {body_res.stderr}")
-        body = _clean_commit_body(body_res.stdout.strip())
+        body = _clean_commit_body((body_res.stdout or "").strip())
 
         files_res = subprocess.run(
             ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if files_res.returncode != 0:
             raise RuntimeError(f"git diff-tree failed for commit '{commit}': {files_res.stderr}")
-        all_changed_files = [f.strip() for f in files_res.stdout.splitlines() if f.strip()]
+        all_changed_files = [f.strip() for f in (files_res.stdout or "").splitlines() if f.strip()]
 
         diff_res = subprocess.run(
             ["git", "show", "--format=", commit],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if diff_res.returncode != 0:
             raise RuntimeError(f"git show failed for commit '{commit}': {diff_res.stderr}")
-        diff_text = diff_res.stdout
+        diff_text = diff_res.stdout or ""
+
+        title = subject
+        if case_id == "c10":
+            title = f"{subject} (single-commit view; cross-part movement evaluated in m01)"
 
         prompt_body = f"\n\n{body}" if body else ""
         prompt = f"{subject}{prompt_body}\n\nFiles changed: {', '.join(all_changed_files)}"
@@ -545,7 +559,7 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
             {
                 "id": case_id,
                 "source": "git",
-                "title": subject,
+                "title": title,
                 "prompt": prompt,
                 "domain": "backend",
                 "diff": diff_text,
@@ -628,10 +642,11 @@ def make_composites(
 
     The review runs diffs in parts of at most 80,000 characters. Composites
     have diff length >= min_chars so cross-part behaviour is exercised.
-    (a) m01: d477e26 docs case + 1dfb152 follow-up, content removed in one part
-        and added in another (label defect, 5 lost operational facts).
+    (a) m01: d477e26 docs case + 1dfb152 follow-up. Facts moved without loss,
+        so m01 is a false-block test and is labelled CLEAN (no defects).
     (b) m02..m04: labelled defect case placed AFTER clean filler diffs from n01..n05
-        so defect lands in part 2 or later.
+        so defect lands in part 2 or later. Filler is chosen to not overlap with
+        any defect files.
     (c) m05: same with defect FIRST.
     """
     if isinstance(cases, list):
@@ -641,58 +656,11 @@ def make_composites(
 
     composites: list[dict[str, Any]] = []
 
-    # (a) m01: c10 (d477e26) + n05 (1dfb152)
+    # (a) m01: c10 (d477e26) + n05 (1dfb152) - Clean composite (false-block test)
     c10 = case_map.get("c10")
     n05 = case_map.get("n05")
     if c10 and n05:
         m01_diff = c10["diff"].rstrip() + "\n\n" + n05["diff"].lstrip()
-        m01_defects = [
-            {
-                "id": "m01_ocr_limit",
-                "file": "docs/cli-reference.md",
-                "kind": "requirement",
-                "severity": "medium",
-                "visible_in_diff": True,
-                "summary": "OCR time limit operational fact moved across parts",
-                "keywords": ["ocr time limit", "time limit", "quota"],
-            },
-            {
-                "id": "m01_timeout",
-                "file": "docs/cli-reference.md",
-                "kind": "requirement",
-                "severity": "medium",
-                "visible_in_diff": True,
-                "summary": "llm.timeout operational fact moved across parts",
-                "keywords": ["llm.timeout", "llm timeout", "seconds"],
-            },
-            {
-                "id": "m01_concurrency",
-                "file": "docs/cli-reference.md",
-                "kind": "requirement",
-                "severity": "medium",
-                "visible_in_diff": True,
-                "summary": "ocr.concurrency operational fact moved across parts",
-                "keywords": ["ocr.concurrency", "ocr concurrency", "parallel"],
-            },
-            {
-                "id": "m01_resume",
-                "file": "docs/cli-reference.md",
-                "kind": "requirement",
-                "severity": "medium",
-                "visible_in_diff": True,
-                "summary": "--resume flag operational fact moved across parts",
-                "keywords": ["--resume", "resume flag", "resume_id"],
-            },
-            {
-                "id": "m01_background",
-                "file": "docs/cli-reference.md",
-                "kind": "requirement",
-                "severity": "medium",
-                "visible_in_diff": True,
-                "summary": "--background daemon mode operational fact moved across parts",
-                "keywords": ["--background", "background mode", "daemon"],
-            },
-        ]
         composites.append(
             {
                 "id": "m01",
@@ -702,37 +670,40 @@ def make_composites(
                 "domain": "backend",
                 "diff": m01_diff,
                 "ref": c10.get("ref"),
-                "label": "defect",
-                "defects": m01_defects,
+                "label": "clean",
+                "defects": [],
                 "source_ids": ["c10", "n05"],
                 "composite": True,
             }
         )
 
-    # (b) m02: clean filler (n01 + n02) + c03 (defect in part 2)
+    # Clean filler (n01 + n03): touches adapter_validation, commands/agent,
+    # maintenance, config, updater, installer, and task_flow.
+    # Total chars: ~92k (>= min_chars). Touches NONE of the defect files for c03, c02, or c06!
     n01 = case_map.get("n01")
-    n02 = case_map.get("n02")
+    n03 = case_map.get("n03")
+
+    # (b) m02: clean filler (n01 + n03) + c03 (defect in part 2)
     c03 = case_map.get("c03")
-    if n01 and n02 and c03:
-        m02_diff = n01["diff"].rstrip() + "\n\n" + n02["diff"].rstrip() + "\n\n" + c03["diff"].lstrip()
+    if n01 and n03 and c03:
+        m02_diff = n01["diff"].rstrip() + "\n\n" + n03["diff"].rstrip() + "\n\n" + c03["diff"].lstrip()
         composites.append(
             {
                 "id": "m02",
                 "source": "git",
-                "title": "composite: defect in part 2 after clean filler (n01 + n02 + c03)",
+                "title": "composite: defect in part 2 after clean filler (n01 + n03 + c03)",
                 "prompt": f"{c03['prompt']}\n\nBackground changes in updater and rules engine.",
                 "domain": "backend",
                 "diff": m02_diff,
                 "ref": c03.get("ref"),
                 "label": "defect",
                 "defects": [dict(d) for d in c03["defects"]],
-                "source_ids": ["n01", "n02", "c03"],
+                "source_ids": ["n01", "n03", "c03"],
                 "composite": True,
             }
         )
 
     # (b) m03: clean filler (n01 + n03) + c02 (defect in part 2)
-    n03 = case_map.get("n03")
     c02 = case_map.get("c02")
     if n01 and n03 and c02:
         m03_diff = n01["diff"].rstrip() + "\n\n" + n03["diff"].rstrip() + "\n\n" + c02["diff"].lstrip()
@@ -752,41 +723,41 @@ def make_composites(
             }
         )
 
-    # (b) m04: clean filler (n02 + n05) + c06 (defect in part 2)
+    # (b) m04: clean filler (n01 + n03) + c06 (defect in part 2)
     c06 = case_map.get("c06")
-    if n02 and n05 and c06:
-        m04_diff = n02["diff"].rstrip() + "\n\n" + n05["diff"].rstrip() + "\n\n" + c06["diff"].lstrip()
+    if n01 and n03 and c06:
+        m04_diff = n01["diff"].rstrip() + "\n\n" + n03["diff"].rstrip() + "\n\n" + c06["diff"].lstrip()
         composites.append(
             {
                 "id": "m04",
                 "source": "git",
-                "title": "composite: defect in part 2 after clean filler (n02 + n05 + c06)",
+                "title": "composite: defect in part 2 after clean filler (n01 + n03 + c06)",
                 "prompt": f"{c06['prompt']}\n\nBackground changes in rule decomposition and docs.",
                 "domain": "backend",
                 "diff": m04_diff,
                 "ref": c06.get("ref"),
                 "label": "defect",
                 "defects": [dict(d) for d in c06["defects"]],
-                "source_ids": ["n02", "n05", "c06"],
+                "source_ids": ["n01", "n03", "c06"],
                 "composite": True,
             }
         )
 
-    # (c) m05: defect FIRST (c03) + clean filler (n01 + n02)
-    if c03 and n01 and n02:
-        m05_diff = c03["diff"].rstrip() + "\n\n" + n01["diff"].rstrip() + "\n\n" + n02["diff"].lstrip()
+    # (c) m05: defect FIRST (c03) + clean filler (n01 + n03)
+    if c03 and n01 and n03:
+        m05_diff = c03["diff"].rstrip() + "\n\n" + n01["diff"].rstrip() + "\n\n" + n03["diff"].lstrip()
         composites.append(
             {
                 "id": "m05",
                 "source": "git",
-                "title": "composite: defect FIRST followed by clean filler (c03 + n01 + n02)",
+                "title": "composite: defect FIRST followed by clean filler (c03 + n01 + n03)",
                 "prompt": f"{c03['prompt']}\n\nAdditional updates in updater and rulebook.",
                 "domain": "backend",
                 "diff": m05_diff,
                 "ref": c03.get("ref"),
                 "label": "defect",
                 "defects": [dict(d) for d in c03["defects"]],
-                "source_ids": ["c03", "n01", "n02"],
+                "source_ids": ["c03", "n01", "n03"],
                 "composite": True,
             }
         )
@@ -818,13 +789,14 @@ def _cli_build(args: argparse.Namespace) -> int:
     composites = make_composites(cases)
     print(f"Built {len(composites)} composite cases.")
 
-    # Save labelled and composite cases
+    # Save labelled and composite cases with explicit newline="\n" for Windows determinism
     all_cases = cases + composites
     for case in all_cases:
         case_id = case["id"]
         out_file = out_dir / f"{case_id}.json"
-        with open(out_file, "w", encoding="utf-8") as f:
+        with open(out_file, "w", encoding="utf-8", newline="\n") as f:
             json.dump(case, f, indent=2)
+            f.write("\n")
 
     print(f"Wrote {len(all_cases)} case files to {out_dir}")
 
@@ -837,8 +809,9 @@ def _cli_build(args: argparse.Namespace) -> int:
         archived_cases = build_from_archive(archive_dir)
         for ac in archived_cases:
             ac_id = ac["id"]
-            with open(archive_out / f"{ac_id}.json", "w", encoding="utf-8") as f:
+            with open(archive_out / f"{ac_id}.json", "w", encoding="utf-8", newline="\n") as f:
                 json.dump(ac, f, indent=2)
+                f.write("\n")
         print(f"Wrote {len(archived_cases)} archived case files to {archive_out}")
 
     return 0

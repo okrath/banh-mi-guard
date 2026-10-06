@@ -17,9 +17,9 @@
       "summary": "`guard/agent/events.py` guard-command detection returns a notice for `C:\\...\\python.exe -m guard post` and for `cd sub && guard post` (note: `guard run -- <cmd>` returning False is intentional per docstrings and tests)",
       "keywords": [
         "python.exe",
-        "cd sub",
-        "shlex",
-        "session_notice"
+        "session_notice",
+        "windows path",
+        "launcher"
       ]
     }
   ]

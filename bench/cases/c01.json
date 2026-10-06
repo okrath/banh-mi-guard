@@ -28,12 +28,12 @@
       "kind": "correctness",
       "severity": "medium",
       "visible_in_diff": true,
-      "summary": "`guard/agent/events.py` a `startswith(\"__\")` filter hid real paths (`__init__.py`, `__tests__/`) from shell-edit detection",
+      "summary": "`guard/agent/events.py` a `startswith(\"__\")` filter hid top-level `__init__.py` and `__tests__/` (repo-relative paths) from shell-edit detection",
       "keywords": [
         "startswith",
-        "__init__",
-        "__tests__",
-        "real paths"
+        "top-level",
+        "__init__.py",
+        "__tests__/"
       ]
     },
     {

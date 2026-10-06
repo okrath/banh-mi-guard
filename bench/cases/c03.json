@@ -19,7 +19,7 @@
         "# [error:",
         "+# [error",
         "diff error",
-        "startswith"
+        "line-prefix check"
       ]
     }
   ]

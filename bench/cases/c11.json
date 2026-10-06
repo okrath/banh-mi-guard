@@ -16,10 +16,10 @@
       "visible_in_diff": true,
       "summary": "`strict`-style command parser returned a concrete but wrong directory for about ten shapes and dropped commits behind git aliases",
       "keywords": [
-        "commandtarget",
         "command_targets",
-        "commit_directories",
-        "is_git_commit"
+        "wrong directory",
+        "git aliases",
+        "dropped commits"
       ]
     }
   ]

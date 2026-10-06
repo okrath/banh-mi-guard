@@ -16,9 +16,10 @@
       "visible_in_diff": true,
       "summary": "`guard/core/llm_reviewer.py` penalties summed then subtracted, the saved score changes in its last digits (a refactor must be bit-identical)",
       "keywords": [
-        "deduction_bs",
-        "deduction_v",
-        "10.0 -",
+        "deduction",
+        "rounding",
+        "floating",
+        "precision",
         "bit-identical"
       ]
     },
@@ -31,9 +32,9 @@
       "summary": "`tests/test_main_module.py` tests depend on cwd and the installed script, and mutate `sys.path` and `guard.__path__` without restoring",
       "keywords": [
         "sys.path.insert",
-        "guard.__path__",
-        "cwd",
-        "main_module"
+        "guard.__path__.insert",
+        "unrestored path",
+        "test_main_module"
       ]
     }
   ]
