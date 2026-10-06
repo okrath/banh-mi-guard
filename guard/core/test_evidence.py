@@ -7,49 +7,26 @@ tests lacking assertions.
 
 Table of Pattern Sets
 =====================
-
-1. Test File Identification
-| Ecosystem / Tool | Path / File Pattern | Examples |
+| Category | Primary Patterns / Frameworks | Reporting Trigger |
 |---|---|---|
-| Universal directories (case-insensitive) | `test/`, `tests/`, `__tests__/`, `spec/`, `specs/` | `tests/foo.py`, `src/__tests__/app.ts` |
-| Python / Go / Rust (prefix/infix) | `*_test.*`, `test_*.*` | `server_test.go`, `test_main.py` |
-| JS / TS / Ruby (infix/suffix) | `*.test.*`, `*.spec.*`, `*_spec.rb` | `button.test.tsx`, `user_spec.rb` |
-| Java / Kotlin / Swift / C# (case-sensitive) | `*Test.java|kt|cs|swift`, `*Tests.*` | `UserTest.java`, `AuthTests.cs` |
+| Assertion reduction | `assert`, `expect(`, `should`, `require`, `verify`, `check`, `XCTAssert`, `t.Error/Fatal`, `assertEquals`, `ok(`, `#[should_panic]`, `pytest.raises`, `assertThrows`, `toThrow` | Removed count > Added count |
+| Skipped / disabled tests | `pytest.mark.skip/xfail`, `unittest.skip`, `xit`, `xdescribe`, `@Disabled`, `@Ignore`, `#[ignore]`, `t.Skip`, `todo!`, `skip "reason"`, `pending`, `markTestSkipped`, `XCTSkip` | Any added skip marker |
+| Global mutation | `sys.path.(insert|append)`, `__path__`, `os.environ[...] =`, `os.environ.pop/setdefault/update`, `process.env.X =`, `setenv`, `putenv`, `Dir.chdir`, `os.chdir`, `ENV[...] =`, `os.Setenv`, `System.setProperty`, `set_var` | Any added mutation line |
+| Assertion-free tests | `def test_`, `it(`, `test(`, `func Test`, `test*()`, `#[test]`, `fn test_`, `@Test`, `[Fact/Test]`, `function test*` | Added test with >= 2 lines and 0 assertions |
+| Deletions-only diff | Test file entirely deleted or containing only deleted lines (`-`) | Diff has deletions > 0 and insertions == 0 |
 
-2. Assertion Patterns
-| Framework / Ecosystem | Assertion Syntax | Patterns Covered |
-|---|---|---|
-| Python `unittest` / `pytest` / keyword | `assert <expr>`, `self.assert*`, `pytest.raises`, `pytest.warns` | `assert`, `self.assert*`, `pytest.raises` |
-| JS / TS (`jest`, `chai`, `vitest`) | `expect(...)`, `.toBe(...)`, `toThrow(...)`, `.should` | `expect(`, `toThrow(`, `.should` |
-| Go `testing` / `testify` | `t.Error`, `t.Fatal`, `t.Fail`, `assert.Equal`, `require.NoError` | `t.Error*`, `t.Fatal*`, `assert.*`, `require.*` |
-| Java / Kotlin (`junit`, `testng`, `kotest`) | `Assert.*`, `assertEquals`, `assertThrows`, `ok(...)`, `shouldBe` | `Assert.*`, `assert*`, `ok(`, `shouldBe` |
-| C# (`xUnit`, `NUnit`, `FluentAssertions`) | `Assert.*`, `.Should()` | `Assert.*`, `.Should()` |
-| Swift `XCTest` / Swift Testing | `XCTAssert*`, `#expect(...)`, `#assert(...)` | `XCTAssert*`, `#expect`, `#assert` |
-| Rust | `assert!`, `assert_eq!`, `assert_ne!`, `#[should_panic]` | `assert!*`, `#[should_panic]` |
-| Behavior / BDD | `verify(...)`, `check(...)`, `require(...)` | `verify(`, `check(`, `require(` |
-
-3. Disabled / Skipped Test Markers
-| Ecosystem / Tool | Marker Syntax | Patterns Covered |
-|---|---|---|
-| Pytest / Python | `@pytest.mark.skip`, `@pytest.mark.skipif`, `pytest.skip`, `xfail`, `@unittest.skip*` | `skip`, `skipif`, `xfail`, `unittest.skip` |
-| JS / TS (`jest`, `mocha`) | `xit(...)`, `xdescribe(...)`, `it.skip(...)`, `.todo(...)` | `xit`, `xdescribe`, `.skip(`, `.todo(` |
-| Java / Kotlin (`junit`, `@Disabled @Test`) | `@Disabled`, `@Ignore`, `@Disabled @Test` | `@Disabled`, `@Ignore` |
-| Go | `t.Skip(...)`, `t.Skipf(...)`, `t.SkipNow()` | `t.Skip*` |
-| Rust | `todo!()`, `#[ignore]` | `todo!`, `#[ignore]` |
-| Ruby / RSpec / minitest | `skip(...)`, `pending(...)`, `xit(...)`, bare `skip`/`pending` | `skip`, `pending`, `xit` |
-| C# (`xUnit`, `NUnit`) | `[Fact(Skip = ...)]`, `[Ignore("...")]`, `[Test, Ignore]` | `[Fact(Skip=`, `[Ignore]` |
-| PHPUnit | `markTestSkipped(...)` | `markTestSkipped` |
-| Swift / XCTest | `XCTSkip(...)`, `XCTSkipIf(...)`, `XCTSkipUnless(...)` | `XCTSkip*` |
-| Dart / Flutter | `skip: true`, `skip: "reason"` | `skip:` |
-
-4. Global State Mutation Added
-| Target | Language / Mechanism | Covered Syntax |
-|---|---|---|
-| Python sys.path | `sys.path.insert`, `sys.path.append` | `sys.path.(insert|append)` |
-| Python package path | `__path__` insertion / assignment | `__path__` method call or assignment |
-| Environment variables | `os.environ[...] =`, `os.environ.pop/setdefault/update` | `os.environ`, `process.env`, `setenv`, `putenv` |
-| Python / Node / Ruby chdir | `os.chdir(...)`, `process.chdir(...)`, `Dir.chdir(...)` | `os.chdir`, `process.chdir`, `Dir.chdir` |
-| Go / Ruby / Java / Rust env | `os.Setenv`, `ENV[...] =`, `System.setProperty`, `set_var` | `os.Setenv`, `ENV[]=`, `System.setProperty`, `set_var` |
+Ecosystem Support
+=================
+- Python: pytest, unittest, assert statements
+- JavaScript / TypeScript: Jest, Vitest, Mocha, Jasmine, Chai
+- Java: JUnit 4, JUnit 5, TestNG, AssertJ
+- Kotlin: kotlin.test, Kotest
+- Go: testing package, testify/assert, testify/require
+- Ruby: RSpec, Minitest
+- Rust: cargo test, built-in #[test] and #[should_panic]
+- C# / .NET: xUnit, NUnit, MSTest, FluentAssertions
+- PHP: PHPUnit, Pest
+- Swift: XCTest, Swift Testing (#expect, #assert)
 
 Known Non-Goals / Left to LLM Review
 ====================================
@@ -87,13 +64,35 @@ MAX_LINE_CHARS = 2_000
 MAX_QUOTE_CHARS = 160
 MAX_EVIDENCE_LINES = 12
 MAX_PATH_CHARS = 80
+MAX_PER_CHAR_SCAN_CHARS = 400_000
+
+
+class _ScanBudget:
+    """Diff-wide character budget for expensive per-character scanners."""
+
+    def __init__(self, limit: int = MAX_PER_CHAR_SCAN_CHARS) -> None:
+        self.remaining: int = limit
+        self.exhausted: bool = False
+
+    def spend(self, count: int) -> bool:
+        """Attempt to spend `count` characters from the scan budget."""
+        if self.remaining <= 0:
+            self.exhausted = True
+            return False
+        self.remaining -= count
+        if self.remaining <= 0:
+            self.exhausted = True
+        return True
+
 
 # Fast regex for string literal masking (25x faster than character loop for standard strings)
 _STRING_LITERAL_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
 
 
-def _mask_code_strings(code: str) -> str:
+def _mask_code_strings(code: str, budget: _ScanBudget | None = None) -> str:
     """Mask string contents in code lines, using fast regex for standard strings."""
+    if budget and not budget.spend(len(code)):
+        return code
     if '"' not in code and "'" not in code and "`" not in code:
         return code
     if "`" in code:
@@ -136,6 +135,7 @@ _FAST_SKIP_KEYS = (
     "xdescribe",
     "Disabled",
     "Ignore",
+    "ignore",
     "todo",
     "pending",
     "markTestSkipped",
@@ -163,20 +163,26 @@ _IMPORT_LINE_RE = re.compile(
     r"^\s*(?:import\s|from\s+\S+\s+import\b|using\s|package\s|#include\b|(?:const|let|var)\s+\S+\s*=\s*require\s*\()"
 )
 
-# Targeted assertion pattern groups mapped by keyword
+
+def _has_should_pattern(s: str) -> bool:
+    """Fast substring check to verify if 'should' occurs in an assertion-like context."""
+    if ".should" in s or ".Should" in s or "should(" in s or "should_" in s:
+        return True
+    if "shouldBe" in s or "shouldNotBe" in s or "shouldEqual" in s or "Should()" in s:
+        return True
+    if any(f"should {w}" in s for w in ("be", "equal", "have", "match", "raise", "not", "exist", "include")):
+        return True
+    return False
+
+
+# Grouped targeted assertion patterns mapped to fast keywords
 _ASSERT_PATTERNS_MAP = [
     (
-        ("assert",),
+        ("assert", "Assert", "Assertions"),
         [
             re.compile(r"(?:^|;\s*)\s*(?:#)?assert(?:\s+|\s*\()"),
             re.compile(r"\b(?:self\.)?assert(?:[A-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+)(?:\s*\(|\s+[^\=\<\>\!\+\-\*\/\%\&\|\^\~])"),
             re.compile(r"\bassert(?:_eq|_ne)?!\s*[\(\[]"),
-            re.compile(r"\b(?:assert|Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
-        ],
-    ),
-    (
-        ("Assert", "Assertions"),
-        [
             re.compile(r"\b(?:assert|Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
             re.compile(r"\bassertEquals\s*\("),
             re.compile(r"\bassertThrows\s*\("),
@@ -254,41 +260,73 @@ _ASSERT_PATTERNS_MAP = [
     ),
 ]
 
-# Skip / disabled test markers
-_SKIP_PATTERNS = [
-    re.compile(r"\bpytest\.mark\.(?:skip|skipif|xfail)\b"),
-    re.compile(r"\bpytest\.(?:skip|xfail)\s*\("),
-    re.compile(r"\b(?:unittest\.skip(?:If|Unless)?|self\.skipTest)\b"),
-    re.compile(r"\b(?:xit|xdescribe)\b"),
-    re.compile(r"\b(?:test|it|describe|context|suite)\.(?:skip|todo)\s*\("),
-    re.compile(r"^\s*@(?:Disabled|Ignore)\b|@Test\s+@Disabled\b|@Disabled\s+@Test\b"),
-    re.compile(r"\[(?:Fact|Theory)\s*\([^\]]*Skip\s*="),
-    re.compile(r"\[[^\]]*\bIgnore\b(?:\s*\([^)]*\))?[^\]]*\]"),
-    re.compile(r"\bt\.Skip(?:f|Now)?\s*\("),
-    re.compile(r"#!?\[ignore(?:\s*=\s*['\"][^'\"]*['\"]|\([^\]]*\))?\]"),
-    re.compile(r"\btodo!\s*\(?"),
-    re.compile(r"^\s*(?:skip|pending)\b(?:\s*\(|\s+['\"]|\s*$)"),
-    re.compile(r"\bmarkTestSkipped\s*\("),
-    re.compile(r"\bXCTSkip(?:If|Unless)?\s*\("),
-    re.compile(r"(?<!\{)\bskip\s*:\s*(?:true\b|['\"])"),
+# Targeted skip / disabled test patterns mapped to fast keywords
+_SKIP_MAP = [
+    (("pytest.mark", "skip", "Skip", "xfail"), [
+        re.compile(r"\bpytest\.mark\.(?:skip|skipif|xfail)\b"),
+        re.compile(r"\bpytest\.(?:skip|xfail)\s*\("),
+    ]),
+    (("unittest.skip", "skipTest"), [
+        re.compile(r"\b(?:unittest\.skip(?:If|Unless)?|self\.skipTest)\b"),
+    ]),
+    (("xit", "xdescribe"), [
+        re.compile(r"\b(?:xit|xdescribe)\b"),
+    ]),
+    ((".skip", ".todo"), [
+        re.compile(r"\b(?:test|it|describe|context|suite)\.(?:skip|todo)\s*\("),
+    ]),
+    (("Disabled", "@Disabled"), [
+        re.compile(r"^\s*@(?:Disabled|Ignore)\b|@Test\s+@Disabled\b|@Disabled\s+@Test\b"),
+    ]),
+    (("Fact", "Theory"), [
+        re.compile(r"\[(?:Fact|Theory)\s*\([^\]]*Skip\s*="),
+    ]),
+    (("Ignore", "ignore"), [
+        re.compile(r"\[[^\]]*\bIgnore\b(?:\s*\([^)]*\))?[^\]]*\]"),
+        re.compile(r"#!?\[ignore(?:\s*=\s*['\"][^'\"]*['\"]|\([^\]]*\))?\]"),
+    ]),
+    (("t.Skip", "Skip"), [
+        re.compile(r"\bt\.Skip(?:f|Now)?\s*\("),
+    ]),
+    (("todo!",), [
+        re.compile(r"\btodo!\s*\(?"),
+    ]),
+    (("pending", "skip"), [
+        re.compile(r"^\s*(?:skip|pending)\b(?:\s*\(|\s+['\"]|\s*$)"),
+    ]),
+    (("markTestSkipped",), [
+        re.compile(r"\bmarkTestSkipped\s*\("),
+    ]),
+    (("XCTSkip",), [
+        re.compile(r"\bXCTSkip(?:If|Unless)?\s*\("),
+    ]),
+    (("skip:",), [
+        re.compile(r"(?<!\{)\bskip\s*:\s*(?:true\b|['\"])"),
+    ]),
 ]
+_SKIP_PATTERNS = [p for _, pats in _SKIP_MAP for p in pats]
 
-# Global state mutation patterns: assignments require =(?!=) and ignore reads/comparisons
-_GLOBAL_MUTATION_PATTERNS = [
-    re.compile(r"\bsys\.path\.(?:insert|append)\s*\("),
-    re.compile(r"\b__path__\.(?:insert|append|extend)\s*\("),
-    re.compile(r"\b__path__\s*(?:\[[^\]]+\])?\s*=(?!=)"),
-    re.compile(r"\bos\.environ\s*\[[^\]]+\]\s*=(?!=)"),
-    re.compile(r"\bos\.environ\.(?:pop|setdefault|update)\s*\("),
-    re.compile(r"\bprocess\.env(?:\.[a-zA-Z0-9_]+|\[[^\]]+\])\s*=(?!=)"),
-    re.compile(r"(?:\bos\.putenv|(?<![\w.])putenv|(?<![\w.])setenv)\s*\("),
-    re.compile(r"\bDir\.chdir\b"),
-    re.compile(r"\b(?:os|process)\.chdir\s*\("),
-    re.compile(r"\bENV\s*\[[^\]]+\]\s*=(?!=)"),
-    re.compile(r"\bos\.Setenv\s*\("),
-    re.compile(r"\bSystem\.setProperty\s*\("),
-    re.compile(r"\b(?:std::env::set_var|env::set_var|set_var)\s*\("),
+# Targeted global state mutation patterns mapped to fast keywords
+_MUTATION_MAP = [
+    (("sys.path",), [re.compile(r"\bsys\.path\.(?:insert|append)\s*\(")]),
+    (("__path__",), [
+        re.compile(r"\b__path__\.(?:insert|append|extend)\s*\("),
+        re.compile(r"\b__path__\s*(?:\[[^\]]+\])?\s*=(?!=)"),
+    ]),
+    (("environ",), [
+        re.compile(r"\bos\.environ\s*\[[^\]]+\]\s*=(?!=)"),
+        re.compile(r"\bos\.environ\.(?:pop|setdefault|update)\s*\("),
+    ]),
+    (("process.env",), [re.compile(r"\bprocess\.env(?:\.[a-zA-Z0-9_]+|\[[^\]]+\])\s*=(?!=)")]),
+    (("setenv", "putenv"), [re.compile(r"(?:\bos\.putenv|(?<![\w.])putenv|(?<![\w.])setenv)\s*\(")]),
+    (("os.chdir", "process.chdir"), [re.compile(r"\b(?:os|process)\.chdir\s*\(")]),
+    (("Dir.chdir",), [re.compile(r"\bDir\.chdir\b")]),
+    (("ENV[",), [re.compile(r"\bENV\s*\[[^\]]+\]\s*=(?!=)")]),
+    (("Setenv",), [re.compile(r"\bos\.Setenv\s*\(")]),
+    (("setProperty",), [re.compile(r"\bSystem\.setProperty\s*\(")]),
+    (("set_var",), [re.compile(r"\b(?:std::env::set_var|env::set_var|set_var)\s*\(")]),
 ]
+_GLOBAL_MUTATION_PATTERNS = [p for _, pats in _MUTATION_MAP for p in pats]
 
 # Secret-like words: password, passwd, token, secret, api_key, apikey, auth, jwt, private_key, credential
 _SECRET_WORDS_RE = re.compile(
@@ -373,7 +411,7 @@ def shorten_path(path: str, max_chars: int = MAX_PATH_CHARS) -> str:
     filename = parts[-1]
     prefix = f"{dir_part}/.../"
 
-    # If filename fits with prefix, keep the whole filename!
+    # If filename fits with prefix, keep the whole filename
     if len(prefix) + len(filename) <= max_chars:
         return f"{prefix}{filename}"
 
@@ -461,17 +499,21 @@ def is_secret_line(line: str) -> bool:
 def format_quoted_line(file_path: str, line_num: int | None, line_content: str) -> str:
     """
     Format a quoted line safely:
-    - Never quotes lines matching secret assignments or exceeding MAX_QUOTE_CHARS.
-    - Names file and line instead of quoting.
+    - Never quotes lines matching secret assignments or comparisons
+    - Names file and line instead of quoting when secret is present or line is > 160 chars
     """
-    clean = line_content.strip()
-    sp = shorten_path(file_path)
+    clean = shorten_path(file_path)
+    sp = clean
     loc = f"{sp}:{line_num}" if line_num is not None else sp
     if is_secret_line(clean):
         return f"[line omitted: potential secret at {loc}]"
+    if is_secret_line(line_content):
+        return f"[line omitted: potential secret at {loc}]"
     if len(clean) > MAX_QUOTE_CHARS:
         return f"[line omitted: exceeds {MAX_QUOTE_CHARS} characters at {loc}]"
-    return clean
+    if len(line_content) > MAX_QUOTE_CHARS:
+        return f"[line omitted: exceeds {MAX_QUOTE_CHARS} characters at {loc}]"
+    return line_content.strip()
 
 
 def is_comment_line(line: str, path_lower: str) -> bool:
@@ -485,14 +527,13 @@ def is_comment_line(line: str, path_lower: str) -> bool:
     # For non-hash languages (JS, TS, Java, Swift, Go, C#, C++, Rust, Kotlin)
     if stripped.startswith("//"):
         return True
-    if stripped.startswith("/*"):
+    while stripped.startswith("/*"):
         close_idx = stripped.find("*/", 2)
         if close_idx == -1:
             return True
-        remainder = stripped[close_idx + 2:].strip()
-        if not remainder or remainder.startswith(("//", "/*")):
-            return True
-        return False
+        stripped = stripped[close_idx + 2:].strip()
+    if not stripped or stripped.startswith("//"):
+        return True
     if stripped.startswith("*") and not stripped.startswith("*="):
         return True
     if path_lower.endswith((".html", ".htm", ".xml", ".svg")) and stripped.startswith("<!--"):
@@ -502,8 +543,11 @@ def is_comment_line(line: str, path_lower: str) -> bool:
     return False
 
 
-def strip_trailing_comment(line: str, path_lower: str = "") -> str:
+def strip_trailing_comment(line: str, path_lower: str = "", budget: _ScanBudget | None = None) -> str:
     """Strip trailing comment outside of string literals using the file language's comment rules."""
+    if budget and not budget.spend(len(line)):
+        return line.rstrip()
+
     is_hash = _hash_comments(path_lower) if path_lower else True
     blocks = _block_comments(path_lower) if path_lower else ()
 
@@ -535,7 +579,7 @@ def strip_trailing_comment(line: str, path_lower: str = "") -> str:
     return line_clean.rstrip()
 
 
-def is_assertion_line(line: str, path: str = "") -> bool:
+def is_assertion_line(line: str, path: str = "", budget: _ScanBudget | None = None) -> bool:
     """True if line matches assertion-like patterns and is not a comment or import."""
     # Lines over 2,000 characters are treated as non-assertion text without scanning
     if len(line) > MAX_LINE_CHARS:
@@ -545,6 +589,10 @@ def is_assertion_line(line: str, path: str = "") -> bool:
 
     # Fast substring check before expensive string masking and regex matching
     if not any(k in line_cut for k in _FAST_ASSERT_KEYS):
+        return False
+
+    # Parens check: almost all assertions require '(' unless statement/macro forms
+    if ("(" not in line_cut) and ("assert" not in line_cut) and ("should" not in line_cut) and ("Should" not in line_cut) and ("should_panic" not in line_cut):
         return False
 
     path_lower = path.replace("\\", "/").lower()
@@ -557,6 +605,9 @@ def is_assertion_line(line: str, path: str = "") -> bool:
     matched_pat = None
     for keys, pats in _ASSERT_PATTERNS_MAP:
         if any(k in line_cut for k in keys):
+            if "should" in keys or "Should" in keys:
+                if not _has_should_pattern(line_cut):
+                    continue
             for p in pats:
                 if p.search(line_cut):
                     matched_pat = p
@@ -566,7 +617,10 @@ def is_assertion_line(line: str, path: str = "") -> bool:
     if not matched_pat:
         return False
 
-    stripped = strip_trailing_comment(line_cut, path_lower)
+    if budget and budget.exhausted:
+        return True
+
+    stripped = strip_trailing_comment(line_cut, path_lower, budget=budget)
     if not matched_pat.search(stripped):
         return False
 
@@ -579,14 +633,14 @@ def is_assertion_line(line: str, path: str = "") -> bool:
         return True
 
     # Otherwise, mask strings to verify assertion is outside string literals
-    code_only = _mask_code_strings(stripped)
+    code_only = _mask_code_strings(stripped, budget=budget)
     return bool(matched_pat.search(code_only))
 
 
 @dataclass
 class _DiffHunk:
-    added_lines: list[tuple[int, str, bool]] = field(default_factory=list)  # (lnum, text, is_assert)
-    removed_lines: list[tuple[int, str, bool]] = field(default_factory=list)
+    added_lines: list[tuple[int, str, bool, bool, bool]] = field(default_factory=list)  # (lnum, text, is_assert, is_comment, was_cut)
+    removed_lines: list[tuple[int, str, bool, bool, bool]] = field(default_factory=list)
 
 
 @dataclass
@@ -598,7 +652,7 @@ class _ParsedFileDiff:
     hunks: list[_DiffHunk] = field(default_factory=list)
 
 
-def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
+def _parse_unified_diff(raw_diff: str, budget: _ScanBudget | None = None) -> tuple[list[_ParsedFileDiff], bool]:
     """Parse raw unified diff into file diffs and hunks, up to MAX_SCANNED_LINES."""
     # Split only on \n and strip trailing \r (avoids splitting on form feed \x0c or line separators)
     lines = [line.rstrip("\r") for line in raw_diff.split("\n")]
@@ -618,6 +672,7 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
     diff_git_re = re.compile(r'^diff --git (?:\"a/(.+?)\"|a/(\S+?)) (?:\"b/(.+?)\"|b/(\S+?))$')
 
     for raw_line in lines:
+        was_cut = len(raw_line) > MAX_LINE_CHARS
         line = raw_line[:MAX_LINE_CHARS]
 
         if line.startswith("diff --git"):
@@ -691,56 +746,76 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
         if line.startswith("+"):
             content = line[1:]
             if is_tp:
-                # Lines over 2,000 characters are treated as non-assertion text without scanning
-                if len(raw_line) > MAX_LINE_CHARS:
+                if was_cut:
                     is_assert = False
+                    is_comment = False
                 else:
-                    if open_comments_new.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content)):
-                        carried = _carry_comment(open_comments_new, fp_lower, content)
+                    needs_carry = open_comments_new.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content))
+                    if needs_carry:
+                        if budget and not budget.spend(len(content)):
+                            carried = content
+                        else:
+                            carried = _carry_comment(open_comments_new, fp_lower, content)
                     else:
                         carried = content
-                    is_assert = (carried is not None) and is_assertion_line(carried, fp)
+                    is_comment = (carried is None) or is_comment_line(carried, fp_lower)
+                    is_assert = (carried is not None) and is_assertion_line(carried, fp, budget=budget)
             else:
                 is_assert = False
-            current_hunk.added_lines.append((new_line_num, content, is_assert))
+                is_comment = False
+            current_hunk.added_lines.append((new_line_num, content, is_assert, is_comment, was_cut))
             current_file.total_insertions += 1
             new_line_num += 1
         elif line.startswith("-"):
             content = line[1:]
             if is_tp:
-                if len(raw_line) > MAX_LINE_CHARS:
+                if was_cut:
                     is_assert = False
+                    is_comment = False
                 else:
-                    if open_comments_old.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content)):
-                        carried = _carry_comment(open_comments_old, fp_lower, content)
+                    needs_carry = open_comments_old.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content))
+                    if needs_carry:
+                        if budget and not budget.spend(len(content)):
+                            carried = content
+                        else:
+                            carried = _carry_comment(open_comments_old, fp_lower, content)
                     else:
                         carried = content
-                    is_assert = (carried is not None) and is_assertion_line(carried, fp)
+                    is_comment = (carried is None) or is_comment_line(carried, fp_lower)
+                    is_assert = (carried is not None) and is_assertion_line(carried, fp, budget=budget)
             else:
                 is_assert = False
-            current_hunk.removed_lines.append((old_line_num, content, is_assert))
+                is_comment = False
+            current_hunk.removed_lines.append((old_line_num, content, is_assert, is_comment, was_cut))
             current_file.total_deletions += 1
             old_line_num += 1
         else:
             # Context line: updates both old and new side comment state if applicable
             if is_tp:
                 ctx_code = line[1:] if line.startswith(" ") else line
-                if open_comments_old.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
-                    _carry_comment(open_comments_old, fp_lower, ctx_code)
-                if open_comments_new.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
-                    _carry_comment(open_comments_new, fp_lower, ctx_code)
+                needs_carry = open_comments_old.get(fp_lower) or open_comments_new.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line))
+                if needs_carry:
+                    if budget and not budget.spend(len(ctx_code)):
+                        pass
+                    else:
+                        if open_comments_old.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
+                            _carry_comment(open_comments_old, fp_lower, ctx_code)
+                        if open_comments_new.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
+                            _carry_comment(open_comments_new, fp_lower, ctx_code)
             new_line_num += 1
             old_line_num += 1
 
     return files, exceeded
 
 
-def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str, bool]]) -> list[tuple[str, int, str]]:
+def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str, bool, bool, bool]]) -> list[tuple[str, int, str]]:
     """Check added lines in a hunk for test functions without assertions (Rule 4)."""
     reports: list[tuple[str, int, str]] = []
     test_starts: list[tuple[int, int, str]] = []
 
-    for idx, (lnum, line, _is_a) in enumerate(added_lines):
+    for idx, (lnum, line, _is_a, is_c, was_cut) in enumerate(added_lines):
+        if is_c or was_cut:
+            continue
         line_cut = line[:MAX_LINE_CHARS]
         next_line = added_lines[idx + 1][1][:MAX_LINE_CHARS] if idx + 1 < len(added_lines) else ""
         for pat, name_fn in _TEST_START_PATTERNS:
@@ -756,7 +831,7 @@ def _check_hunk_tests(file_path: str, added_lines: list[tuple[int, str, bool]]) 
         if len(block) < 2:
             continue
         # Reuse cached assertion evaluation from diff parsing
-        has_assert = any(is_a for _, _, is_a in block)
+        has_assert = any(is_a for _, _, is_a, _, _ in block)
         if not has_assert:
             reports.append((file_path, lnum, test_name))
 
@@ -773,19 +848,20 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
     if not raw_diff or not raw_diff.strip():
         return []
 
-    parsed_files, exceeded_diff_lines = _parse_unified_diff(raw_diff)
+    budget = _ScanBudget(MAX_PER_CHAR_SCAN_CHARS)
+    parsed_files, exceeded_diff_lines = _parse_unified_diff(raw_diff, budget=budget)
     test_files = [f for f in parsed_files if is_test_path(f.path)]
 
     if not test_files:
+        res = []
         if exceeded_diff_lines:
-            return [f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only"]
-        return []
+            res.append(f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only")
+        if budget.exhausted:
+            res.append("diff scan budget reached; scan reduced")
+        return res
 
     # Collect raw candidate actions before expensive formatting/quoting
     candidates: list[tuple] = []
-
-    if exceeded_diff_lines:
-        candidates.append(("notice", f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only"))
 
     for file_stat in test_files:
         fp = file_stat.path
@@ -797,59 +873,81 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
         elif file_stat.total_deletions > 0 and file_stat.total_insertions == 0:
             candidates.append(("rule5", f"{shorten_path(fp)}: test file diff only deletes lines"))
 
-        all_added: list[tuple[int, str, bool]] = []
-        all_removed: list[tuple[int, str, bool]] = []
+        all_added: list[tuple[int, str, bool, bool, bool]] = []
+        all_removed: list[tuple[int, str, bool, bool, bool]] = []
         for hunk in file_stat.hunks:
             all_added.extend(hunk.added_lines)
             all_removed.extend(hunk.removed_lines)
 
         # Rule 1: Assertions removed or reduced (uses cached assertion evaluations)
         removed_assertions = [
-            (lnum, text) for lnum, text, is_a in all_removed if is_a
+            (lnum, text) for lnum, text, is_a, _, _ in all_removed if is_a
         ]
         added_assertions = [
-            (lnum, text) for lnum, text, is_a in all_added if is_a
+            (lnum, text) for lnum, text, is_a, _, _ in all_added if is_a
         ]
 
         if len(removed_assertions) > len(added_assertions):
             candidates.append(("rule1", fp, removed_assertions, added_assertions))
 
-        # Rule 2: Disabled or skipped added (fast keyword precheck before regex)
+        # Rule 2: Disabled or skipped added (recheck only the matching pattern after masking)
         skip_matches = []
-        for lnum, text, _is_a in all_added:
-            if len(text) > MAX_LINE_CHARS:
+        for lnum, text, _is_a, _is_c, was_cut in all_added:
+            if was_cut:
                 continue
             if not any(k in text for k in _FAST_SKIP_KEYS):
                 continue
+            matching_skips = []
+            for keys, pats in _SKIP_MAP:
+                if any(k in text for k in keys):
+                    for p in pats:
+                        if p.search(text[:MAX_LINE_CHARS]):
+                            matching_skips.append(p)
+            if not matching_skips:
+                continue
+            if budget.exhausted:
+                skip_matches.append((lnum, text))
+                continue
             if is_comment_line(text, fp_lower):
                 continue
-            stripped = strip_trailing_comment(text, fp_lower)
-            code_only = _mask_code_strings(stripped)
-            if any(p.search(code_only) for p in _SKIP_PATTERNS):
+            stripped = strip_trailing_comment(text, fp_lower, budget=budget)
+            code_only = _mask_code_strings(stripped, budget=budget)
+            if any(p.search(code_only) for p in matching_skips):
                 skip_matches.append((lnum, text))
         if skip_matches:
             candidates.append(("rule2", fp, skip_matches))
 
-        # Rule 3: Global state mutation added (fast keyword precheck, comments/strings masked)
-        for lnum, text, _is_a in all_added:
-            if len(text) > MAX_LINE_CHARS:
+        # Rule 3: Global state mutation added (recheck only the matching pattern after masking)
+        for lnum, text, _is_a, _is_c, was_cut in all_added:
+            if was_cut:
                 continue
             if not any(k in text for k in _FAST_MUTATION_KEYS):
                 continue
-            # Fast raw match before expensive comment/string masking
-            if not any(p.search(text[:MAX_LINE_CHARS]) for p in _GLOBAL_MUTATION_PATTERNS):
+            matching_mutations = []
+            for keys, pats in _MUTATION_MAP:
+                if any(k in text for k in keys):
+                    for p in pats:
+                        if p.search(text[:MAX_LINE_CHARS]):
+                            matching_mutations.append(p)
+            if not matching_mutations:
+                continue
+            if budget.exhausted:
+                candidates.append(("rule3", fp, lnum, text))
                 continue
             if is_comment_line(text, fp_lower):
                 continue
-            stripped = strip_trailing_comment(text, fp_lower)
-            code_only = _mask_code_strings(stripped)
-            if any(p.search(code_only) for p in _GLOBAL_MUTATION_PATTERNS):
+            stripped = strip_trailing_comment(text, fp_lower, budget=budget)
+            code_only = _mask_code_strings(stripped, budget=budget)
+            if any(p.search(code_only) for p in matching_mutations):
                 candidates.append(("rule3", fp, lnum, text))
-
         # Rule 4: New test without assertion lines (heuristic)
         for hunk in file_stat.hunks:
             for item in _check_hunk_tests(fp, hunk.added_lines):
                 candidates.append(("rule4", *item))
+    if budget.exhausted:
+        candidates.insert(0, ("notice", "diff scan budget reached; scan reduced"))
+    if exceeded_diff_lines:
+        candidates.insert(0, ("notice", f"diff exceeds {MAX_SCANNED_LINES:,} lines; scanned first {MAX_SCANNED_LINES:,} lines only"))
 
     # Apply 12-line cap BEFORE formatting candidates
     total_candidates = len(candidates)
