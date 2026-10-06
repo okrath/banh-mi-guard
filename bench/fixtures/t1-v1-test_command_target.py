@@ -1,0 +1,290 @@
+"""
+Tests for command target parsing: finding the effective directory and commit status
+for each command segment, covering Windows and POSIX path conventions, directory changes
+(cd, chdir, Set-Location, sl, Push-Location, pushd, Pop-Location, popd), git -C overrides,
+nested shells, and unknowable paths.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from guard.agent.bash import (
+    CommandTarget,
+    _cd_target,
+    _extract_nested_shell,
+    _git_dir_and_c_paths,
+    _norm_path,
+    _segment_words,
+    _split_command_segments,
+    _unquote,
+    command_targets,
+    commit_directories,
+    is_git_commit,
+    is_read_only,
+)
+
+
+@pytest.mark.parametrize(
+    "command, cwd, expected_commits",
+    [
+        (r"Set-Location C:\foo\wt; git commit -m x", r"C:\cwd", [r"C:\foo\wt"]),
+        (r"Set-Location -LiteralPath 'C:\a b\wt'; git commit", r"C:\cwd", [r"C:\a b\wt"]),
+        (r'Set-Location -Path "C:\a b\wt"; git commit', r"C:\cwd", [r"C:\a b\wt"]),
+        (r"Set-Location -LiteralPath:C:\wt; git commit", r"C:\cwd", [r"C:\wt"]),
+        (r"Set-Location -Path:C:\wt; git commit", r"C:\cwd", [r"C:\wt"]),
+        (r"git -C C:\foo\wt commit -m x", r"C:\cwd", [r"C:\foo\wt"]),
+        (r"git -C wt -C sub commit", r"C:\repo", [r"C:\repo\wt\sub"]),
+        (r"cd /d D:\x && git commit", r"C:\repo", [r"D:\x"]),
+        (r"cd /D D:\x && git commit", r"C:\repo", [r"D:\x"]),
+        (r"chdir /d D:\x && git commit", r"C:\repo", [r"D:\x"]),
+        (r"pushd wt; git commit; popd; git status", r"C:\repo", [r"C:\repo\wt"]),
+        (r"Push-Location wt; git commit; Pop-Location; git commit", r"C:\repo", [r"C:\repo\wt", r"C:\repo"]),
+        (r'''powershell -Command "Set-Location wt; git commit -m 'a; b'"''', r"C:\repo", [r"C:\repo\wt"]),
+        (r'''pwsh -c "Set-Location wt; git commit -m 'a; b'"''', r"C:\repo", [r"C:\repo\wt"]),
+        (r'cmd /c "cd /d D:\x && git commit"', r"C:\repo", [r"D:\x"]),
+        (r'cmd /c "cd /d D:\x & git commit"', r"C:\repo", [r"D:\x"]),
+        (r"cmd /c git commit -m x", r"C:\repo", [r"C:\repo"]),
+        (r"powershell -Command git commit -m x", r"C:\repo", [r"C:\repo"]),
+        (r"git commit -m fix-if-bug", r"C:\repo", [r"C:\repo"]),
+        (r"cd docs/for/x && git commit", r"C:\repo", [r"C:\repo\docs\for\x"]),
+        (r"cd $env:WT; git commit", r"C:\repo", [None]),
+        (r"git commit", r"C:\repo", [r"C:\repo"]),
+        (r"git commit -m 'initial'", r"C:\repo", [r"C:\repo"]),
+        (r"sl C:\wt; git commit", r"C:\cwd", [r"C:\wt"]),
+        (r"sl wt; git commit", r"C:\repo", [r"C:\repo\wt"]),
+        (r"chdir C:\wt; git commit", r"C:\cwd", [r"C:\wt"]),
+        (r"git -C 'C:\a b\wt' commit", r"C:\cwd", [r"C:\a b\wt"]),
+        (r'git -C "C:\a b\wt" commit', r"C:\cwd", [r"C:\a b\wt"]),
+        (r"cd /d D:\x & git commit", r"C:\repo", [None]),
+        (r'''cd $env:WT; powershell -Command "git commit"''', r"C:\repo", [None]),
+        (r"git --git-dir=/foo commit", r"C:\repo", [None]),
+        (r"git --work-tree=wt commit", r"C:\repo", [None]),
+        (r"GIT_DIR=/foo git commit", r"C:\repo", [None]),
+        (r"GIT_WORK_TREE=wt git commit", r"C:\repo", [None]),
+        (r"popd; git commit", r"C:\repo", [None]),
+    ],
+)
+def test_windows_shapes(command: str, cwd: str, expected_commits: list[str | None]):
+    assert commit_directories(command, cwd) == expected_commits
+
+
+@pytest.mark.parametrize(
+    "command, cwd, expected_commits",
+    [
+        ("cd /opt/wt; git commit -m x", "/workspace/repo", ["/opt/wt"]),
+        ("cd wt && git commit", "/workspace/repo", ["/workspace/repo/wt"]),
+        ("cd sub/dir && git commit", "/workspace/repo", ["/workspace/repo/sub/dir"]),
+        ("git -C /opt/wt commit -m x", "/workspace/repo", ["/opt/wt"]),
+        ("git -C wt -C sub commit", "/workspace/repo", ["/workspace/repo/wt/sub"]),
+        ("pushd wt; git commit; popd; git status", "/workspace/repo", ["/workspace/repo/wt"]),
+        ('bash -c "cd wt; git commit -m \'a; b\'"', "/workspace/repo", ["/workspace/repo/wt"]),
+        ('sh -c "cd wt; git commit -m \'a; b\'"', "/workspace/repo", ["/workspace/repo/wt"]),
+        ('bash -lc "cd wt; git commit"', "/workspace/repo", ["/workspace/repo/wt"]),
+        ("bash -c git commit", "/workspace/repo", ["/workspace/repo"]),
+        ("git commit", "/workspace/repo", ["/workspace/repo"]),
+        ("git commit -m fix-if-bug", "/workspace/repo", ["/workspace/repo"]),
+        ("cd docs/for/x && git commit", "/workspace/repo", ["/workspace/repo/docs/for/x"]),
+        ("cd $DIR; git commit", "/workspace/repo", [None]),
+        ("cd ${DIR}; git commit", "/workspace/repo", [None]),
+        ("cd %DIR%; git commit", "/workspace/repo", [None]),
+        ("cd $(pwd); git commit", "/workspace/repo", [None]),
+        ("cd `pwd`; git commit", "/workspace/repo", [None]),
+        ("cd -; git commit", "/workspace/repo", [None]),
+        ("cd ~; git commit", "/workspace/repo", [None]),
+        ("cd ~user; git commit", "/workspace/repo", [None]),
+        ("cd ~/repo; git commit", "/workspace/repo", [None]),
+        ("cd; git commit", "/workspace/repo", [None]),
+        ("git -C $DIR commit", "/workspace/repo", [None]),
+        ("git -C ~ commit", "/workspace/repo", [None]),
+        ("git -C - commit", "/workspace/repo", [None]),
+        ("cd wt || exit 1; git commit", "/workspace/repo", ["/workspace/repo/wt"]),
+        ("cd wt || cd other; git commit", "/workspace/repo", [None]),
+        ("cd wt & git commit", "/workspace/repo", [None]),
+        ('cd $DIR; bash -c "git commit"', "/workspace/repo", [None]),
+        ("(cd wt; git commit)", "/workspace/repo", [None]),
+        ("{ cd wt; git commit; }", "/workspace/repo", [None]),
+        ("if true; then git commit; fi", "/workspace/repo", [None]),
+        ("popd; git commit", "/workspace/repo", [None]),
+        ("GIT_DIR=/foo git commit", "/workspace/repo", [None]),
+        ("git --git-dir=/foo commit", "/workspace/repo", [None]),
+        ("git --work-tree=wt commit", "/workspace/repo", [None]),
+    ],
+)
+def test_posix_shapes(command: str, cwd: str, expected_commits: list[str | None]):
+    assert commit_directories(command, cwd) == expected_commits
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls -la",
+        "git status",
+        "git diff HEAD",
+        "git log --oneline -5",
+        "git log --grep commit",
+        "echo git commit",
+        "cd wt && ls",
+        'powershell -Command "Set-Location wt; git status"',
+        "git branch -a",
+        "cat file.txt",
+        "npm test",
+        "python -m pytest",
+        "(cd wt; git status)",
+        "if true; then git status; fi",
+        "",
+        "   ",
+    ],
+)
+def test_non_commit_commands_have_no_commit_directories(command: str):
+    assert commit_directories(command, "/repo") == []
+
+
+def test_command_targets_segment_details_and_ordering():
+    cmd = r"pushd wt; git commit -m 'first'; popd; git -C other commit -m 'second'; git status"
+    targets = command_targets(cmd, r"C:\repo")
+    assert len(targets) == 5
+
+    assert targets[0] == CommandTarget(directory=r"C:\repo", is_git_commit=False, segment="pushd wt")
+    assert targets[1] == CommandTarget(directory=r"C:\repo\wt", is_git_commit=True, segment="git commit -m 'first'")
+    assert targets[2] == CommandTarget(directory=r"C:\repo\wt", is_git_commit=False, segment="popd")
+    assert targets[3] == CommandTarget(directory=r"C:\repo\other", is_git_commit=True, segment="git -C other commit -m 'second'")
+    assert targets[4] == CommandTarget(directory=r"C:\repo", is_git_commit=False, segment="git status")
+
+
+def test_git_c_overrides_directory_for_segment_only():
+    cmd = "git -C wt status && git commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 2
+    assert targets[0].directory == "/repo/wt"
+    assert targets[0].is_git_commit is False
+    assert targets[1].directory == "/repo"
+    assert targets[1].is_git_commit is True
+
+
+def test_multi_level_directory_stack():
+    cmd = "pushd d1; pushd d2; git commit -m 1; popd; git commit -m 2; popd; git commit -m 3"
+    targets = command_targets(cmd, "/repo")
+    commit_dirs = [t.directory for t in targets if t.is_git_commit]
+    assert commit_dirs == ["/repo/d1/d2", "/repo/d1", "/repo"]
+
+
+def test_parse_failure_returns_unknown_target():
+    cmd = 'echo "broken string; git commit'
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 1
+    assert targets[0].directory is None
+    assert targets[0].is_git_commit is True
+    assert targets[0].segment == cmd
+    assert commit_directories(cmd, "/repo") == [None]
+
+    cmd_clean = "echo 'broken string"
+    targets_clean = command_targets(cmd_clean, "/repo")
+    assert len(targets_clean) == 1
+    assert targets_clean[0].directory is None
+    assert targets_clean[0].is_git_commit is False
+    assert commit_directories(cmd_clean, "/repo") == []
+
+
+def test_deeply_nested_shells_limit():
+    cmd = 'sh -c "sh -c \\"sh -c \\\\\\"sh -c \'git commit\'\\\\\\"\\""'
+    targets = command_targets(cmd, "/repo")
+    for t in targets:
+        assert t.directory is None or t.directory.startswith("/repo")
+
+
+def test_leading_environment_assignments():
+    cmd = "ENV_VAR=1 cd wt && OTHER=2 git commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 2
+    assert targets[0].directory == "/repo"
+    assert targets[1].directory == "/repo/wt"
+    assert targets[1].is_git_commit is True
+
+
+def test_command_with_comments_and_newlines():
+    cmd = "cd wt # navigate to worktree\ngit commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 2
+    assert targets[0].directory == "/repo"
+    assert targets[1].directory == "/repo/wt"
+    assert targets[1].is_git_commit is True
+
+
+def test_command_with_crlf():
+    cmd = "cd wt\r\ngit commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 2
+    assert targets[0].directory == "/repo"
+    assert targets[1].directory == "/repo/wt"
+    assert targets[1].is_git_commit is True
+
+
+def test_heredocs_do_not_inject_segments():
+    cmd = """git commit -F - <<'EOF'
+Set-Location /injected/wt; git commit -m malicious
+EOF
+git status"""
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 2
+    assert targets[0].is_git_commit is True
+    assert targets[0].directory == "/repo"
+    assert targets[1].is_git_commit is False
+    assert targets[1].directory == "/repo"
+
+
+def test_wrappers_like_sudo_and_env():
+    cmd = "sudo git -C wt commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 1
+    assert targets[0].directory == "/repo/wt"
+    assert targets[0].is_git_commit is True
+    assert commit_directories(cmd, "/repo") == ["/repo/wt"]
+
+
+def test_chained_relative_cds():
+    cmd = "cd dir1 && cd dir2 && git commit -m x"
+    targets = command_targets(cmd, "/repo")
+    assert len(targets) == 3
+    assert targets[0].directory == "/repo"
+    assert targets[1].directory == "/repo/dir1"
+    assert targets[2].directory == "/repo/dir1/dir2"
+    assert targets[2].is_git_commit is True
+    assert commit_directories(cmd, "/repo") == ["/repo/dir1/dir2"]
+
+
+def test_cd_with_dot_dot():
+    cmd = "cd ../sibling && git commit -m x"
+    targets = command_targets(cmd, "/workspace/project/child")
+    assert targets[1].directory == "/workspace/project/sibling"
+    assert commit_directories(cmd, "/workspace/project/child") == ["/workspace/project/sibling"]
+
+
+def test_empty_and_whitespace_command():
+    assert command_targets("", "/repo") == []
+    assert command_targets("   \t  \n  ", "/repo") == []
+    assert commit_directories("", "/repo") == []
+
+
+def test_is_git_commit_and_is_read_only_behave_as_before():
+    assert is_git_commit("git commit -m 'x'") is True
+    assert is_git_commit("git -C repo commit") is True
+    assert is_git_commit("git log") is False
+    assert is_git_commit("echo git commit") is False
+
+    assert is_read_only("ls -la") is True
+    assert is_read_only("git status") is True
+    assert is_read_only("git commit -m 'x'") is False
+    assert is_read_only("echo x > file.txt") is False
+
+
+def test_private_helpers():
+    assert _norm_path("wt", "/repo") == "/repo/wt"
+    assert _norm_path("$dir", "/repo") is None
+    assert _split_command_segments("a && b") == [("a", "&&"), ("b", "")]
+    assert _segment_words('echo "hello"') == ["echo", '"hello"']
+    assert _cd_target(["cd", "/d", r"D:\x"]) == r"D:\x"
+    assert _git_dir_and_c_paths(["git", "-C", "wt"], ["git", "-C", "wt"]) == (False, ["wt"])
+    assert _git_dir_and_c_paths(["git", "--git-dir=x"], ["git", "--git-dir=x"]) == (True, [])
+    assert _extract_nested_shell("cmd", ["cmd", "/c", "dir"]) == "dir"
+    assert _unquote('"quoted"') == "quoted"

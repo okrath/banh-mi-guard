@@ -1,0 +1,317 @@
+diff --git a/guard/agent/bash.py b/guard/agent/bash.py
+index 0f91d00..20fdf23 100644
+--- a/guard/agent/bash.py
++++ b/guard/agent/bash.py
+@@ -9,11 +9,13 @@ tree is compared before and after (git status + content hashes) to see what it r
+ from __future__ import annotations
+ 
+ import hashlib
++import ntpath
+ import os
++import posixpath
+ import re
+ import shlex
+ from pathlib import Path
+-from typing import Dict, List, Optional
++from typing import Dict, List, NamedTuple, Optional, Tuple
+ 
+ from guard.core.ocr_engine import GitDiffInspector
+ 
+@@ -299,3 +301,297 @@ def worktree_fingerprint(repo: Path) -> Dict[str, str]:
+ 
+ def changed_between(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
+     return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
++
++
++class CommandTarget(NamedTuple):
++    directory: Optional[str]
++    is_git_commit: bool
++    segment: str
++
++
++CONTROL_KEYWORDS = {
++    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select"
++}
++
++
++def _unquote(p: str) -> str:
++    p = p.strip()
++    return p[1:-1].strip() if (p.startswith(('"', "'")) and len(p) >= 2 and p[-1] == p[0]) else p
++
++
++def _norm_path(raw: Optional[str], base: Optional[str]) -> Optional[str]:
++    if not raw:
++        return None
++    p = _unquote(raw)
++    if not p or p in ("-", "~") or p.startswith("~") or any(c in p for c in "$`%*?"):
++        return None
++    drive = ntpath.splitdrive(p)[0]
++    if drive or p.startswith(("\\\\", "//", "/")):
++        if p.startswith("/") and not drive:
++            return posixpath.normpath(p)
++        res = ntpath.normpath(p)
++        d = ntpath.splitdrive(res)[0]
++        return (d.upper() + res[len(d):]) if d else res
++    if base is None:
++        return None
++    is_win = bool(ntpath.splitdrive(base)[0] or "\\" in base or "\\" in p)
++    if not is_win and base.startswith("/"):
++        return posixpath.normpath(posixpath.join(base, p))
++    res = ntpath.normpath(ntpath.join(base, p))
++    d = ntpath.splitdrive(res)[0]
++    return (d.upper() + res[len(d):]) if d else res
++
++
++def _split_command_segments(command: str) -> Optional[List[Tuple[str, str]]]:
++    clean = strip_heredocs(command.replace("\\\n", ""))
++    segments: List[Tuple[str, str]] = []
++    curr: List[str] = []
++    quote = ""
++    i, n = 0, len(clean)
++    while i < n:
++        ch = clean[i]
++        if quote:
++            curr.append(ch)
++            if ch == "\\" and quote == '"' and i + 1 < n:
++                i += 1
++                curr.append(clean[i])
++            elif ch == quote:
++                quote = ""
++        elif ch in "'\"":
++            quote = ch
++            curr.append(ch)
++        elif ch == "#" and (i == 0 or clean[i - 1] in " \t;&|()"):
++            nl = clean.find("\n", i)
++            if nl == -1:
++                break
++            i = nl
++            continue
++        elif clean[i : i + 2] in ("&&", "||"):
++            seg = "".join(curr).strip()
++            if seg:
++                segments.append((seg, clean[i : i + 2]))
++            curr = []
++            i += 2
++            continue
++        elif ch in (";", "|", "&", "\n"):
++            seg = "".join(curr).strip()
++            if seg:
++                segments.append((seg, ch))
++            curr = []
++            i += 1
++            continue
++        else:
++            curr.append(ch)
++        i += 1
++    if quote:
++        return None
++    seg = "".join(curr).strip()
++    if seg:
++        segments.append((seg, ""))
++    return segments
++
++
++def _segment_words(segment_str: str) -> List[str]:
++    lexer = shlex.shlex(segment_str, posix=False, punctuation_chars=";&|<>")
++    lexer.whitespace_split = True
++    lexer.commenters = ""
++    try:
++        return [tok for tok in lexer if tok not in (";", "&&", "||", "|", "&")]
++    except ValueError:
++        return []
++
++
++def _cd_target(words: List[str]) -> Optional[str]:
++    args = words[1:]
++    i = 0
++    while i < len(args):
++        a = args[i]
++        low = a.lower()
++        if low in ("/d", "-p", "-l", "--"):
++            i += 1
++            continue
++        for pfx in ("-path:", "-literalpath:", "-path=", "-literalpath="):
++            if low.startswith(pfx):
++                return _unquote(a[len(pfx) :])
++        if low in ("-path", "-literalpath"):
++            return _unquote(args[i + 1]) if i + 1 < len(args) else None
++        if low.startswith("-"):
++            i += 1
++            continue
++        return _unquote(a)
++    return None
++
++
++def _git_dir_and_c_paths(raw_tokens: List[str], git_words: List[str]) -> Tuple[bool, List[str]]:
++    for tok in raw_tokens:
++        if not ASSIGNMENT.match(tok):
++            break
++        if tok.split("=", 1)[0].upper() in ("GIT_DIR", "GIT_WORK_TREE"):
++            return True, []
++    paths: List[str] = []
++    i = 1
++    while i < len(git_words):
++        w = git_words[i]
++        low = w.lower()
++        if low in ("--git-dir", "--work-tree") or low.startswith(("--git-dir=", "--work-tree=")):
++            return True, []
++        if w == "-C":
++            if i + 1 < len(git_words):
++                paths.append(git_words[i + 1])
++                i += 2
++                continue
++            return True, []
++        elif w.startswith("-C") and len(w) > 2:
++            paths.append(w[2:])
++            i += 1
++            continue
++        elif w in ("-c", "--namespace"):
++            i += 2
++            continue
++        elif w.startswith("-"):
++            i += 1
++            continue
++        else:
++            break
++    return False, paths
++
++
++def _extract_nested_shell(prog: str, words: List[str]) -> Optional[str]:
++    for i, w in enumerate(words[:-1]):
++        low = w.lower()
++        if prog in ("powershell", "pwsh"):
++            if low in ("-c", "-command", "/c", "/command"):
++                rest = words[i + 1 :]
++                return " ".join(rest) if rest else None
++            for pfx in ("-c:", "-command:", "/c:", "/command:"):
++                if low.startswith(pfx):
++                    rest = [w.split(":", 1)[1]] + words[i + 1 :]
++                    return " ".join(rest) if rest else None
++        elif prog == "cmd":
++            if low in ("/c", "/k", "-c"):
++                rest = words[i + 1 :]
++                return " ".join(rest) if rest else None
++        else:
++            if low == "-c" or (
++                low.startswith("-")
++                and not low.startswith("--")
++                and low.endswith("c")
++                and all(c in "abcdefghijklmnopqrstuvwxyz" for c in low[1:])
++            ):
++                rest = words[i + 1 :]
++                return " ".join(rest) if rest else None
++    return None
++
++
++def command_targets(
++    command: str, cwd: Optional[str] = None, _depth: int = 0, shell: Optional[str] = None
++) -> list[CommandTarget]:
++    norm_cwd = _norm_path(".", cwd or os.path.abspath(".")) if cwd is not None else None
++    if _depth > 3:
++        return [CommandTarget(directory=None, is_git_commit=is_git_commit(command), segment=command)]
++
++    raw_segments = _split_command_segments(command)
++    if raw_segments is None:
++        return [CommandTarget(directory=None, is_git_commit=is_git_commit(command), segment=command)]
++
++    targets: list[CommandTarget] = []
++    current_dir: Optional[str] = norm_cwd
++    dir_stack: List[Optional[str]] = []
++    prev_sep = ""
++
++    for idx, (seg_str, sep) in enumerate(raw_segments):
++        raw_words = _segment_words(seg_str)
++        words = _words(raw_words)
++        unwrapped = _unwrap(words)
++        prog = _program(unwrapped) if unwrapped else ""
++
++        next_prog = ""
++        if idx + 1 < len(raw_segments):
++            next_unwrapped = _unwrap(_words(_segment_words(raw_segments[idx + 1][0])))
++            next_prog = _program(next_unwrapped) if next_unwrapped else ""
++
++        # Check subshell / grouping or control keywords at command position
++        seg_s = seg_str.lstrip()
++        is_grouped = seg_s.startswith(("(", "{")) or seg_str.rstrip().endswith((")", "}"))
++        is_control = prog in CONTROL_KEYWORDS
++        if is_grouped or is_control:
++            seg_clean = re.sub(r"[(){}]", " ", seg_str).strip()
++            words_clean = seg_clean.split()
++            s_no_ctl = (
++                " ".join(words_clean[1:])
++                if words_clean and words_clean[0].lower() in CONTROL_KEYWORDS
++                else seg_clean
++            )
++            is_commit = (
++                is_git_commit(seg_str)
++                or _looks_like_commit(seg_str)
++                or (bool(seg_clean) and is_git_commit(seg_clean))
++                or (bool(s_no_ctl) and is_git_commit(s_no_ctl))
++            )
++            targets.append(CommandTarget(directory=None, is_git_commit=is_commit, segment=seg_str))
++            current_dir = None
++            prev_sep = sep
++            continue
++
++        if prog in SHELLS:
++            inner_cmd = _extract_nested_shell(prog, unwrapped)
++            inner_targets: list[CommandTarget] = []
++            if inner_cmd:
++                ic = _unquote(inner_cmd)
++                inner_targets = command_targets(ic, current_dir, _depth + 1, shell=prog)
++            if any(t.is_git_commit for t in inner_targets):
++                targets.extend(inner_targets)
++                prev_sep = sep
++                continue
++            if is_git_commit(seg_str) or _looks_like_commit(seg_str) or (inner_cmd and is_git_commit(inner_cmd)):
++                targets.append(CommandTarget(directory=None, is_git_commit=True, segment=seg_str))
++                prev_sep = sep
++                continue
++            if inner_targets:
++                targets.extend(inner_targets)
++                prev_sep = sep
++                continue
++
++        effective_dir = current_dir
++        if prog == "git":
++            has_override, c_paths = _git_dir_and_c_paths(raw_words, unwrapped)
++            if has_override:
++                effective_dir = None
++            elif c_paths:
++                res = current_dir
++                for cp in c_paths:
++                    res = _norm_path(cp, res or norm_cwd)
++                    if res is None:
++                        break
++                effective_dir = res
++
++        repo_arg = Path(effective_dir) if effective_dir and Path(effective_dir).is_dir() else None
++        is_commit = is_git_commit(seg_str, repo_arg)
++        targets.append(CommandTarget(directory=effective_dir, is_git_commit=is_commit, segment=seg_str))
++
++        if prog in ("pop-location", "popd"):
++            current_dir = dir_stack.pop() if dir_stack else None
++        elif prog in ("push-location", "pushd", "cd", "chdir", "set-location", "sl"):
++            if prog in ("push-location", "pushd"):
++                dir_stack.append(current_dir)
++            tpath = _cd_target(unwrapped)
++            new_dir = _norm_path(
++                tpath, norm_cwd if (tpath and _norm_path(tpath, None) is not None) else current_dir
++            )
++
++            if prev_sep == "||":
++                current_dir = None
++            elif sep == "||":
++                current_dir = new_dir if next_prog in ("exit", "return", "throw", "die") else None
++            elif sep in (";", "&&", "\n"):
++                current_dir = new_dir
++            elif sep == "&":
++                current_dir = new_dir if shell == "cmd" else None
++
++        prev_sep = sep
++
++    return targets
++
++
++def commit_directories(command: str, cwd: Optional[str] = None) -> list[Optional[str]]:
++    return [t.directory for t in command_targets(command, cwd) if t.is_git_commit]
