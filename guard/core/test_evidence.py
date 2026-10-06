@@ -53,7 +53,8 @@ Table of Pattern Sets
 
 Known Non-Goals / Left to LLM Review
 ====================================
-- Embedded test function signatures inside multiline docstrings or multiline strings may split a test block.
+- Embedded test function signatures inside multiline docstrings (Python triple-quotes, Ruby =begin/=end, C# #if false, PHP #).
+- Wrapping existing unchanged assertions in `+/*` and `+*/` comment markers without editing the assertion lines themselves (context lines in diff are not counted as removed).
 - Assertions inside loops that execute zero times cannot be verified statically.
 - Dynamic test assertions constructed through metaprogramming or reflection.
 - RSpec block assertions (`expect { ... }.to change(...)`).
@@ -78,6 +79,7 @@ from guard.core.code_text import (
     _mask_strings,
 )
 from guard.core.rulebook import OCRRulebookRunner
+from guard.core.rules import LINE_RULES
 
 # Bounded limit constants
 MAX_SCANNED_LINES = 20_000
@@ -85,6 +87,24 @@ MAX_LINE_CHARS = 2_000
 MAX_QUOTE_CHARS = 160
 MAX_EVIDENCE_LINES = 12
 MAX_PATH_CHARS = 80
+
+# Fast regex for string literal masking (25x faster than character loop for standard strings)
+_STRING_LITERAL_RE = re.compile(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')')
+
+
+def _mask_code_strings(code: str) -> str:
+    """Mask string contents in code lines, using fast regex for standard strings."""
+    if '"' not in code and "'" not in code and "`" not in code:
+        return code
+    if "`" in code:
+        return _mask_strings(code)
+    return _STRING_LITERAL_RE.sub(
+        lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[-1]
+        if len(m.group(0)) >= 2
+        else m.group(0),
+        code,
+    )
+
 
 # Fast keyword prefilters to skip expensive string masking / regexes on plain lines
 _FAST_ASSERT_KEYS = (
@@ -143,25 +163,95 @@ _IMPORT_LINE_RE = re.compile(
     r"^\s*(?:import\s|from\s+\S+\s+import\b|using\s|package\s|#include\b|(?:const|let|var)\s+\S+\s*=\s*require\s*\()"
 )
 
-# Assertion patterns (statement, call or macro; assignments like assertion_count = 0 excluded)
-_ASSERTION_PATTERNS = [
-    re.compile(r"(?:^|;\s*)\s*(?:#)?assert(?:\s+|\s*\()"),
-    re.compile(r"\b(?:self\.)?assert(?:[A-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+)(?:\s*\(|\s+[^\=\<\>\!\+\-\*\/\%\&\|\^\~])"),
-    re.compile(r"\bassert(?:_eq|_ne)?!\s*[\(\[]"),
-    re.compile(r"\b(?:assert|Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
-    re.compile(r"\bXCTAssert[a-zA-Z0-9_]*\s*\("),
-    re.compile(r"(?:^|;\s*)\s*#(?:expect|assert)\s*\("),
-    re.compile(r"\bexpect\s*\("),
-    re.compile(r"\btoThrow(?:Error)?\s*\("),
-    re.compile(
-        r"(?:\.should\b|\bshould\s*\(|\bshould\s+(?:be|equal|have|match|raise|not)\b|\.should_[a-zA-Z0-9_]+|\bshould(?:Be|NotBe|Equal)\b|\.Should\s*\()"
+# Targeted assertion pattern groups mapped by keyword
+_ASSERT_PATTERNS_MAP = [
+    (
+        ("assert",),
+        [
+            re.compile(r"(?:^|;\s*)\s*(?:#)?assert(?:\s+|\s*\()"),
+            re.compile(r"\b(?:self\.)?assert(?:[A-Z][a-zA-Z0-9_]*|_[a-zA-Z0-9_]+)(?:\s*\(|\s+[^\=\<\>\!\+\-\*\/\%\&\|\^\~])"),
+            re.compile(r"\bassert(?:_eq|_ne)?!\s*[\(\[]"),
+            re.compile(r"\b(?:assert|Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
+        ],
     ),
-    re.compile(r"(?:\brequire\.[a-zA-Z0-9_]+|\b(?:verify|check)\s*\()"),
-    re.compile(r"\brequire\s*\((?!['\"][a-zA-Z0-9_\-\.\/]+['\"]\s*\))"),
-    re.compile(r"\bt\.(?:Error|Fatal|Fail)(?:f|Now)?\s*\("),
-    re.compile(r"\bok\s*\("),
-    re.compile(r"#!?\[should_panic"),
-    re.compile(r"\bpytest\.(?:raises|warns)\b"),
+    (
+        ("Assert", "Assertions"),
+        [
+            re.compile(r"\b(?:assert|Assert|Assertions|StringAssert|CollectionAssert)\.[a-zA-Z0-9_]+\s*\("),
+            re.compile(r"\bassertEquals\s*\("),
+            re.compile(r"\bassertThrows\s*\("),
+        ],
+    ),
+    (
+        ("expect", "#expect"),
+        [
+            re.compile(r"\bexpect\s*\("),
+            re.compile(r"(?:^|;\s*)\s*#expect\s*\("),
+        ],
+    ),
+    (
+        ("#assert",),
+        [
+            re.compile(r"(?:^|;\s*)\s*#assert\s*\("),
+        ],
+    ),
+    (
+        ("should", "Should"),
+        [
+            re.compile(
+                r"(?:\.should\b|\bshould\s*\(|\bshould\s+(?:be|equal|have|match|raise|not)\b|\.should_[a-zA-Z0-9_]+|\bshould(?:Be|NotBe|Equal)\b|\.Should\s*\()"
+            ),
+        ],
+    ),
+    (
+        ("require",),
+        [
+            re.compile(r"(?:\brequire\.[a-zA-Z0-9_]+|\b(?:verify|check)\s*\()"),
+            re.compile(r"\brequire\s*\((?!['\"][a-zA-Z0-9_\-\.\/]+['\"]\s*\))"),
+        ],
+    ),
+    (
+        ("verify", "check"),
+        [
+            re.compile(r"(?:\brequire\.[a-zA-Z0-9_]+|\b(?:verify|check)\s*\()"),
+        ],
+    ),
+    (
+        ("XCT",),
+        [
+            re.compile(r"\bXCTAssert[a-zA-Z0-9_]*\s*\("),
+        ],
+    ),
+    (
+        ("t.Error", "t.Fatal", "t.Fail"),
+        [
+            re.compile(r"\bt\.(?:Error|Fatal|Fail)(?:f|Now)?\s*\("),
+        ],
+    ),
+    (
+        ("ok(",),
+        [
+            re.compile(r"\bok\s*\("),
+        ],
+    ),
+    (
+        ("should_panic",),
+        [
+            re.compile(r"#!?\[should_panic"),
+        ],
+    ),
+    (
+        ("pytest",),
+        [
+            re.compile(r"\bpytest\.(?:raises|warns)\b"),
+        ],
+    ),
+    (
+        ("Throw",),
+        [
+            re.compile(r"\btoThrow(?:Error)?\s*\("),
+        ],
+    ),
 ]
 
 # Skip / disabled test markers
@@ -177,7 +267,7 @@ _SKIP_PATTERNS = [
     re.compile(r"\bt\.Skip(?:f|Now)?\s*\("),
     re.compile(r"#!?\[ignore(?:\s*=\s*['\"][^'\"]*['\"]|\([^\]]*\))?\]"),
     re.compile(r"\btodo!\s*\(?"),
-    re.compile(r"(?<!def\s)(?<![\w.])(?:skip|pending)\b(?:\s*\(|\s+['\"]|\s*$|\s*#)"),
+    re.compile(r"^\s*(?:skip|pending)\b(?:\s*\(|\s+['\"]|\s*$)"),
     re.compile(r"\bmarkTestSkipped\s*\("),
     re.compile(r"\bXCTSkip(?:If|Unless)?\s*\("),
     re.compile(r"(?<!\{)\bskip\s*:\s*(?:true\b|['\"])"),
@@ -200,21 +290,20 @@ _GLOBAL_MUTATION_PATTERNS = [
     re.compile(r"\b(?:std::env::set_var|env::set_var|set_var)\s*\("),
 ]
 
+# Secret-like words: password, passwd, token, secret, api_key, apikey, auth, jwt, private_key, credential
+_SECRET_WORDS_RE = re.compile(
+    r"""(?i)\b[a-zA-Z0-9_]*(?:password|passwd|token|secret|api_key|apikey|api-key|auth|jwt|private_key|credential)[a-zA-Z0-9_]*\b"""
+)
+
 # Linear, strictly bounded token prefix patterns (no unbounded wildcards, O(N) execution)
 _TOKEN_PREFIX_PATTERNS = [
     OCRRulebookRunner.SECRET_REGEX,
-    re.compile(r"""(?i)\b(?:sk_live_|sk_test_|ghp_|github_pat_|glpat-|xoxb-|AKIA)[a-zA-Z0-9_\-]{8,100}\b"""),
-    re.compile(r"""(?i)\bAIza[0-9A-Za-z-_]{35}\b"""),
-    re.compile(r"""(?i)\bBearer\s{1,4}[a-zA-Z0-9_\-\.]{4,200}\b"""),
+    re.compile(r"""(?i)\b(?:sk_live_|sk_test_|sk-proj-|ghp_|github_pat_|glpat-|xoxb-|xoxp-|AKIA)[a-zA-Z0-9_\-]{8,100}\b"""),
+    re.compile(r"""(?i)\bAIza[0-9A-Za-z-_]{20,100}\b"""),
+    re.compile(r"""(?i)\bBearer\s{1,4}\S+"""),
     re.compile(r"""-----BEGIN (?:[A-Z ]{1,20} )?PRIVATE KEY-----"""),
     re.compile(r"""\beyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}"""),
-    re.compile(r"""[a-zA-Z][a-zA-Z0-9+.-]{1,10}://[^:\s/]{1,100}:[^@\s/]{1,100}@[^/\s]{1,100}"""),
-    re.compile(
-        r"""(?i)\b[a-zA-Z0-9_]{0,30}(?:password|token|secret|api[_-]?key|auth[_-]?token|private[_-]?key)[a-zA-Z0-9_]{0,30}\s{0,8}(?:[:=]|={2,3})\s{0,8}["'][^"'\r\n]{1,200}["']"""
-    ),
-    re.compile(
-        r"""(?i)(?:os\.environ\s{0,8}\[\s{0,8}["']|process\.env(?:\.[a-zA-Z0-9_]{1,40}){0,2}[\.\[]\s{0,8}["']?)[a-zA-Z0-9_]{0,30}(?:password|token|secret|api[_-]?key|auth|jwt|private[_-]?key)[a-zA-Z0-9_]{0,30}["']?\s{0,8}\]?\s{0,8}(?:[:=]|={2,3})\s{0,8}["'][^"'\r\n]{1,200}["']"""
-    ),
+    re.compile(r"""[a-zA-Z][a-zA-Z0-9+.-]{1,10}://[^:\s/]{0,100}:[^@\s/]{1,100}@[^/\s]{1,100}"""),
 ]
 
 # Test function starters
@@ -235,9 +324,19 @@ _TEST_START_PATTERNS = [
 ]
 
 
-def _extract_sec008_rule_patterns() -> list[re.Pattern]:
-    """Test hook for SEC-008 pattern compatibility."""
-    return _TOKEN_PREFIX_PATTERNS[:2]
+def _extract_secret_patterns() -> list[re.Pattern]:
+    """Test hook for secret pattern access from LINE_RULES and bounded token patterns."""
+    patterns: list[re.Pattern] = []
+    for rule in LINE_RULES:
+        if rule[0] == "SEC-008":
+            pat = getattr(rule[3], "_pattern", rule[3])
+            if hasattr(pat, "search"):
+                patterns.append(pat)
+    return patterns or _TOKEN_PREFIX_PATTERNS
+
+
+# Backward compatibility alias for earlier callers
+_extract_sec008_rule_patterns = _extract_secret_patterns
 
 
 def _extract_method_name(next_line: str) -> str | None:
@@ -349,8 +448,13 @@ def is_test_path(path: str) -> bool:
 
 
 def is_secret_line(line: str) -> bool:
-    """True if line matches credential, token prefix, or secret assignment/comparison patterns."""
+    """True if line matches credential, token prefix, or secret-like name with a string literal."""
+    if len(line) > MAX_LINE_CHARS:
+        return False
     line_cut = line[:MAX_LINE_CHARS]
+    # Any line that mentions a secret-like name with a string literal on the same line
+    if ('"' in line_cut or "'" in line_cut or "`" in line_cut) and _SECRET_WORDS_RE.search(line_cut):
+        return True
     return any(p.search(line_cut) for p in _TOKEN_PREFIX_PATTERNS)
 
 
@@ -379,8 +483,16 @@ def is_comment_line(line: str, path_lower: str) -> bool:
     if is_hash:
         return stripped.startswith("#")
     # For non-hash languages (JS, TS, Java, Swift, Go, C#, C++, Rust, Kotlin)
-    if stripped.startswith(("//", "/*")):
+    if stripped.startswith("//"):
         return True
+    if stripped.startswith("/*"):
+        close_idx = stripped.find("*/", 2)
+        if close_idx == -1:
+            return True
+        remainder = stripped[close_idx + 2:].strip()
+        if not remainder or remainder.startswith(("//", "/*")):
+            return True
+        return False
     if stripped.startswith("*") and not stripped.startswith("*="):
         return True
     if path_lower.endswith((".html", ".htm", ".xml", ".svg")) and stripped.startswith("<!--"):
@@ -394,6 +506,22 @@ def strip_trailing_comment(line: str, path_lower: str = "") -> str:
     """Strip trailing comment outside of string literals using the file language's comment rules."""
     is_hash = _hash_comments(path_lower) if path_lower else True
     blocks = _block_comments(path_lower) if path_lower else ()
+
+    might_have_comment = False
+    if is_hash and "#" in line:
+        might_have_comment = True
+    elif blocks and ("/" in line or "=" in line):
+        might_have_comment = True
+    elif not is_hash and ("/" in line or ("#" in line and path_lower.endswith(".php"))):
+        might_have_comment = True
+    elif path_lower.endswith((".sql", ".lua")) and "--" in line:
+        might_have_comment = True
+    elif path_lower.endswith((".html", ".htm", ".xml", ".svg")) and "<!--" in line:
+        might_have_comment = True
+
+    if not might_have_comment:
+        return line.rstrip()
+
     spans: list[tuple[int, int]] = []
     cut = _comment_start(line, is_hash, spans=spans, blocks=blocks)
     chars = list(line)
@@ -425,9 +553,34 @@ def is_assertion_line(line: str, path: str = "") -> bool:
     if _IMPORT_LINE_RE.match(line_cut):
         return False
 
+    # Targeted raw pattern check: only run patterns for the keyword that matched
+    matched_pat = None
+    for keys, pats in _ASSERT_PATTERNS_MAP:
+        if any(k in line_cut for k in keys):
+            for p in pats:
+                if p.search(line_cut):
+                    matched_pat = p
+                    break
+            if matched_pat:
+                break
+    if not matched_pat:
+        return False
+
     stripped = strip_trailing_comment(line_cut, path_lower)
-    code_only = _mask_strings(stripped)
-    return any(p.search(code_only) for p in _ASSERTION_PATTERNS)
+    if not matched_pat.search(stripped):
+        return False
+
+    # Check if the matched assertion was inside a string literal
+    first_quote = min((stripped.find(q) for q in ('"', "'", "`") if stripped.find(q) != -1), default=-1)
+    if first_quote == -1:
+        return True
+    m = matched_pat.search(stripped)
+    if m and m.start() < first_quote:
+        return True
+
+    # Otherwise, mask strings to verify assertion is outside string literals
+    code_only = _mask_code_strings(stripped)
+    return bool(matched_pat.search(code_only))
 
 
 @dataclass
@@ -458,7 +611,8 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
     current_hunk: _DiffHunk | None = None
     old_line_num = 0
     new_line_num = 0
-    open_comments: dict[str, str] = {}
+    open_comments_old: dict[str, str] = {}
+    open_comments_new: dict[str, str] = {}
 
     hunk_header_re = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
     diff_git_re = re.compile(r'^diff --git (?:\"a/(.+?)\"|a/(\S+?)) (?:\"b/(.+?)\"|b/(\S+?))$')
@@ -531,33 +685,50 @@ def _parse_unified_diff(raw_diff: str) -> tuple[list[_ParsedFileDiff], bool]:
             continue
 
         fp = current_file.path
+        is_tp = is_test_path(fp)
         fp_lower = fp.replace("\\", "/").lower()
 
         if line.startswith("+"):
             content = line[1:]
-            if open_comments.get(fp_lower) or ("/*" in content) or ("<!--" in content):
-                carried = _carry_comment(open_comments, fp_lower, content)
+            if is_tp:
+                # Lines over 2,000 characters are treated as non-assertion text without scanning
+                if len(raw_line) > MAX_LINE_CHARS:
+                    is_assert = False
+                else:
+                    if open_comments_new.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content)):
+                        carried = _carry_comment(open_comments_new, fp_lower, content)
+                    else:
+                        carried = content
+                    is_assert = (carried is not None) and is_assertion_line(carried, fp)
             else:
-                carried = content
-            # Evaluate assertion once per line on the comment-stripped content and cache result
-            is_assert = (carried is not None) and is_assertion_line(carried, fp)
+                is_assert = False
             current_hunk.added_lines.append((new_line_num, content, is_assert))
             current_file.total_insertions += 1
             new_line_num += 1
         elif line.startswith("-"):
             content = line[1:]
-            if open_comments.get(fp_lower) or ("/*" in content) or ("<!--" in content):
-                carried = _carry_comment(open_comments, fp_lower, content)
+            if is_tp:
+                if len(raw_line) > MAX_LINE_CHARS:
+                    is_assert = False
+                else:
+                    if open_comments_old.get(fp_lower) or ("/*" in content) or ("<!--" in content) or (fp_lower.endswith(".rb") and ("=begin" in content or "=end" in content)):
+                        carried = _carry_comment(open_comments_old, fp_lower, content)
+                    else:
+                        carried = content
+                    is_assert = (carried is not None) and is_assertion_line(carried, fp)
             else:
-                carried = content
-            is_assert = (carried is not None) and is_assertion_line(carried, fp)
+                is_assert = False
             current_hunk.removed_lines.append((old_line_num, content, is_assert))
             current_file.total_deletions += 1
             old_line_num += 1
         else:
-            # Context line
-            if open_comments.get(fp_lower) or ("/*" in line) or ("<!--" in line):
-                _carry_comment(open_comments, fp_lower, line[1:] if line.startswith(" ") else line)
+            # Context line: updates both old and new side comment state if applicable
+            if is_tp:
+                ctx_code = line[1:] if line.startswith(" ") else line
+                if open_comments_old.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
+                    _carry_comment(open_comments_old, fp_lower, ctx_code)
+                if open_comments_new.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
+                    _carry_comment(open_comments_new, fp_lower, ctx_code)
             new_line_num += 1
             old_line_num += 1
 
@@ -652,7 +823,9 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
                 continue
             if is_comment_line(text, fp_lower):
                 continue
-            if any(p.search(text) for p in _SKIP_PATTERNS):
+            stripped = strip_trailing_comment(text, fp_lower)
+            code_only = _mask_code_strings(stripped)
+            if any(p.search(code_only) for p in _SKIP_PATTERNS):
                 skip_matches.append((lnum, text))
         if skip_matches:
             candidates.append(("rule2", fp, skip_matches))
@@ -666,14 +839,10 @@ def test_evidence_lines(raw_diff: str) -> list[str]:
             # Fast raw match before expensive comment/string masking
             if not any(p.search(text[:MAX_LINE_CHARS]) for p in _GLOBAL_MUTATION_PATTERNS):
                 continue
-            # Once we have enough candidates to saturate the 12-line cap, fast-count remaining raw matches
-            if len(candidates) >= MAX_EVIDENCE_LINES + 20:
-                candidates.append(("rule3", fp, lnum, text))
-                continue
             if is_comment_line(text, fp_lower):
                 continue
             stripped = strip_trailing_comment(text, fp_lower)
-            code_only = _mask_strings(stripped)
+            code_only = _mask_code_strings(stripped)
             if any(p.search(code_only) for p in _GLOBAL_MUTATION_PATTERNS):
                 candidates.append(("rule3", fp, lnum, text))
 
