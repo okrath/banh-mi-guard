@@ -358,7 +358,12 @@ def ensure_repo_setup(start: Path, create_invariants: bool = True) -> List[str]:
 
     if known is None or known.get("version") != __version__:
         registry[key] = {"version": __version__}
-        _write_json(_registry_file(), registry)
+        try:
+            _write_json(_registry_file(), registry)
+        except OSError:
+            # Registry is only a cache of known repositories; keep silent so an unwritable
+            # GUARD_HOME does not print on every run, and continue without stopping the command.
+            pass
     return messages
 
 

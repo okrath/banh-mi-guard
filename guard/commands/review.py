@@ -108,16 +108,26 @@ def accept_cmd(
         console.print("Restore the reviewed files, or allow more rounds (c) and run guard post.")
         raise typer.Exit(code=1)
     if choice == "a":
+        from guard.core.session import ApprovalKeyError, compute_approval_signature
+        try:
+            sig = compute_approval_signature(
+                mgr.repo_path,
+                session.session_id,
+                dict(reviewed),
+            )
+        except (ApprovalKeyError, OSError) as e:
+            session.post.approval_signature = None
+            session.post.all_passed = False
+            session.post.accepted_by_user = False
+            _save_or_exit(mgr, session)
+            console.print(f"[bold red]❌ {e}[/bold red]")
+            raise typer.Exit(code=1) from e
+
         session.status = SessionStatus.COMPLETED
         session.post.approved_fingerprints = dict(reviewed)
         session.post.all_passed, session.post.accepted_by_user = True, True
         session.post.followups, session.post.needs_user = remaining, False
-        from guard.core.session import compute_approval_signature
-        session.post.approval_signature = compute_approval_signature(
-            mgr.repo_path,
-            session.session_id,
-            session.post.approved_fingerprints,
-        )
+        session.post.approval_signature = sig
         _save_or_exit(mgr, session)
         _write_post_report(target, session.post, session.pre)
     elif choice == "c":

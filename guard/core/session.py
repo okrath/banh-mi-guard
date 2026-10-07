@@ -14,7 +14,6 @@ import hmac
 import json
 import os
 import secrets
-import tempfile
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -159,33 +158,88 @@ def get_approval_key() -> bytes:
     """
     key_dir = guard_home()
     key_file = key_dir / "approval.key"
-    if key_file.is_file():
-        data = key_file.read_bytes()
-        if len(data) == 32:
-            return data
-    key_dir.mkdir(parents=True, exist_ok=True)
-    new_key = secrets.token_bytes(32)
-    fd, tmp = tempfile.mkstemp(dir=key_dir, prefix=".approval-key-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_key)
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
+        if key_file.is_file():
+            data = key_file.read_bytes()
+            if len(data) == 32:
+                return data
+    except OSError:
+        pass
+
+    try:
+        key_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ApprovalKeyError(f"Approval key directory {key_dir} cannot be created: {e}") from e
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    max_attempts = 5
+    fd: Optional[int] = None
+    tmp: Optional[Path] = None
+    last_err: Optional[BaseException] = None
+
+    for _ in range(max_attempts):
+        candidate = key_dir / f".approval-key-{secrets.token_hex(8)}.tmp"
         try:
-            os.link(tmp, key_file)
-        except (FileExistsError, OSError):
+            fd = os.open(str(candidate), flags, 0o600)
+            tmp = candidate
+            break
+        except OSError as e:
+            last_err = e
+
+    if fd is None or tmp is None:
+        raise ApprovalKeyError(
+            f"Approval key in {key_dir} cannot be created or written: {last_err}"
+        ) from last_err
+
+    new_key = secrets.token_bytes(32)
+    try:
+        try:
             try:
-                if not key_file.is_file() or len(key_file.read_bytes()) != 32:
-                    os.replace(tmp, key_file)
+                f = os.fdopen(fd, "wb")
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            with f:
+                f.write(new_key)
+            if os.name != "nt":
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            try:
+                os.link(tmp, key_file)
+            except (FileExistsError, OSError):
+                try:
+                    if not key_file.is_file() or len(key_file.read_bytes()) != 32:
+                        os.replace(tmp, key_file)
+                except OSError:
+                    pass
+        except OSError as e:
+            raise ApprovalKeyError(f"Approval key in {key_dir} cannot be created or written: {e}") from e
+    finally:
+        if tmp is not None:
+            try:
+                Path(tmp).unlink(missing_ok=True)
             except OSError:
                 pass
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    if key_file.is_file():
-        data = key_file.read_bytes()
-        if len(data) == 32:
-            return data
-    raise RuntimeError(f"Approval key file {key_file} is corrupt or invalid length")
+    for attempt in range(3):
+        try:
+            if key_file.is_file():
+                data = key_file.read_bytes()
+                if len(data) == 32:
+                    return data
+                break
+        except OSError as e:
+            if attempt < 2:
+                time.sleep(0.05)
+                continue
+            raise ApprovalKeyError(f"Approval key file {key_file} cannot be read: {e}") from e
+        break
+
+    raise ApprovalKeyError(f"Approval key file {key_file} is corrupt or invalid length")
 
 
 def compute_approval_signature(repo_path: str | Path, session_id: str, approved_fingerprints: Dict[str, str]) -> str:
@@ -219,7 +273,7 @@ class SessionManager:
                 Path(repo_path).resolve(), session.session_id, session.post.approved_fingerprints
             )
             return hmac.compare_digest(sig, expected)
-        except (OSError, RuntimeError, ValueError, TypeError):
+        except (ApprovalKeyError, OSError, RuntimeError, ValueError, TypeError):
             # A key that cannot be read or created means "not verified": the commit gate must
             # block, and an exception here would reach the hook boundary, which allows the action.
             return False
@@ -410,10 +464,25 @@ class SessionManager:
                 )
             except (OSError, RuntimeError) as e:
                 post_rec.approval_signature = None
+                post_rec.all_passed = False
+                post_rec.muse_verdict = "REVISE"
+                post_rec.approved_fingerprints = {}
+                key_err = (
+                    e
+                    if isinstance(e, ApprovalKeyError)
+                    else ApprovalKeyError(
+                        f"Approval key in {guard_home()} cannot be created or written: {e}"
+                    )
+                )
+                msg = f"Approval could not be signed: {key_err}"
+                post_rec.muse_notes = f"{post_rec.muse_notes}\n{msg}".strip() if post_rec.muse_notes else msg
                 session.status = SessionStatus.NEEDS_FIX
                 session.post = post_rec
-                self._save(session)
-                raise ApprovalKeyError(f"Approval key in {guard_home()} cannot be created or written: {e}") from e
+                try:
+                    self._save(session)
+                except OSError as save_err:
+                    print(f"Could not save session: {save_err}")
+                raise key_err from e
         else:
             post_rec.approval_signature = None
 

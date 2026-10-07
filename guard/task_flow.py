@@ -854,22 +854,31 @@ def _post_record_and_report(
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
     )
 
+    key_error = None
     try:
         session_mgr.complete_post_session(post_rec)
     except ApprovalKeyError as e:
-        console.print(f"[bold red]❌ {e}[/bold red]")
-        return False
+        key_error = e
+
     post_rec.needs_user = _record_round(session_mgr, review_verdict, post_rec)
+
+    report_verdict = review_verdict
+    if key_error is not None:
+        all_passed = False
+        report_verdict = review_verdict.model_copy(update={"verdict": ReviewVerdict.REVISE})
 
     render_post_task_terminal(post_rec, pre)
     _write_post_report(target_repo, post_rec, pre)
-
-    if not all_passed and review_verdict.remediation_steps:
+    if not all_passed and report_verdict.remediation_steps:
         console.print(Panel(
-            "\n".join(f"  [bold red]•[/bold red] {s}" for s in review_verdict.remediation_steps),
+            "\n".join(f"  [bold red]•[/bold red] {s}" for s in report_verdict.remediation_steps),
             title="🔧 Actionable Remediation Checklist",
             border_style="red",
         ))
+
+    if key_error is not None:
+        console.print(f"[bold red]❌ {key_error}[/bold red]")
+        return False
 
     return all_passed
 
@@ -972,6 +981,7 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
         start_t = time.perf_counter()
         try:
             # detect_build_command returns guard's own fixed commands (never user config); shell=True needed for npm/pnpm on Windows.
+            # Turn into an argument list before ever reading a build command from config.
             p = subprocess.run(
                 build_cmd,
                 shell=True,
