@@ -9,7 +9,6 @@ import pytest
 
 from guard.core import repo_setup
 from guard.core.repo_setup import (
-    _clean_git_env,
     _clear_repo_cache,
     _dir_for_path,
     _normalise_path,
@@ -174,13 +173,13 @@ def test_repo_for_path_caching(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     f4.write_text("4", encoding="utf-8")
 
     git_calls: list[tuple] = []
-    orig_git = repo_setup._git
+    orig_git = repo_setup._git_clean
 
     def counting_git(*args, **kwargs):
         git_calls.append(args)
         return orig_git(*args, **kwargs)
 
-    monkeypatch.setattr(repo_setup, "_git", counting_git)
+    monkeypatch.setattr(repo_setup, "_git_clean", counting_git)
 
     # First file in pkg1 costs 1 git call
     assert repo_for_path(f1) == repo
@@ -349,24 +348,45 @@ def test_repo_for_path_clean_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     main_file = main / "main_file.txt"
     main_file.write_text("main", encoding="utf-8")
 
-    # GIT_DIR set to main/.git must not make outside_file resolve to main
+    # Set all 4 git location variables in the environment
     monkeypatch.setenv("GIT_DIR", str(main / ".git"))
-    _clear_repo_cache()
-    assert repo_for_path(outside_file) is None
-
-    # GIT_WORK_TREE set to main must not make wt_file resolve to main
     monkeypatch.setenv("GIT_WORK_TREE", str(main))
-    _clear_repo_cache()
-    assert repo_for_path(wt_file) == wt
-
-    # All 4 stripped variables simultaneously
     monkeypatch.setenv("GIT_COMMON_DIR", str(main / ".git"))
     monkeypatch.setenv("GIT_INDEX_FILE", str(main / ".git" / "index"))
-    _clear_repo_cache()
+
+    env_during_calls: list[dict[str, str | None]] = []
+    orig_git_clean = repo_setup._git_clean
+
+    def spy_git_clean(*args, **kwargs):
+        # Capture process environment during the git lookup
+        env_during_calls.append({
+            "GIT_DIR": os.environ.get("GIT_DIR"),
+            "GIT_WORK_TREE": os.environ.get("GIT_WORK_TREE"),
+            "GIT_COMMON_DIR": os.environ.get("GIT_COMMON_DIR"),
+            "GIT_INDEX_FILE": os.environ.get("GIT_INDEX_FILE"),
+        })
+        return orig_git_clean(*args, **kwargs)
+
+    monkeypatch.setattr(repo_setup, "_git_clean", spy_git_clean)
+
+    # 1. The 4 variables do not change the lookup results:
     assert repo_for_path(outside_file) is None
     assert repo_for_path(wt_file) == wt
     assert repo_for_path(main_file) == main
 
+    # 2. os.environ was NEVER modified during the calls
+    assert len(env_during_calls) > 0
+    for env_snapshot in env_during_calls:
+        assert env_snapshot["GIT_DIR"] == str(main / ".git")
+        assert env_snapshot["GIT_WORK_TREE"] == str(main)
+        assert env_snapshot["GIT_COMMON_DIR"] == str(main / ".git")
+        assert env_snapshot["GIT_INDEX_FILE"] == str(main / ".git" / "index")
+
+    # 3. os.environ is unchanged after the calls
+    assert os.environ.get("GIT_DIR") == str(main / ".git")
+    assert os.environ.get("GIT_WORK_TREE") == str(main)
+    assert os.environ.get("GIT_COMMON_DIR") == str(main / ".git")
+    assert os.environ.get("GIT_INDEX_FILE") == str(main / ".git" / "index")
 
 def test_repo_for_path_msys_bash_paths(tmp_path: Path):
     _clear_repo_cache()
@@ -417,35 +437,47 @@ def test_repo_for_path_specific_exceptions(tmp_path: Path, monkeypatch: pytest.M
     def raise_runtime_error(*args, **kwargs):
         raise RuntimeError("symlink loop")
 
-    monkeypatch.setattr(repo_setup, "git_root", raise_value_error)
+    # repo_for_path handles exceptions from git lookup
+    monkeypatch.setattr(repo_setup, "_git_clean_root", raise_value_error)
     _clear_repo_cache()
     assert repo_for_path(file_path) is None
 
-    monkeypatch.setattr(repo_setup, "git_root", raise_os_error)
+    monkeypatch.setattr(repo_setup, "_git_clean_root", raise_os_error)
     _clear_repo_cache()
     assert repo_for_path(file_path) is None
 
-    monkeypatch.setattr(repo_setup, "git_root", raise_runtime_error)
+    monkeypatch.setattr(repo_setup, "_git_clean_root", raise_runtime_error)
     _clear_repo_cache()
     assert repo_for_path(file_path) is None
 
+    # git_root itself handles exceptions from Path.resolve()
+    monkeypatch.setattr(repo_setup, "_git", lambda *args, **kwargs: "invalid\x00path")
+    assert git_root(file_path) is None
 
-def test_clean_git_env_helper(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("GIT_DIR", "/some/git/dir")
-    monkeypatch.setenv("GIT_WORK_TREE", "/some/work/tree")
-    monkeypatch.setenv("GIT_COMMON_DIR", "/some/common/dir")
-    monkeypatch.setenv("GIT_INDEX_FILE", "/some/index")
-    monkeypatch.setenv("OTHER_VAR", "keep_me")
 
-    assert os.environ.get("GIT_DIR") == "/some/git/dir"
-    with _clean_git_env():
-        assert "GIT_DIR" not in os.environ
-        assert "GIT_WORK_TREE" not in os.environ
-        assert "GIT_COMMON_DIR" not in os.environ
-        assert "GIT_INDEX_FILE" not in os.environ
-        assert os.environ.get("OTHER_VAR") == "keep_me"
+def test_repo_for_path_broken_worktree(tmp_path: Path):
+    _clear_repo_cache()
+    main = _init_git_repo(tmp_path / "main_repo")
+    broken_wt = main / "broken_wt"
+    broken_wt.mkdir()
+    (broken_wt / ".git").write_text("gitdir: /nonexistent/deleted/wt\n", encoding="utf-8")
 
-    assert os.environ.get("GIT_DIR") == "/some/git/dir"
-    assert os.environ.get("GIT_WORK_TREE") == "/some/work/tree"
-    assert os.environ.get("GIT_COMMON_DIR") == "/some/common/dir"
-    assert os.environ.get("GIT_INDEX_FILE") == "/some/index"
+    broken_file = broken_wt / "broken.py"
+    broken_file.write_text("broken", encoding="utf-8")
+
+    broken_sub = broken_wt / "nested" / "deep"
+    broken_sub.mkdir(parents=True)
+    broken_sub_file = broken_sub / "deep.py"
+    broken_sub_file.write_text("deep", encoding="utf-8")
+
+    # All paths in broken worktree must resolve to None, not <main>
+    assert repo_for_path(broken_wt) is None
+    assert repo_for_path(broken_file) is None
+    assert repo_for_path(broken_sub_file) is None
+    assert repo_for_path(broken_wt / ".git") is None
+
+    # Valid paths in main still resolve to main
+    main_file = main / "valid.py"
+    main_file.write_text("valid", encoding="utf-8")
+    assert repo_for_path(main_file) == main
+    assert repo_for_path(main) == main

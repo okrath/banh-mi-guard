@@ -15,7 +15,6 @@ are only read; when they need a change, the setup check tells the user what to d
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
@@ -23,7 +22,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from guard import __version__
 
@@ -138,24 +137,40 @@ def git_root(path: Path) -> Optional[Path]:
         return None
 
 
-_REPO_FOR_PATH_CACHE: Dict[Path, Optional[Path]] = {}
 _GIT_CLEAN_ENV_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+
+
+def _git_clean(repo: Path, *args: str) -> Optional[str]:
+    clean_env = {k: v for k, v in os.environ.items() if k not in _GIT_CLEAN_ENV_VARS}
+    try:
+        res = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", env=clean_env, check=False)
+    except OSError:
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def _git_clean_root(path: Path) -> Optional[Path]:
+    top = _git_clean(path, "rev-parse", "--show-toplevel")
+    try:
+        return Path(top).resolve() if top else None
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+_REPO_FOR_PATH_CACHE: Dict[Path, Optional[Path]] = {}
 
 
 def _clear_repo_cache() -> None:
     _REPO_FOR_PATH_CACHE.clear()
 
 
-@contextlib.contextmanager
-def _clean_git_env() -> Iterator[None]:
-    saved = {k: os.environ[k] for k in _GIT_CLEAN_ENV_VARS if k in os.environ}
-    for k in saved:
-        del os.environ[k]
+def _dir_has_git(p: Path) -> bool:
     try:
-        yield
-    finally:
-        os.environ.update(saved)
-
+        entry = p / ".git"
+        return entry.exists() or entry.is_symlink()
+    except (ValueError, OSError):
+        return False
 
 def _normalise_path(path: str | Path, base: Optional[Path] = None) -> Path:
     p_str = str(path).strip().strip('"').strip("'")
@@ -168,20 +183,18 @@ def _normalise_path(path: str | Path, base: Optional[Path] = None) -> Path:
             p_str = p_str[len(prefix):]
             break
 
-    if sys.platform == "win32":
-        posix = p_str.replace("\\", "/")
-        m = re.match(r"^/cygdrive/([a-zA-Z])(/.*)?$", posix)
+    if sys.platform == "win32" and p_str.startswith("/"):
+        m = re.match(r"^/cygdrive/([a-zA-Z])(/.*)?$", p_str)
         if m:
             letter = m.group(1).upper()
             rest = m.group(2) or "/"
             p_str = f"{letter}:{rest}"
         else:
-            m = re.match(r"^/([a-zA-Z])(/.*)?$", posix)
+            m = re.match(r"^/([a-zA-Z])(/.*)?$", p_str)
             if m:
                 letter = m.group(1).upper()
                 rest = m.group(2) or "/"
                 p_str = f"{letter}:{rest}"
-
     p = Path(p_str)
     if not p.is_absolute() and base is not None:
         base_norm = _normalise_path(base)
@@ -223,19 +236,22 @@ def repo_for_path(path: str | Path, base: Optional[Path] = None) -> Optional[Pat
     if target_dir in _REPO_FOR_PATH_CACHE:
         return _REPO_FOR_PATH_CACHE[target_dir]
 
+    curr: Path = target_dir
+    repo: Optional[Path] = None
     try:
-        with _clean_git_env():
-            repo = git_root(target_dir)
-            if repo is None:
-                curr = target_dir
-                while curr.parent != curr:
-                    curr = curr.parent
-                    if curr in _REPO_FOR_PATH_CACHE:
-                        repo = _REPO_FOR_PATH_CACHE[curr]
-                        break
-                    repo = git_root(curr)
-                    if repo is not None:
-                        break
+        while True:
+            if curr in _REPO_FOR_PATH_CACHE:
+                repo = _REPO_FOR_PATH_CACHE[curr]
+                break
+            if _dir_has_git(curr):
+                repo = _git_clean_root(curr)
+                break
+            repo = _git_clean_root(curr)
+            if repo is not None:
+                break
+            if curr.parent == curr:
+                break
+            curr = curr.parent
     except (ValueError, OSError, RuntimeError):
         repo = None
     _REPO_FOR_PATH_CACHE[target_dir] = repo
