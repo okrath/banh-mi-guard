@@ -1,0 +1,11 @@
+{
+  "id": "n04",
+  "source": "git",
+  "title": "test: read the CLI command order without parsing coloured help",
+  "prompt": "test: read the CLI command order without parsing coloured help\n\nRead top-level CLI command and group order directly from the Click group\nbuilt by Typer (via list_commands on Context) and filter out hidden\ncommands, avoiding dependency on terminal ANSI colour codes or width.\n\nFiles changed: tests/test_cli_command_order.py",
+  "domain": "backend",
+  "diff": "diff --git a/tests/test_cli_command_order.py b/tests/test_cli_command_order.py\nindex 9280f0b..54e2dcc 100644\n--- a/tests/test_cli_command_order.py\n+++ b/tests/test_cli_command_order.py\n@@ -2,6 +2,11 @@\n Pin top-level CLI command order to prevent silent reordering from import sorting.\n \"\"\"\n \n+from typing import cast\n+\n+import typer\n+import typer.core\n+import typer.main\n from typer.testing import CliRunner\n \n import guard.cli\n@@ -67,17 +72,11 @@ def test_help_command_order():\n     res = runner.invoke(guard.cli.app, [\"--help\"])\n     assert res.exit_code == 0\n \n-    visible_commands = []\n-    in_commands_section = False\n-    for line in res.stdout.splitlines():\n-        if \"Commands\" in line:\n-            in_commands_section = True\n-            continue\n-        if in_commands_section and \"\u2502\" in line:\n-            parts = line.split(\"\u2502\")\n-            if len(parts) >= 3:\n-                name = parts[1][:14].strip()\n-                if name and not name.startswith(\"\u2500\"):\n-                    visible_commands.append(name)\n-\n+    group = cast(typer.core.TyperGroup, typer.main.get_command(guard.cli.app))\n+    ctx = typer.Context(group)\n+    visible_commands = [\n+        name\n+        for name in group.list_commands(ctx)\n+        if not getattr(group.get_command(ctx, name), \"hidden\", False)\n+    ]\n     assert visible_commands == EXPECTED_HELP_COMMAND_ORDER\n",
+  "ref": "3ea1af9",
+  "label": "clean",
+  "defects": []
+}

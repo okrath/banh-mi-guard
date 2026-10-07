@@ -1,0 +1,26 @@
+{
+  "id": "c05",
+  "source": "git",
+  "title": "fix: keep the CLI command order and pin the lint tools",
+  "prompt": "fix: keep the CLI command order and pin the lint tools\n\nRestore original command import order in CLI with isort fences and pin\nruff and pyright to exact versions in test dependencies. Drop redundant\nstatic analysis checks in OCR engine, repo setup, and task flow. Add\ntest pinning the top-level command order.\n\nFiles changed: guard/cli.py, guard/core/ocr_engine.py, guard/core/repo_setup.py, guard/task_flow.py, pyproject.toml, tests/test_cli_command_order.py",
+  "domain": "backend",
+  "diff": "diff --git a/tests/test_cli_command_order.py b/tests/test_cli_command_order.py\nnew file mode 100644\nindex 0000000..9280f0b\n--- /dev/null\n+++ b/tests/test_cli_command_order.py\n@@ -0,0 +1,83 @@\n+\"\"\"\n+Pin top-level CLI command order to prevent silent reordering from import sorting.\n+\"\"\"\n+\n+from typer.testing import CliRunner\n+\n+import guard.cli\n+\n+EXPECTED_REGISTERED_COMMANDS = [\n+    \"pre\",\n+    \"post\",\n+    \"reset\",\n+    \"run\",\n+    \"setup\",\n+    \"install\",\n+    \"uninstall\",\n+    \"finding\",\n+    \"accept\",\n+    \"untracked\",\n+    \"agent-event\",\n+    \"review\",\n+    \"update\",\n+    \"doctor\",\n+    \"laya\",\n+]\n+\n+EXPECTED_REGISTERED_GROUPS = [\n+    \"invariants\",\n+    \"config\",\n+    \"hook\",\n+    \"agent\",\n+]\n+\n+EXPECTED_HELP_COMMAND_ORDER = [\n+    \"pre\",\n+    \"post\",\n+    \"reset\",\n+    \"run\",\n+    \"setup\",\n+    \"install\",\n+    \"uninstall\",\n+    \"finding\",\n+    \"accept\",\n+    \"untracked\",\n+    \"agent-event\",\n+    \"review\",\n+    \"update\",\n+    \"doctor\",\n+    \"invariants\",\n+    \"config\",\n+    \"hook\",\n+    \"agent\",\n+]\n+\n+\n+def test_registered_commands_order():\n+    \"\"\"Typer registered command and group names must match the canonical order.\"\"\"\n+    cmd_names = [c.name or (c.callback.__name__ if c.callback else \"\") for c in guard.cli.app.registered_commands]\n+    group_names = [g.name for g in guard.cli.app.registered_groups]\n+    assert cmd_names == EXPECTED_REGISTERED_COMMANDS\n+    assert group_names == EXPECTED_REGISTERED_GROUPS\n+\n+\n+def test_help_command_order():\n+    \"\"\"`guard --help` lists top-level commands and groups in the exact expected order.\"\"\"\n+    runner = CliRunner()\n+    res = runner.invoke(guard.cli.app, [\"--help\"])\n+    assert res.exit_code == 0\n+\n+    visible_commands = []\n+    in_commands_section = False\n+    for line in res.stdout.splitlines():\n+        if \"Commands\" in line:\n+            in_commands_section = True\n+            continue\n+        if in_commands_section and \"\u2502\" in line:\n+            parts = line.split(\"\u2502\")\n+            if len(parts) >= 3:\n+                name = parts[1][:14].strip()\n+                if name and not name.startswith(\"\u2500\"):\n+                    visible_commands.append(name)\n+\n+    assert visible_commands == EXPECTED_HELP_COMMAND_ORDER\n",
+  "ref": "4fb9917",
+  "label": "defect",
+  "defects": [
+    {
+      "id": "c05",
+      "file": "tests/test_cli_command_order.py",
+      "kind": "test-quality",
+      "severity": "medium",
+      "visible_in_diff": true,
+      "summary": "`tests/test_cli_command_order.py` parses coloured help text, fails on CI where colour is on",
+      "keywords": [
+        "colored help output",
+        "expected_registered_commands",
+        "rich box",
+        "ansi"
+      ]
+    }
+  ]
+}
