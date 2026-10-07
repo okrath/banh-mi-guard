@@ -219,7 +219,9 @@ class SessionManager:
                 Path(repo_path).resolve(), session.session_id, session.post.approved_fingerprints
             )
             return hmac.compare_digest(sig, expected)
-        except (OSError, ValueError, TypeError):
+        except (OSError, RuntimeError, ValueError, TypeError):
+            # A key that cannot be read or created means "not verified": the commit gate must
+            # block, and an exception here would reach the hook boundary, which allows the action.
             return False
 
     def is_approval_verified(self, session: Optional[GuardSession]) -> bool:
