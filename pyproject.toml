@@ -34,6 +34,11 @@ guard = "guard.cli:main"
 where = ["."]
 include = ["guard*"]
 
+[tool.pytest.ini_options]
+# A bare `pytest` imports this checkout's own packages (`guard`, and `bench`, which is not installed)
+# instead of an editable install that may point at another checkout or worktree.
+pythonpath = ["."]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
