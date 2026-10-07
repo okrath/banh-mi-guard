@@ -136,6 +136,25 @@ def test_tampered_fingerprints_returns_empty_and_blocks_commit(tmp_path, fake_oc
     assert execute_post_task(repo_path=repo, hook=True) is False
 
 
+def test_unreadable_key_blocks_commit_instead_of_allowing(tmp_path, fake_ocr_review, isolate_guard_home):
+    repo = _make_repo(tmp_path)
+    assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
+    (repo / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    assert execute_post_task(repo_path=repo) is True
+    assert decide(AgentEvent(event="before-commit", cwd=str(repo))).action != "block"
+
+    # The key turns into something that cannot be read as a key: verification fails closed
+    key_file = isolate_guard_home / "approval.key"
+    key_file.unlink()
+    key_file.mkdir()
+    mgr = SessionManager(repo)
+    session = mgr.load_local_session()
+    assert mgr.is_approval_verified(session) is False
+    assert mgr.verified_approval(session) == {}
+    assert decide(AgentEvent(event="before-commit", cwd=str(repo))).action == "block"
+    assert _bash(repo, "git add -A && git commit -m 'x'").action == "block"
+
+
 def test_hook_path_refuses_forged_approval(tmp_path, fake_ocr_review, capsys):
     repo = _make_repo(tmp_path)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is True
