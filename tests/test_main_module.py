@@ -1,5 +1,6 @@
 """Unit and functional tests for `python -m guard` entry point and score arithmetic."""
 
+import os
 import runpy
 import subprocess
 import sys
@@ -14,16 +15,21 @@ from guard.core.ocr_engine import RuleViolation
 from guard.core.repo_setup import refresh_after_upgrade
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Guard prints emoji/box-drawing text; force the child to write UTF-8 so it matches the decode below.
+CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def _run_guard(cmd):
+    return subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", env=CHILD_ENV
+    )
 
 
 def test_main_module_version():
     """`python -m guard --version` prints the version and exits 0."""
     refresh_after_upgrade()
-    result = subprocess.run(
-        [sys.executable, "-m", "guard", "--version"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+    result = _run_guard(
+        [sys.executable, "-m", "guard", "--version"]
     )
     assert result.returncode == 0
     assert f"guard version {__version__}" in result.stdout
@@ -34,17 +40,11 @@ def test_main_module_matches_console_script():
     # Ensure GUARD_HOME is already refreshed so neither invocation prints first-visit health check
     refresh_after_upgrade()
 
-    module_res = subprocess.run(
-        [sys.executable, "-m", "guard", "--version"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+    module_res = _run_guard(
+        [sys.executable, "-m", "guard", "--version"]
     )
-    script_res = subprocess.run(
-        [sys.executable, "-c", "import sys; from guard.cli import main; sys.exit(main())", "--version"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+    script_res = _run_guard(
+        [sys.executable, "-c", "import sys; from guard.cli import main; sys.exit(main())", "--version"]
     )
 
     assert module_res.returncode == script_res.returncode
@@ -53,20 +53,14 @@ def test_main_module_matches_console_script():
 
 def test_main_module_exit_code_pass_through():
     """Non-zero exit codes (such as unknown command or invalid options) pass through."""
-    result = subprocess.run(
-        [sys.executable, "-m", "guard", "nonexistent-subcommand-12345"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+    result = _run_guard(
+        [sys.executable, "-m", "guard", "nonexistent-subcommand-12345"]
     )
     assert result.returncode != 0
 
     # Also test valid command exits with 0
-    help_res = subprocess.run(
-        [sys.executable, "-m", "guard", "--help"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+    help_res = _run_guard(
+        [sys.executable, "-m", "guard", "--help"]
     )
     assert help_res.returncode == 0
 
