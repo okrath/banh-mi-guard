@@ -13,7 +13,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 from guard.core.ocr_engine import GitDiffInspector
 
@@ -299,3 +299,301 @@ def worktree_fingerprint(repo: Path) -> Dict[str, str]:
 
 def changed_between(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
     return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+# Anchored location-change commands and git -C
+_TARGET_GIT = re.compile(r"^\s*(?i:git(?:\.exe)?)\s+-C(?=\s)")
+_TARGET_SECOND = re.compile(
+    r"\b(?:cd|chdir|sl|Set-Location|pushd|popd|Push-Location|Pop-Location|env\s+-C|sudo\s+-D)"
+    r"|(?<!\w)-(?:(?-i:C)|wd)\b|--(?:git-dir|work-tree|chdir)\b|-WorkingDirectory\b|\bGIT_(?:DIR|WORK_TREE)=",
+    re.I,
+)
+_TARGET_INDIRECT = re.compile(
+    r"\b(?:cmd|powershell|pwsh|bash|sh|iex|Invoke-Expression|Start-Process|xargs|"
+    r"eval|source|exec|zsh|dash|ksh|wsl|Invoke-Command|icm)\b|"
+    r"\[scriptblock\]",
+    re.I,
+)
+_TARGET_SEGMENT_SEP = re.compile(r"[;&|\r\n]+")
+_CD_KEYWORDS = re.compile(
+    r"\b(?:cd|chdir|sl|Set-Location|Push-Location|pushd|popd|Pop-Location)\b",
+    re.I,
+)
+_CURLY_QUOTES = tuple(chr(cp) for cp in range(0x2018, 0x201F))
+_TARGET_PROVIDER = re.compile(r"^[a-zA-Z]{2,}:[\\/]")
+_TARGET_DRIVE_REL = re.compile(r"^[a-zA-Z]:(?![\\/])")
+_TARGET_POSIX_WIN = re.compile(r"^/[a-zA-Z](?:/|$)")
+_TARGET_DRIVE_PREFIX = re.compile(r"^([a-zA-Z]):")
+_TARGET_UNC_OR_DRIVE = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
+_TARGET_ENV_VAR = re.compile(r"%[^%\s]+%")
+_TARGET_FORBIDDEN = set("$%`();&|*?<>{}\"'^") | ({"\\"} if os.name != "nt" else set())
+
+_LINEAR_DQ = re.compile(r'"[^"]*"')
+_LINEAR_ALL_QUOTES = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+_PS_CMD = re.compile(r"^\s*(Set-Location|sl|cd|chdir|Push-Location|pushd)(?=\s)", re.I)
+_PS_OPT = re.compile(r"^-(?:Path|LiteralPath)\s+", re.I)
+_CD_CMD = re.compile(r"^\s*cd(?=\s)")
+_CMD_CMD = re.compile(r"^\s*(cd|chdir)(?=\s)", re.I)
+_CMD_D = re.compile(r"^/[dD]\s+")
+
+
+def _extract_literal_path(s: str) -> Optional[tuple[str, str]]:
+    if not s:
+        return None
+    if s[0] in ('"', "'"):
+        q = s[0]
+        end = s.find(q, 1)
+        if end == -1:
+            return None
+        raw, after = s[1:end], s[end + 1:]
+        if any(ch in raw for ch in ("$", "`", "%", "^", ";", "&", "|", "#", "\n", "\r")):
+            return None
+        if any(c in raw for c in _CURLY_QUOTES):
+            return None
+    else:
+        idx = 0
+        while idx < len(s) and s[idx] not in " \t\r\n;&":
+            idx += 1
+        raw, after = s[:idx], s[idx:]
+        if not raw or any(c in _TARGET_FORBIDDEN for c in raw):
+            return None
+        if any(c in raw for c in _CURLY_QUOTES):
+            return None
+    if raw.endswith("\\") and after and after[0] in " \t":
+        return None
+    if after and after[0] not in " \t\r\n;&":
+        return None
+    return raw, after
+
+
+def strict_target(
+    command: str,
+    cwd: str,
+    shell: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Return the absolute, normalised directory the command clearly runs git in, or None."""
+    if not cwd or not os.path.isabs(cwd):
+        return None
+    is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
+    if os.name == "nt" and not _TARGET_UNC_OR_DRIVE.match(cwd):
+        return None
+    if not command or not command.strip():
+        return None
+    if any(c in command for c in _CURLY_QUOTES):
+        return None
+
+    if shell:
+        s_lower = shell.lower()
+        if s_lower in ("powershell", "pwsh"):
+            sh = "powershell"
+        elif s_lower in ("bash", "sh"):
+            sh = "bash"
+        elif s_lower == "cmd":
+            sh = "cmd"
+        else:
+            return None
+    else:
+        sh = None
+
+    cmd = command.lstrip(" \t\r\n")
+    raw_path: Optional[str] = None
+    rest: Optional[str] = None
+
+    # git -C works in every shell
+    m_git = _TARGET_GIT.match(cmd)
+    if m_git:
+        s = cmd[m_git.end():].lstrip(" \t")
+        extracted = _extract_literal_path(s)
+        if not extracted:
+            return None
+        raw_path, after = extracted
+        if after and not after[0].isspace():
+            return None
+        rest = after
+        if (sh in ("bash", None)) and ("\\" in raw_path or (is_win and raw_path.startswith("/"))):
+            return None
+    elif sh == "powershell":
+        m = _PS_CMD.match(cmd)
+        if not m:
+            return None
+        s = cmd[m.end():].lstrip(" \t")
+        m_opt = _PS_OPT.match(s)
+        has_literal_path = False
+        if m_opt:
+            has_literal_path = m_opt.group(0).strip().lower() == "-literalpath"
+            s = s[m_opt.end():].lstrip(" \t")
+        elif s.startswith("-") or _CMD_D.match(s):
+            return None
+        extracted = _extract_literal_path(s)
+        if not extracted:
+            return None
+        raw_path, after = extracted
+        if not has_literal_path and any(ch in raw_path for ch in "[]*?"):
+            return None
+        after_ws = after.lstrip(" \t")
+        if after_ws.startswith(";"):
+            rest = after_ws[1:]
+        elif after_ws.startswith("&&"):
+            rest = after_ws[2:]
+        elif after_ws.startswith(("\n", "\r\n")):
+            rest = after_ws.lstrip("\r\n")
+        else:
+            return None
+    elif sh == "bash":
+        m = _CD_CMD.match(cmd)
+        if not m:
+            return None
+        s = cmd[m.end():].lstrip(" \t")
+        if s.startswith("-") or _CMD_D.match(s):
+            return None
+        extracted = _extract_literal_path(s)
+        if not extracted:
+            return None
+        raw_path, after = extracted
+        if "\\" in raw_path or any(ch in raw_path for ch in "[]*?"):
+            return None
+        if is_win and raw_path.startswith("/"):
+            return None
+        after_ws = after.lstrip(" \t")
+        is_posix_abs = raw_path.startswith("/")
+        is_rel = not is_posix_abs
+        effective_env = os.environ if env is None else env
+        if is_rel and effective_env.get("CDPATH"):
+            return None
+        if after_ws.startswith("&&"):
+            rest = after_ws[2:]
+        elif after_ws.startswith(";") or after_ws.startswith(("\n", "\r\n")):
+            plain_rel = is_rel and ("/" not in raw_path) and not raw_path.startswith(".")
+            if not (is_posix_abs or plain_rel):
+                return None
+            rest = after_ws[1:] if after_ws.startswith(";") else after_ws.lstrip("\r\n")
+        else:
+            return None
+    elif sh == "cmd":
+        m = _CMD_CMD.match(cmd)
+        if not m:
+            return None
+        s = cmd[m.end():].lstrip(" \t")
+        m_d = _CMD_D.match(s)
+        has_d = False
+        if m_d:
+            has_d = True
+            s = s[m_d.end():].lstrip(" \t")
+        elif s.startswith("-"):
+            return None
+        extracted = _extract_literal_path(s)
+        if not extracted:
+            return None
+        raw_path, after = extracted
+        after_ws = after.lstrip(" \t")
+        if not after_ws.startswith("&&"):
+            return None
+        rest = after_ws[2:]
+        if not has_d:
+            m_drive = _TARGET_DRIVE_PREFIX.match(raw_path)
+            m_cwd = _TARGET_DRIVE_PREFIX.match(cwd)
+            if m_drive and m_cwd and m_drive.group(1).upper() != m_cwd.group(1).upper():
+                return None
+            if m_drive and not m_cwd:
+                return None
+    else:  # sh is None (unknown shell)
+        m = _CD_CMD.match(cmd)
+        if not m:
+            return None
+        s = cmd[m.end():].lstrip(" \t")
+        if s.startswith("-") or _CMD_D.match(s):
+            return None
+        extracted = _extract_literal_path(s)
+        if not extracted:
+            return None
+        raw_path, after = extracted
+        if "\\" in raw_path or any(ch in raw_path for ch in "[]*?"):
+            return None
+        if is_win and raw_path.startswith("/"):
+            return None
+        after_ws = after.lstrip(" \t")
+        if not after_ws.startswith("&&"):
+            return None
+        rest = after_ws[2:]
+
+    if not raw_path or not rest or not rest.strip():
+        return None
+
+    # Safety scan on rest with shell-aware quote handling (strictly linear)
+    quote_pattern = _LINEAR_DQ if sh == "cmd" else _LINEAR_ALL_QUOTES
+    for m_q in quote_pattern.finditer(rest):
+        text = m_q.group(0)
+        qchar = text[0]
+        content = text[1:-1]
+        # Strip a quoted string only when its contents hold none of:
+        # newline, ;, &, |, #, \, the other quote kind, a curly quote,
+        # a cd/Set-Location/Push-Location/pushd keyword; otherwise return None.
+        if "\n" in content or "\r" in content:
+            return None
+        if any(ch in content for ch in (";", "&", "|", "#", "\\")):
+            return None
+        if qchar == '"' and "'" in content:
+            return None
+        if qchar == "'" and '"' in content:
+            return None
+        if any(c in content for c in _CURLY_QUOTES):
+            return None
+        if _CD_KEYWORDS.search(content):
+            return None
+        if qchar == '"':
+            if sh in ("powershell", None) and "$" in content:
+                return None
+            if sh == "bash":
+                if "`" in content:
+                    return None
+                if re.search(r"\bgit\b|-(?-i:C)\b|--(?:git-dir|work-tree)\b", content):
+                    return None
+
+    unquoted_rest = quote_pattern.sub(" ", rest)
+
+    if any(tok in unquoted_rest for tok in ("#", "<<", "@'", '@"', r"\'", "^")):
+        return None
+    if any(c in unquoted_rest for c in _CURLY_QUOTES):
+        return None
+    if '"' in unquoted_rest:
+        return None
+    if sh != "cmd" and "'" in unquoted_rest:
+        return None
+
+    if m_git and any(sep in unquoted_rest for sep in (";", "&&", "||", "\n")):
+        return None
+
+    if any(c in unquoted_rest for c in ("<", ">", "(")):
+        return None
+    for seg in _TARGET_SEGMENT_SEP.split(unquoted_rest):
+        s_strip = seg.strip()
+        if not s_strip:
+            continue
+        if ASSIGNMENT.match(s_strip):
+            return None
+        if s_strip == "." or s_strip.startswith((". ", ".\t", ".(")):
+            return None
+    if _TARGET_SECOND.search(unquoted_rest):
+        return None
+    if "$" in unquoted_rest or "`" in unquoted_rest or "|" in unquoted_rest or _TARGET_ENV_VAR.search(unquoted_rest):
+        return None
+    if "&" in unquoted_rest.replace("&&", "") or _TARGET_INDIRECT.search(unquoted_rest):
+        return None
+
+    # Path syntax: ~, -, registry, drive-relative
+    if raw_path.startswith(("~", "-")):
+        return None
+    if _TARGET_PROVIDER.match(raw_path) or _TARGET_DRIVE_REL.match(raw_path):
+        return None
+
+    if is_win and _TARGET_POSIX_WIN.match(raw_path):
+        return None
+
+    is_abs = os.path.isabs(raw_path) and (os.name != "nt" or bool(_TARGET_UNC_OR_DRIVE.match(raw_path)))
+    target = raw_path if is_abs else os.path.join(cwd, raw_path)
+    if not os.path.isdir(target):
+        return None
+
+    return os.path.normcase(os.path.abspath(target))
+
