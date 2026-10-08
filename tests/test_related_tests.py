@@ -85,6 +85,18 @@ def test_anything_guard_cannot_map_to_tests_means_the_full_suite(tmp_path):
         assert related_tests(repo, changed) == [], changed
     (repo / "pkg" / "lonely.py").write_text("X = 1\n", encoding="utf-8")
     assert related_tests(repo, ["pkg/lonely.py"]) == []  # no test reaches it
+    (repo / "-a_test.py").write_text("import pkg.a\n\n" + PASS, encoding="utf-8")
+    git(repo, "add", "--", "-a_test.py")
+    assert related_tests(repo, ["pkg/a.py"]) == []  # pytest would read "-a_test.py" as an option: the full suite
+
+
+def test_config_tests_warns_when_the_repository_config_is_read_instead(tmp_path, monkeypatch):
+    repo = python_repo(tmp_path)
+    (repo / ".guard").mkdir()
+    (repo / ".guard" / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    result = CliRunner().invoke(app, ["config", "tests", "related"])
+    assert result.exit_code == 0 and "has its own .guard/config.json" in result.output
 
 
 # --- guard post -----------------------------------------------------------------------------------------------

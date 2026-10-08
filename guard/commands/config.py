@@ -178,6 +178,8 @@ def config_tests_cmd(
     what = ("every guard post runs the full test suite" if scope == "full" else
             "a pytest build runs the related tests first; the full suite runs before any approval")
     console.print(f"[bold green]✅ Tests `{scope}`: {what}.[/bold green] [dim]Saved to {path}[/dim]")
+    if get_local_config_path().is_file():
+        console.print("[yellow]This repository has its own .guard/config.json, which is read instead of the machine-wide file.[/yellow]")
 
 
 @config_app.command("commit")

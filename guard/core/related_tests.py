@@ -13,7 +13,8 @@ from typing import List
 
 # Files that change how every test runs: any change to them needs the full suite
 _WHOLE_SUITE = {"conftest.py", "pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini"}
-_SAFE_PATH = re.compile(r"[\w./-]+")  # passed to a shell: anything else falls back to the full suite
+# passed to a shell, never read as an option: anything else (a leading "-", a space) falls back to the full suite
+_SAFE_PATH = re.compile(r"[\w.][\w./-]*")
 
 
 def _is_test(path: str) -> bool:
@@ -37,6 +38,8 @@ def related_tests(repo: Path, changed: List[str]) -> List[str]:
     """
     if not changed or any(not p.endswith(".py") or PurePosixPath(p).name in _WHOLE_SUITE for p in changed):
         return []
+    if any(PurePosixPath(p).name == "__init__.py" for p in changed):
+        return []  # a package's __init__ is imported through every module of the package
     try:
         listed = subprocess.run(["git", "-C", str(repo), "ls-files", "-z", "--", "*.py"], capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", check=True).stdout
@@ -45,9 +48,7 @@ def related_tests(repo: Path, changed: List[str]) -> List[str]:
     tests = [p for p in listed.split("\0") if p and _is_test(p)]
     picked = {p for p in changed if _is_test(p) and (repo / p).is_file()}
     modules = [(PurePosixPath(p).with_suffix("").as_posix().replace("/", "."), PurePosixPath(p).stem)
-               for p in changed if not _is_test(p) and PurePosixPath(p).name != "__init__.py"]
-    if any(PurePosixPath(p).name == "__init__.py" for p in changed if not _is_test(p)):
-        return []  # a package's __init__ is imported through every module of the package
+               for p in changed if not _is_test(p)]
     for test in tests:
         try:
             text = (repo / test).read_text(encoding="utf-8", errors="replace")
