@@ -10,16 +10,20 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
 LOCK_FILE = "guard-exclude.lock"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+REPLACE_ATTEMPTS = 100  # about 2 s of 20 ms waits
+WINDOWS = os.name == "nt"
 
 
 def exclude_file(repo: Path) -> Optional[Path]:
     try:
-        res = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+        res = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-common-dir"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace")
     except OSError:
         return None
     common = (res.stdout or "").strip()
@@ -137,7 +141,15 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        # Windows refuses to replace a file another process has open (git reading info/exclude): wait it out briefly
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if not WINDOWS or attempt == REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.02)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

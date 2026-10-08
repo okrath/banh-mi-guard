@@ -482,8 +482,10 @@ def _staged_differs(repo: Path) -> List[str]:
     res = subprocess.run(git + ["diff", "--cached", "--name-only", "-z"], capture_output=True)
     out = []
     for rel in (p.decode("utf-8", "replace") for p in res.stdout.split(b"\0") if p):
-        staged = subprocess.run(git + ["rev-parse", "-q", "--verify", f":{rel}"], capture_output=True, text=True).stdout.strip()
-        on_disk = subprocess.run(git + ["hash-object", "--", rel], capture_output=True, text=True).stdout.strip() \
+        staged = subprocess.run(git + ["rev-parse", "-q", "--verify", f":{rel}"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace").stdout.strip()
+        on_disk = subprocess.run(git + ["hash-object", "--", rel], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace").stdout.strip() \
             if (repo / rel).is_file() else ""
         if staged != on_disk:  # also a staged deletion of a file that still exists, and the reverse
             out.append(rel)

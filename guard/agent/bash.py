@@ -209,7 +209,8 @@ def _git_alias(repo: Optional[Path], name: str) -> str:
     if repo is None:
         return ""
     import subprocess
-    res = subprocess.run(["git", "-C", str(repo), "config", "--get", f"alias.{name}"], capture_output=True, text=True)
+    res = subprocess.run(["git", "-C", str(repo), "config", "--get", f"alias.{name}"], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
     return (res.stdout or "").strip()
 
 

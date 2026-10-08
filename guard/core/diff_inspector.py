@@ -248,11 +248,13 @@ class GitDiffInspector:
             for args in (["read-tree", head], ["add", "-A"]):
                 if subprocess.run(git + args, env=env, capture_output=True, check=False).returncode != 0:
                     return None
-            tree = subprocess.run(git + ["write-tree"], env=env, capture_output=True, text=True, check=False).stdout.strip()
+            tree = subprocess.run(git + ["write-tree"], env=env, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", check=False).stdout.strip()
             ident = {"GIT_AUTHOR_NAME": "guard", "GIT_AUTHOR_EMAIL": "guard@localhost",
                      "GIT_COMMITTER_NAME": "guard", "GIT_COMMITTER_EMAIL": "guard@localhost"}
             res = subprocess.run(git + ["commit-tree", tree, "-p", head, "-m", "guard review snapshot"],
-                                 env={**os.environ, **ident}, capture_output=True, text=True, check=False)
+                                 env={**os.environ, **ident}, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", check=False)
             return res.stdout.strip() or None
         except OSError:
             return None
