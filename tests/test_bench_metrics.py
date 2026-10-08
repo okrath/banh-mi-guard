@@ -551,6 +551,28 @@ def test_run_corpus_budget_stops_exactly():
     assert c3_row["verdict"] == "skipped (budget)"
 
 
+def test_run_corpus_skips_only_a_case_that_does_not_fit_and_runs_the_smaller_ones_after_it():
+    big = ("diff --git a/f1.py b/f1.py\n--- a/f1.py\n+++ b/f1.py\n@@ -1,1 +1,1 @@\n" + ("+x\n" * 15000) +
+           "diff --git a/f2.py b/f2.py\n--- a/f2.py\n+++ b/f2.py\n@@ -1,1 +1,1 @@\n" + ("+x\n" * 15000))
+    cases = [
+        {"id": "small1", "label": "clean", "diff": "diff 1"},
+        {"id": "big", "label": "clean", "diff": big},  # 2 parts: worst case 4
+        {"id": "small2", "label": "clean", "diff": "diff 2"},  # worst case 2
+    ]
+    ran: list = []
+
+    def mock_review(case: dict, variant: Any = None) -> ReviewResult:
+        ran.append(case["id"])
+        return ReviewResult(verdict="APPROVED", findings=[], calls=1, chars_sent=50, seconds=0.01)
+
+    # Budget 4: small1 runs (3 left), big needs 4 and is skipped, small2 needs 2 and still runs (2 left)
+    summary = run_corpus(cases, mock_review, repeats=1, max_calls=4)
+    assert ran == ["small1", "small2"]
+    assert summary["skipped_count"] == 1 and summary["budget_remaining"] == 2
+    rows = {r["case_id"]: r for r in summary["per_case_rows"]}
+    assert rows["big"]["verdict"] == "skipped (budget)" and rows["small2"]["verdict"] == "APPROVED"
+
+
 def test_run_corpus_label_filter():
     cases = [
         {"id": "c01", "label": "defect", "diff": "d1", "defects": []},
