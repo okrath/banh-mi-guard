@@ -11,16 +11,17 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
 from guard.core.config import load_config, load_global_config
+from guard.core.diff_partition import partition_diff
 from guard.core.hygiene_engine import HygieneEngine
 from guard.core.impact import ImpactRange, check_impact, expected_impact
 from guard.core.invariant_eval import DomainType, InvariantResult, evaluate_invariants
@@ -38,6 +39,7 @@ from guard.core.project_invariants import (
 )
 from guard.core.removal_check import check_removed_symbols
 from guard.core.repo_setup import ensure_repo_setup
+from guard.core.review_options import ReviewOptions, effective_sources, load_review_options
 from guard.core.session import ApprovalKeyError, BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.domains.detector import detect_build_command, extract_contracts_and_invariants
@@ -390,12 +392,48 @@ def execute_pre_task(
 
 def execute_post_task(
     repo_path: Optional[Path] = None, auto_fix: bool = False, focus: str = "all", hook: bool = False, full: bool = False,
+    review_cli: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """guard post, marked as running while it works (an agent waiting for it may stop its turn)."""
+    """
+    guard post, marked as running while it works (an agent waiting for it may stop its turn).
+    `review_cli` holds only the review options the user passed as flags (see guard.core.review_options).
+    """
     from guard.agent.events import post_running
     target_repo = Path(repo_path or Path.cwd()).resolve()
     with post_running(target_repo):
-        return _execute_post_task(target_repo, auto_fix=auto_fix, focus=focus, hook=hook, full=full)
+        return _execute_post_task(
+            target_repo, auto_fix=auto_fix, focus=focus, hook=hook, full=full, review_cli=review_cli,
+        )
+
+
+def _fmt_option(value: Any) -> str:
+    return ("on" if value else "off") if isinstance(value, bool) else str(value)
+
+
+def review_options_line(
+    opts: ReviewOptions, sources: Mapping[str, str], parts: int = 1,
+) -> str:
+    """
+    One line naming every review option that differs from the default, with its source, "weaker than
+    default" for an option that reviews less, and the worst-case LLM call count when options add calls.
+    Empty when every option is the default.
+    """
+    default = ReviewOptions()
+    shown = []
+    for name in ReviewOptions.model_fields:
+        value, base = getattr(opts, name), getattr(default, name)
+        if value == base:
+            continue
+        weaker = (
+            (name == "coverage_notes" and not value)
+            or (name in ("max_llm_calls", "stage_timeout_s") and value < base)
+        )
+        origin = sources.get(name, "default") + (", weaker than default" if weaker else "")
+        shown.append(f"{name}={_fmt_option(value)} ({origin})")
+    if not shown:
+        return ""
+    cost = f"; up to {opts.cost_hint(parts)} LLM calls" if opts.reviewers > 1 or opts.validate_findings else ""
+    return f"Review options: {', '.join(shown)}{cost}"
 
 
 def _post_check_hook_and_session(
@@ -750,6 +788,7 @@ class _PostGateResult:
     build_res: Optional[BuildCheckResult]
     learned: List[str]
     rejected_props: List[str]
+    review_options: Dict[str, Any] = field(default_factory=dict)
 
 
 def _record_learned_invariants(
@@ -795,9 +834,17 @@ def _post_llm_gate(
     target_repo: Path, config, session: Optional[Any], pre: Optional[Any],
     diff_scope: _PostDiffScope, rules_res: _PostRulesResult,
     inv_eval: InvariantResult, ocr_res: _PostOcrResult, focus: str,
+    review_opts: Optional[ReviewOptions] = None, review_sources: Optional[Mapping[str, str]] = None,
 ) -> _PostGateResult:
     """Execute LLM reviewer gate, await build check, and record learned invariants."""
     reviewer = LLMReviewerEngine(config=config)
+    review_opts = review_opts or ReviewOptions()
+    review_sources = review_sources or {}
+    # the part count only prices the extra calls, so the diff is partitioned only when options add calls
+    parts = len(partition_diff(diff_scope.task_diff).parts) if review_opts.reviewers > 1 or review_opts.validate_findings else 1
+    line = review_options_line(review_opts, review_sources, parts=max(1, parts))
+    if line:
+        console.print(line, style="cyan", markup=False, highlight=False, soft_wrap=True)
     domain = pre.domain if pre else DomainType.BACKEND
     prompt = pre.prompt if pre else "Post-task verification"
     if pre and pre.user_prompt and pre.user_prompt.strip() != pre.prompt.strip():
@@ -811,7 +858,7 @@ def _post_llm_gate(
             build_check=build_res, violations=rules_res.violations, invariant_result=inv_eval,
             contracts=pre.existing_contracts if pre else None, use_llm=use_llm, focus=focus,
             evidence=rules_res.evidence + notes, ledger=session.findings_ledger if session else [],
-            known_rules=_known_rules(target_repo),
+            known_rules=_known_rules(target_repo), options=review_opts,
         )
 
     review_verdict, build_res = _run_gate_review(gate, target_repo, ocr_res)
@@ -820,6 +867,7 @@ def _post_llm_gate(
     )
     return _PostGateResult(
         review_verdict=review_verdict, build_res=build_res, learned=learned, rejected_props=rejected_props,
+        review_options={"options": review_opts.model_dump(), "sources": dict(review_sources)},
     )
 
 
@@ -852,6 +900,8 @@ def _post_record_and_report(
         ocr_status=ocr_res.ocr_status, impact_summary=rules_res.impact_summary or "",
         ocr_complete=ocr_res.ocr_status.startswith("complete") and not any(v.rule_id == "OCR-RUN" for v in rules_res.violations),
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
+        review_options=gate_res.review_options, coverage_notes=review_verdict.coverage_notes,
+        validation_log=review_verdict.validation_log, llm_calls=review_verdict.llm_calls,
     )
 
     key_error = None
@@ -885,6 +935,7 @@ def _post_record_and_report(
 
 def _execute_post_task(
     target_repo: Path, auto_fix: bool = False, focus: str = "all", hook: bool = False, full: bool = False,
+    review_cli: Optional[Dict[str, Any]] = None,
 ) -> bool:
     for msg in ensure_repo_setup(target_repo, create_invariants=not hook):
         console.print(f"[cyan]🔧 guard setup: {msg}[/cyan]")
@@ -894,6 +945,17 @@ def _execute_post_task(
     proceed, result, session = _post_check_hook_and_session(target_repo, session_mgr, hook)
     if not proceed:
         return result
+    # defaults < the config's "review" object (local-then-global, as load_config reads it) < the flags passed.
+    # Resolved only for a session that is reviewed: a hook with nothing to check never fails on it
+    try:
+        if not isinstance(config.review, dict):
+            raise ValueError(f'"review" in the guard config must be an object, not {type(config.review).__name__}')
+        review_cfg = {"review": config.review}
+        review_opts = load_review_options(review_cfg, review_cli)
+        review_sources = effective_sources(review_cfg, review_cli)
+    except ValueError as e:
+        console.print(f"[bold red]❌ Invalid review option: {escape(str(e))}[/bold red]")
+        return False
     pre = session.pre if session else None
 
     diff_scope = _post_diff_and_scope_audit(target_repo, pre)
@@ -912,6 +974,7 @@ def _execute_post_task(
     # Build and tests: running in parallel (see start_build); waited for before the gate decides
     gate_res = _post_llm_gate(
         target_repo, config, session, pre, diff_scope, rules_res, inv_eval, ocr_res, focus,
+        review_opts=review_opts, review_sources=review_sources,
     )
     return _post_record_and_report(
         target_repo, session_mgr, session, pre, diff_scope, rules_res, inv_eval, ocr_res, gate_res,

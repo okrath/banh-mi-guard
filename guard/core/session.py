@@ -130,6 +130,11 @@ class PostTaskRecord(BaseModel):
     reviewed_fingerprints: Dict[str, str] = Field(default_factory=dict)
     accepted_by_user: bool = False  # approved by `guard accept`, not by the gate
     needs_user: bool = False  # this post used the last review round: the user decides next
+    # How the review was run and what it did not cover; an older guard that re-saves the session drops these
+    review_options: Dict = Field(default_factory=dict)  # {"options": {...}, "sources": {...}}
+    coverage_notes: List[str] = Field(default_factory=list)  # what the review did not see (not already in the report)
+    validation_log: List[Dict] = Field(default_factory=list)  # one entry per finding the validation stage checked
+    llm_calls: int = 0  # LLM calls this review made (retries and extra stages included)
 
 
 class GuardSession(BaseModel):

@@ -83,6 +83,7 @@ For architectural diagrams, taxonomy, and security specifications, see [Architec
 
 * 📖 **[CLI Command Reference](docs/cli-reference.md):** Complete option flags, syntax, and operational rules for every command.
 * 🏛️ **[Architecture Specification](docs/architecture.md):** Detailed system taxonomy, defense layers, state isolation, and HMAC approval signing.
+* 🔎 **[Review Options, Stages & Limits](docs/cli-reference.md#review-options-stages--limits):** Optional review stages of `guard post` (reviewer panel, finding validation, test evidence, threat frame), what they cost, and the *Not reviewed / limits* section of the report. Developer-only measurement tool: [Benchmark](docs/benchmark.md).
 * 🛡️ **[Quality Pillars & Matrix](docs/quality-pillars.md):** 2D quality matrix (domains × pillars), static rule catalog, and scoring rules.
 * 🚀 **[Releasing Guide](docs/quality-pillars.md#releasing-maintainers):** Release process, version tagging, and PyPI trusted publishing workflow.
 * 🌐 **[Live Documentation Website](https://okrath.github.io/banh-mi-guard/):** Interactive documentation guide and full feature matrix.
