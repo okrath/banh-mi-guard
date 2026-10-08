@@ -338,8 +338,8 @@ def run_corpus(
     """
     Run an entire corpus of cases within a hard LLM call budget.
 
-    Checks worst-case call bound before each case; skips remaining cases if budget would be exceeded.
-    Stops immediately if BudgetExceeded is raised.
+    Checks the worst-case call bound before each case and skips a case that would not fit, then goes on with
+    the next one. Stops immediately if BudgetExceeded is raised.
     """
     if repeats < 1:
         raise ValueError(f"repeats must be at least 1, got {repeats}")
@@ -372,21 +372,20 @@ def run_corpus(
         worst_case = estimate_case_worst_calls(case.get("diff", ""), variant=variant, repeats=repeats)
 
         if remaining_budget < worst_case:
-            # Hard budget cap: skip this case and all remaining cases
-            for skipped_case in filtered_cases[i:]:
-                for _ in range(repeats):
-                    out = case_outcome(
-                        skipped_case,
-                        verdict="skipped (budget)",
-                        findings=[],
-                        calls=0,
-                        chars_sent=0,
-                        seconds=0.0,
-                    )
-                    out["skipped"] = True
-                    out["skip_reason"] = "budget"
-                    all_outcomes.append(out)
-            break
+            # This case could exceed the hard cap: skip it alone; a smaller case after it may still fit
+            for _ in range(repeats):
+                out = case_outcome(
+                    case,
+                    verdict="skipped (budget)",
+                    findings=[],
+                    calls=0,
+                    chars_sent=0,
+                    seconds=0.0,
+                )
+                out["skipped"] = True
+                out["skip_reason"] = "budget"
+                all_outcomes.append(out)
+            continue
 
         # Run repeats for this case with budget guard
         budget_blown = False
