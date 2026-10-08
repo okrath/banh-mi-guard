@@ -36,6 +36,31 @@ def gate_label(post: PostTaskRecord) -> str:
     return "LLM Gate" if post.review_mode == "llm_deep" else "Heuristic Gate (no LLM review)"
 
 
+def heuristic_reason(post: PostTaskRecord) -> str:
+    """Why the heuristic gate decided, or "" when the LLM answered; never claims a review that did not happen."""
+    if post.review_mode == "llm_deep":
+        return ""
+    return post.llm_error or "a failed build or a hard rule decided before the LLM was asked"
+
+
+def validation_summary(post: PostTaskRecord) -> str:
+    """"Finding validation: N checked, M demoted (evidence quoted)", or "" when the stage did not check anything."""
+    if not post.validation_log:
+        return ""
+    checked = {str(e.get("finding_id")) for e in post.validation_log}
+    demoted = sum(1 for f in post.findings if str(f.get("id")) in checked and not f.get("blocking")
+                  and "[contested:" in str(f.get("description", "")))
+    return f"Finding validation: {len(post.validation_log)} checked, {demoted} demoted (evidence quoted)"
+
+
+def limit_lines(post: PostTaskRecord) -> list:
+    """What the review did not see, as plain lines (empty when it saw everything); the caller renders them."""
+    if not post.coverage_notes:
+        return []
+    lead = ["The approval covers only what the review saw."] if post.muse_verdict == "APPROVED" else []
+    return lead + [str(n) for n in post.coverage_notes]
+
+
 COMMIT_INSTRUCTIONS = {
     "auto": "Commit mode `auto`: write the commit message yourself (conventional commit describing the change; never mention guard, its gates or scores).",
     "ask": "Commit mode `ask`: before committing, ask the user for the commit message and use it as given.",
@@ -299,6 +324,12 @@ def _markdown_gate_and_findings(post: PostTaskRecord) -> list:
         md.append(f"  - *Assessment:* {post.muse_notes}")
     if post.llm_error:
         md.append(f"  - ⚠️ *LLM review did not run:* {post.llm_error}")
+    if validation_summary(post):
+        md.append(f"  - {validation_summary(post)}")
+    limits = limit_lines(post)
+    if limits:
+        md.append("\n* **Not reviewed / limits:**")
+        md.extend(f"  - {inert(line)}" for line in limits)
 
     blocking = [f for f in post.findings if f.get("blocking")]
     advisory = [f for f in post.findings if not f.get("blocking")]
@@ -345,6 +376,8 @@ def generate_post_task_markdown(post: PostTaskRecord, pre: Optional[PreTaskRecor
     Generate standard Post-Task Verification report.
     """
     md = ["### 🧪 POST-TASK VERIFICATION:\n"]
+    if heuristic_reason(post):
+        md.append(f"* **Heuristic gate ran, not an LLM review:** {inert(heuristic_reason(post))}")
     md.extend(_markdown_prelude(pre))
     md.extend(_markdown_impact_range(post, pre))
     md.extend(_markdown_build_check(post))

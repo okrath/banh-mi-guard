@@ -17,7 +17,14 @@ from rich.table import Table
 from rich.text import Text
 
 from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
-from guard.reporters.markdown import commit_instruction, gate_label, ocr_findings
+from guard.reporters.markdown import (
+    commit_instruction,
+    gate_label,
+    heuristic_reason,
+    limit_lines,
+    ocr_findings,
+    validation_summary,
+)
 
 console = Console()
 
@@ -132,6 +139,8 @@ def _render_post_verdict_banner(post: PostTaskRecord, pre: Optional[PreTaskRecor
         summary_text.append(f"Assessment: {post.muse_notes}\n", style="italic")
     if post.llm_error:
         summary_text.append(f"LLM review did not run: {post.llm_error}\n", style="bold yellow")
+    elif heuristic_reason(post):
+        summary_text.append(f"Heuristic gate ran, not an LLM review: {heuristic_reason(post)}\n", style="bold yellow")
 
     console.print(Panel(summary_text, border_style="green" if is_approved else "red"))
 
@@ -141,6 +150,17 @@ def _render_post_verdict_banner(post: PostTaskRecord, pre: Optional[PreTaskRecor
         console.print(f"[bold yellow]⚠️ Baseline snapshot missing{reason_part}: review covers the full diff.[/bold yellow]")
     if post.diff_summary and post.diff_summary.error:
         console.print(f"[bold red]❌ Diff inspection error: {post.diff_summary.error}[/bold red]")
+
+
+def _render_post_limits(post: PostTaskRecord) -> None:
+    """Under the verdict: what finding validation did, and what the review did not see."""
+    if validation_summary(post):
+        console.print(Text(validation_summary(post), style="cyan"))
+    limits = limit_lines(post)
+    if limits:
+        console.print(Text("Not reviewed / limits:", style="bold yellow"))
+        for line in limits:
+            console.print(Text(f"  - {line}", style="yellow"))
 
 
 def _render_post_diff_and_build(post: PostTaskRecord) -> None:
@@ -272,6 +292,7 @@ def _render_post_findings_and_summary(post: PostTaskRecord) -> None:
 
 def render_post_task_terminal(post: PostTaskRecord, pre: Optional[PreTaskRecord] = None):
     _render_post_verdict_banner(post, pre)
+    _render_post_limits(post)
     _render_post_diff_and_build(post)
     _render_post_invariants(post)
     _render_post_rule_violations(post)

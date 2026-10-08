@@ -2,7 +2,7 @@
 Complete CLI for Banh-Mi-Guard (`guard`).
 Provides:
 - `guard pre "<prompt>"`: Triage, Baseline Contracts, Invariants, Pre-task Note
-- `guard post [--auto-fix] [--focus]`: Diff Audit, Build Check, OCR Rules, Invariants, LLM Final Gate Verdict
+- `guard post [--auto-fix] [--focus] [--reviewers N] [--validate] [--test-checklist] [--threat-frame]`: Diff Audit, Build Check, OCR Rules, Invariants, LLM Final Gate Verdict
 - `guard config` [show | llm | test | sync]: Manage LLM and OCR credentials
 - `guard hook` [install | uninstall | status]: Bind hooks and AI Agent directives to target repos
 - `guard run "<prompt>" -- <cmd>`: Sandwich pattern wrapper
@@ -105,11 +105,22 @@ def post_cmd(
     focus: str = typer.Option("all", "--focus", "-f", help="Quality pillar focus: 'all', 'security', 'memory', 'performance', 'ux', 'dead-code', 'simplicity'"),
     hook: bool = typer.Option(False, "--hook", help="Git-hook mode: skip when this repository has no guard session"),
     full: bool = typer.Option(False, "--full", help="Full review: also run the Alibaba OCR review (minutes, no time limit); OCR failing or a high/critical finding blocks"),
+    reviewers: Optional[int] = typer.Option(None, "--reviewers", min=1, max=5, help="LLM review panel size, 1 to 5 (each extra reviewer costs LLM calls; default 1)"),
+    validate: Optional[bool] = typer.Option(None, "--validate/--no-validate", help="Check blocking findings of a multi-part diff against the whole diff before they block"),
+    test_checklist: Optional[bool] = typer.Option(None, "--test-checklist/--no-test-checklist", help="Add the test-quality checklist to the review prompt"),
+    threat_frame: Optional[str] = typer.Option(None, "--threat-frame", help="Threat-model frame for security-sensitive diffs: off or auto"),
 ):
     """
     Run Post-Task Guard: diff audit, build checks, invariant checks & LLM final verification.
+    Review options not passed here come from `guard config review` (see it for the effective values).
     """
-    passed = execute_post_task(repo_path=Path(repo) if repo else None, auto_fix=auto_fix, focus=focus, hook=hook, full=full)
+    # only the flags the user passed: an unset flag must not override the config
+    flags = {"reviewers": reviewers, "validate_findings": validate, "test_checklist": test_checklist, "threat_frame": threat_frame}
+    review_cli = {k: v for k, v in flags.items() if v is not None}
+    passed = execute_post_task(
+        repo_path=Path(repo) if repo else None, auto_fix=auto_fix, focus=focus, hook=hook, full=full,
+        review_cli=review_cli or None,
+    )
     if not passed:
         raise typer.Exit(code=1)
 
