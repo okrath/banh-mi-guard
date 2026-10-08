@@ -299,10 +299,15 @@ def worktree_fingerprint(repo: Path) -> Dict[str, str]:
 
 def changed_between(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
     return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
 # Grammar allow-list parser for strict_target
 _TARGET_UNC_OR_DRIVE = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _BARE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:=@,+-\\")
-_SUBCOMMAND_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_GIT_ALLOWED_SUBCOMMANDS = frozenset({
+    "add", "commit", "status", "diff", "log", "show",
+    "rev-parse", "ls-files", "branch",
+})
 
 
 def strict_target(
@@ -322,6 +327,8 @@ def strict_target(
     if "\0" in command or "\r" in command or "\n" in command:
         return None
     if any("\u2018" <= ch <= "\u201f" for ch in command):
+        return None
+    if env is not None and any(k.upper() in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") for k in env):
         return None
 
     if shell:
@@ -377,6 +384,8 @@ def strict_target(
             if after_i < n and command[after_i] not in (" ", "\t", ";") and not command[after_i:after_i + 2] == "&&":
                 return None
             content = command[i + 1:end]
+            if content == "":
+                return None  # empty quoted tokens ('' or "") rejected in every shell
             if ch == "'":
                 if sh is None and any(c in content for c in ("&", "|", "<", ">", "^", "%")):
                     return None
@@ -384,6 +393,8 @@ def strict_target(
                 if any(c in content for c in ('"', "$", "`", "\\")):
                     return None
                 if sh == "cmd" and any(c in content for c in ("%", "^", "!")):
+                    return None
+                if sh is None and any(c in content for c in ("%", "^")):
                     return None
             tokens.append((content, True))
             i = after_i
@@ -407,6 +418,9 @@ def strict_target(
         return None
 
     def resolve_path(val: str, is_q: bool, base: str, is_cd: bool = False, has_d: bool = False, is_lit: bool = False) -> Optional[str]:
+        # Reject UNC and device paths before any filesystem calls
+        if val.startswith(("\\\\", "//")):
+            return None
         if not val.isascii() or val.startswith(("-", "~")):
             return None
         if any(c in val for c in ("$", "%", "*", "?")):
@@ -415,16 +429,34 @@ def strict_target(
             return None
         if not is_q and ("," in val or "@" in val):
             return None
+        if is_cd and sh == "cmd" and not is_q and "=" in val:
+            return None
         if "\\" in val and (sh not in ("powershell", "cmd") or not is_win):
             return None
+
+        # Trailing dot or space in ANY component (except . or ..)
         p_clean = val.replace("\\", "/").rstrip("/")
-        last_comp = p_clean.rsplit("/", 1)[-1]
-        if last_comp not in (".", "..") and last_comp.endswith((" ", ".")):
-            return None
+        for comp in p_clean.split("/"):
+            if comp not in (".", "..") and comp.endswith((" ", ".")):
+                return None
+
         if re.match(r"^[a-zA-Z]:(?![\\/])", val) or re.match(r"^[a-zA-Z]{2,}:", val):
             return None
         if is_win and sh in ("bash", None) and val.startswith("/"):
             return None
+
+        # Drive check for cmd and unknown shell
+        m_d = re.match(r"^([a-zA-Z]):", val)
+        if m_d:
+            if sh is None:
+                m_c = re.match(r"^([a-zA-Z]):", base)
+                if not m_c or m_d.group(1).upper() != m_c.group(1).upper():
+                    return None
+            elif is_cd and sh == "cmd" and not has_d:
+                m_c = re.match(r"^([a-zA-Z]):", base)
+                if (m_c and m_d.group(1).upper() != m_c.group(1).upper()) or not m_c:
+                    return None
+
         is_posix_abs = val.startswith("/")
         is_win_abs = bool(_TARGET_UNC_OR_DRIVE.match(val))
         is_abs = is_win_abs if is_win else is_posix_abs
@@ -432,11 +464,7 @@ def strict_target(
             eff_env = os.environ if env is None else env
             if eff_env.get("CDPATH"):
                 return None
-        if is_cd and sh == "cmd" and not has_d:
-            m_d = re.match(r"^([a-zA-Z]):", val)
-            m_c = re.match(r"^([a-zA-Z]):", base)
-            if (m_d and m_c and m_d.group(1).upper() != m_c.group(1).upper()) or (m_d and not m_c):
-                return None
+
         target = val if is_abs else os.path.join(base, val)
         abs_p = os.path.abspath(target)
         return os.path.normcase(abs_p) if os.path.isdir(abs_p) else None
@@ -511,16 +539,20 @@ def strict_target(
             if idx >= len(seg):
                 return None
             sub_tok, sub_is_q = seg[idx]
-            if sub_is_q or not sub_tok.isascii() or not _SUBCOMMAND_RE.match(sub_tok):
+            if sub_is_q or not sub_tok.isascii() or sub_tok not in _GIT_ALLOWED_SUBCOMMANDS:
                 return None
             idx += 1
 
             for arg_val, arg_is_q in seg[idx:]:
                 if not arg_is_q and "\\" in arg_val:
                     return None
-                if sh == "powershell" and not arg_is_q and ("," in arg_val or "@" in arg_val):
-                    return None  # PowerShell splat/array arguments
-                if arg_val == "-C" or arg_val.startswith(("--git-dir", "--work-tree", "--exec-path")):
+                if sh == "powershell" and not arg_is_q and ("," in arg_val or "@" in arg_val):  # PowerShell splat/array arguments
+                    return None
+                if (
+                    arg_val == "-C"
+                    or arg_val in ("-x", "--exec", "--extcmd", "--ext-diff", "--textconv", "-o")
+                    or arg_val.startswith(("--git-dir", "--work-tree", "--exec-path", "--exec", "--extcmd", "--output", "--ext-diff", "--textconv"))
+                ):
                     return None
 
             git_targets.append(git_c_dir if git_c_dir else (loc_dir if loc_dir else os.path.normcase(os.path.abspath(cwd))))

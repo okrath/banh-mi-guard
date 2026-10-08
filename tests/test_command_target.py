@@ -12,6 +12,7 @@ import pytest
 from guard.agent.bash import is_git_commit, strict_target
 
 GC = "git " + "commit"
+CI = "com" + "mit"
 
 RESOLVE_CASES = [
     # PowerShell location commands
@@ -51,6 +52,7 @@ RESOLVE_CASES = [
     # Quoted message with non-ASCII or data characters
     ("git -C wt commit -m 'sửa lỗi'", None, "wt"),
     ("git -C wt commit -m \"fix; a & b #12\"", None, "wt"),
+    ("git -C wt commit -m \"feat!: x\"", None, "wt"),
 ]
 
 
@@ -75,37 +77,92 @@ def test_resolve_to_worktree(cmd_tmpl: str, shell: str | None, target_key: str, 
 
 
 NONE_CASES = [
-    # 25 inputs from review round: glued quotes, backslashes, scripts, etc.
+    # Item 1: Subcommand allow-list and options after subcommand
+    ("git -C wt difftool --cached -y -x \"unset GIT_DIR GIT_WORK_TREE; cd .. && git commit -m y; true\"", None),
+    ("git -C wt rebase --autostash --root -x 'unset GIT_DIR GIT_WORK_TREE; cd .. && git commit -m y'", None),
+    ("git -C wt ci", None),
+    ("cd wt && git ci", None),
+    ("git config alias.ci x && git -C wt commit", None),
+    ("git -C wt commit -x cmd", None),
+    ("git -C wt commit --exec cmd", None),
+    ("git -C wt commit --extcmd cmd", None),
+    ("git -C wt commit --exec=cmd", None),
+    ("git -C wt commit --extcmd=cmd", None),
+    ("git -C wt diff --ext-diff", None),
+    ("git -C wt diff --textconv", None),
+    ("git -C wt diff --output=out.txt", None),
+    ("git -C wt log -o out.txt", None),
+    ("git -C wt log --output out.txt", None),
+    ("git -C wt commit -m \"100%\"", "cmd"),
+
+    # Item 2: Empty quoted tokens
+    ("git -C '' wt commit", None),
+    ("git -C \"\" wt commit", None),
+    ("git -C '' wt commit -m x", None),
+    ("git -C '' wt commit", "powershell"),
+    ("git -C \"\" wt commit", "powershell"),
+    ("git -C '' wt commit", "cmd"),
+    ("git -C \"\" wt commit", "cmd"),
+
+    # Item 3: Trailing dot or space in ANY path component
+    ("cd wt./sub; git commit", "bash"),
+    ("cd 'wt /sub'; git commit", "bash"),
+    ("Set-Location wt./sub; git commit", "powershell"),
+    ("cd 'wt ' && git commit", "bash"),
+    ("cd wt. && git commit", "bash"),
+
+    # Item 4: Unknown shell and drives
+    ("cd D:/ && git commit", None),
+
+    # Item 5: UNC and device paths
+    (r"git -C \\10.255.255.7\s commit", None),
+    (r"git -C \\.\C:\Windows commit", None),
+    ("git -C //./C:/Windows commit", None),
+
+    # Item 7: Restored rows (both original and item-7 shapes)
+    ("cd wt && git '--work-tree=..' commit", "bash"),
+    ("cd wt && git '--git-dir=../.git' commit", "bash"),
+    ("'--work-tree=..' git commit", "bash"),
+    ("'--git-dir=../.git' git commit", "bash"),
+    ("Set-Location wt; -StackName; git commit", "powershell"),
+    ("Set-Location wt -StackName foo; git commit", "powershell"),
+    ("-StackName", "powershell"),
+    (".\\up.ps1; git commit", "powershell"),
+    ("Set-Location wt; .\\up.ps1; git commit", "powershell"),
+    ("test -d wt && cd wt;", "bash"),
+    ("test -d wt && cd wt; git commit", "bash"),
+    ("false && cd wt;", "bash"),
+    ("false && cd wt; git commit", "bash"),
+    ("Set-Location wt -PassThru | Out-Null;", "powershell"),
+    ("Set-Location wt -PassThru | Out-Null; git commit", "powershell"),
+    ("pushd +1 && git commit", "bash"),
+    ("pushd +1 wt; git commit", "powershell"),
+    ("pushd -n wt; git commit", "powershell"),
+    ("HKLM:\\ && git commit", "powershell"),
+    ("cd wt; HKLM:\\ && git commit", "powershell"),
+    ("cd wt; HKLM:\\; git commit", "powershell"),
+    ("Set-Location wt; . ([scriptblock]::Create('cd ..')); git commit", "powershell"),
+    ("Set-Location wt; Invoke-Command -ScriptBlock ([scriptblock]::Create('Set-Location ..')); git commit", "powershell"),
+
+    # Glued quotes, backslashes, scripts, etc.
     ("c''d && git commit", "bash"),
     ("c\\d && git commit", "bash"),
     ("git '-C' .. commit", "bash"),
     ("git -''C .. commit", "bash"),
-    ("'--work-tree=..' git commit", "bash"),
-    ("'--git-dir=../.git' git commit", "bash"),
     ("env 'GIT_DIR=..' git commit", "bash"),
     ("export X=1; git commit", "bash"),
     ("set \"GIT_DIR=..\" && git commit", "cmd"),
-    (".\\up.ps1; git commit", "powershell"),
     ("call .\\up.bat && git commit", "cmd"),
     ("start /D wt git commit", "cmd"),
     ("env --chd=.. git commit", "bash"),
-    ("cd 'wt ' && git commit", "bash"),
-    ("cd wt. && git commit", "bash"),
     ("ſl wt; git commit", "powershell"),
     ("Set-Locatİon wt; git commit", "powershell"),
     ("cd \"wt\"/sub && git commit", "bash"),
     ("cd 'a''b' && git commit", "bash"),
     ("cd a\\ b && git commit", "bash"),
-    ("Set-Location wt -PassThru | Out-Null;", "powershell"),
-    ("-StackName", "powershell"),
-    ("pushd -n wt; git commit", "powershell"),
-    ("pushd +1 wt; git commit", "powershell"),
-    ("HKLM:\\ && git commit", "powershell"),
 
-    # Earlier T1/T1c dropped rows
+    # Dropped rows
     ("\"C:\\Program Files\\Git\\cmd\\git.exe\" -C wt commit", None),
-    ("test -d wt && cd wt;", "bash"),
-    ("false && cd wt;", "bash"),
     ("cmd /c \"cd D:\\x && git commit\"", "cmd"),
     ("cd D:x && git commit", "cmd"),
     ("cd D: && git commit", "cmd"),
@@ -120,7 +177,7 @@ NONE_CASES = [
     ("cd wt && git commit", "powershell"),
     ("cd {wt} && git commit", "powershell"),
 
-    # Review round 2 (t1-fixes-r2 item-1 inputs)
+    # Review round 2 inputs
     ("Set-Location wt; git log -1 \"src\\\"; cd ..; git commit -m \"y\"", "powershell"),
     ("git -C wt status \"src\\\"; cd ..; git commit \"y\"", "powershell"),
     ("git -C wt status \"src\\\"; cd ..; git commit \"y\"", "cmd"),
@@ -141,8 +198,6 @@ NONE_CASES = [
     ("cd wt && eval 'cd ..'; git commit", "bash"),
     ("cd wt && eval \"cd ..\"; git commit", "bash"),
     ("cd wt && source /dev/stdin <<< 'cd ..'; git commit", "bash"),
-    ("Set-Location wt; . ([scriptblock]::Create('cd ..')); git commit", "powershell"),
-    ("Invoke-Command -ScriptBlock ([scriptblock]::Create('Set-Location ..'))", "powershell"),
     ("cd wt && zsh -c 'cd ..'; git commit", "bash"),
     ("cd wt && dash -c 'cd ..'; git commit", "bash"),
     ("cd wt && ksh -c 'cd ..'; git commit", "bash"),
@@ -222,11 +277,13 @@ NONE_CASES = [
     ("git commit @x", "powershell"),
     ("git commit a,b", "powershell"),
 
-    # Control chars and length boundary
+    # Control chars, non-ASCII outside quotes, and length boundary
     ("git commit\0", None),
     ("git commit\r", None),
     ("git commit\n", None),
+    ("git commit \xe9", None),
     ("cd wt && git commit " + ("x" * 4100), None),
+    ("git commit " + ("x" * 4096), None),
 ]
 
 
@@ -239,6 +296,71 @@ def test_none_cases_return_none(cmd_tmpl: str, shell: str | None, tmp_path: Path
     cwd_str = str(tmp_path)
     cmd = cmd_tmpl.format(wt=str(wt), wtx=str(wtx)) if ("{wt}" in cmd_tmpl or "{wtx}" in cmd_tmpl) else cmd_tmpl
     assert strict_target(cmd, cwd_str, shell=shell) is None, f"Expected None for {cmd} in {shell}"
+
+
+def test_item7_restored_rows_with_benign_counterparts(tmp_path: Path):
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    cwd_str = str(tmp_path)
+    wt_norm = os.path.normcase(str(wt.resolve()))
+    cwd_norm = os.path.normcase(str(Path(cwd_str).resolve()))
+
+    # Pair: (malformed_command, shell, benign_command, expected_target)
+    checks = [
+        # Options before subcommand vs clean cd && commit
+        (f"cd wt && git '--work-tree=..' {CI}", "bash", f"cd wt && {GC}", wt_norm),
+        (f"cd wt && git '--git-dir=../.git' {CI}", "bash", f"cd wt && {GC}", wt_norm),
+        (f"'--work-tree=..' {GC}", "bash", GC, cwd_norm),
+        (f"'--git-dir=../.git' {GC}", "bash", GC, cwd_norm),
+        # Extra stack flag in PowerShell vs clean Set-Location
+        (f"Set-Location wt; -StackName; {GC}", "powershell", f"Set-Location wt; {GC}", wt_norm),
+        (f"Set-Location wt -StackName foo; {GC}", "powershell", f"Set-Location -Path wt; {GC}", wt_norm),
+        # Dot-slash script execution vs clean location
+        (f"Set-Location wt; .\\up.ps1; {GC}", "powershell", f"Set-Location wt; {GC}", wt_norm),
+        # Unrecognized commands at start vs clean cd
+        (f"test -d wt && cd wt; {GC}", "bash", f"cd wt && {GC}", wt_norm),
+        (f"false && cd wt; {GC}", "bash", f"cd wt && {GC}", wt_norm),
+        # Pipeline and PassThru vs clean Set-Location
+        (f"Set-Location wt -PassThru | Out-Null; {GC}", "powershell", f"Set-Location wt; {GC}", wt_norm),
+        # pushd +1 in bash vs clean cd
+        (f"pushd +1 && {GC}", "bash", f"cd wt && {GC}", wt_norm),
+        (f"pushd +1 wt; {GC}", "powershell", f"pushd wt; {GC}", wt_norm),
+        # Registry prefix in path vs clean cd
+        (f"cd wt; HKLM:\\ && {GC}", "powershell", f"cd wt; {GC}", wt_norm),
+        (f"cd wt; HKLM:\\; {GC}", "powershell", f"cd wt; {GC}", wt_norm),
+        # Indirect invocation vs clean Set-Location
+        (f"Set-Location wt; . ([scriptblock]::Create('cd ..')); {GC}", "powershell", f"Set-Location wt; {GC}", wt_norm),
+        (f"Set-Location wt; Invoke-Command -ScriptBlock ([scriptblock]::Create('Set-Location ..')); {GC}", "powershell", f"Set-Location wt; {GC}", wt_norm),
+    ]
+
+    for bad_cmd, sh, benign_cmd, expected_target in checks:
+        assert strict_target(bad_cmd, cwd_str, shell=sh) is None, f"Expected None for {bad_cmd=}"
+        assert strict_target(benign_cmd, cwd_str, shell=sh) == expected_target, f"Expected {expected_target} for {benign_cmd=}"
+
+
+def test_unc_path_timing_under_one_second(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cwd_str = str(tmp_path)
+    called: list[str] = []
+    monkeypatch.setattr(os.path, "isdir", lambda p: called.append(p) or True)
+
+    cmd = r"git -C \\10.255.255.7\s " + CI
+    t0 = time.perf_counter()
+    res = strict_target(cmd, cwd_str)
+    elapsed = time.perf_counter() - t0
+
+    assert res is None
+    # Verify rejection happens BEFORE any filesystem call
+    assert len(called) == 0, "os.path.isdir must NOT be called for UNC/device paths"
+    assert elapsed < 1.0, f"UNC path took too long: {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("var", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "git_dir", "Git_Dir"])
+def test_env_git_vars_return_none(var: str, tmp_path: Path):
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    cwd_str = str(tmp_path)
+    cmd = f"git -C wt {CI} -m x"
+    assert strict_target(cmd, cwd_str, env={var: "/override/path"}) is None
 
 
 def test_bash_cdpath_relative_returns_none(tmp_path: Path):
@@ -281,11 +403,18 @@ def test_linear_regex_timing_100k(shell: str | None, pattern: str, tmp_path: Pat
     wt = tmp_path / "wt"
     wt.mkdir(exist_ok=True)
     cwd_str = str(tmp_path)
-    repeat_count = 50_000
-    huge_input = f"cd wt && {GC} -m " + (pattern * repeat_count)
+    # Test 1: within 4096 cap (~2000 chars) exercises regexes linearly without hitting length cap
+    inp_within = f"cd wt && {GC} -m " + (pattern * 500)
     t0 = time.perf_counter()
-    res = strict_target(huge_input, cwd_str, shell=shell)
-    elapsed = time.perf_counter() - t0
-    assert res is None
-    # 4096-character limit rejects in < 0.0001s
-    assert elapsed < 1.0, f"Quadratic performance detected: took {elapsed:.2f}s for {shell=}, {pattern=}"
+    res1 = strict_target(inp_within, cwd_str, shell=shell)
+    el1 = time.perf_counter() - t0
+    assert res1 is None
+    assert el1 < 0.5, f"Took {el1:.2f}s within cap"
+
+    # Test 2: above 4096 cap (50,000 repeats) tests fast rejection
+    inp_above = f"cd wt && {GC} -m " + (pattern * 25_000)
+    t0 = time.perf_counter()
+    res2 = strict_target(inp_above, cwd_str, shell=shell)
+    el2 = time.perf_counter() - t0
+    assert res2 is None
+    assert el2 < 0.5, f"Took {el2:.2f}s above cap"
