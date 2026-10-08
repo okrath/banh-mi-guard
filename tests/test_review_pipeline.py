@@ -857,3 +857,18 @@ def test_full_multistage_deterministic_run(monkeypatch: pytest.MonkeyPatch):
     assert verdict.llm_calls > 0
     assert verdict.llm_chars > 0
     assert len(verdict.coverage_notes) > 0
+
+
+@pytest.mark.parametrize("interloper", ["  NOTE: see below", "Summary: two issues", "  **Score:** 4"])
+def test_a_header_like_line_inside_findings_never_drops_the_findings_after_it(interloper):
+    text = (
+        "SCORE: 8\nSUMMARY: ok\nFINDINGS:\n- low | style | a.py:1 | - | nit\n"
+        f"{interloper}\n- high | security | b.py:2 | - | sql injection\nTECHNICAL:\n- x\n"
+    )
+    assert parse_findings(text, "task") is None  # unreadable: never an approval missing the high finding
+
+
+def test_a_section_after_findings_without_finding_lines_still_ends_the_block():
+    text = "FINDINGS:\n- high | security | b.py:2 | - | sql injection\n  Threatmodel:\n  - attacker controls b\n"
+    parsed = parse_findings(text, "task")
+    assert parsed is not None and [f.severity for f in parsed] == ["high"]

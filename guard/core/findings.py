@@ -57,6 +57,12 @@ _NEXT_SECTION_RE = re.compile(
 )
 
 
+def _is_finding_line(line: str) -> bool:
+    """`severity | kind | ...` with a known severity and kind: the shape of a finding wherever it stands."""
+    parts = [x.strip().lower() for x in line.strip().lstrip("-*•").split("|")]
+    return len(parts) >= 5 and parts[0] in SEVERITIES and parts[1] in KINDS
+
+
 def parse_findings(text: str, task_text: str) -> Optional[List[Finding]]:
     """
     `FINDINGS:` lines -> classified findings. None when the section is missing or any line is malformed
@@ -70,6 +76,8 @@ def parse_findings(text: str, task_text: str) -> Optional[List[Finding]]:
     rest = text[start_pos:]
     end_match = _NEXT_SECTION_RE.search(rest)
     block = rest[:end_match.start()] if end_match else rest
+    if end_match and any(_is_finding_line(line) for line in rest[end_match.start():].splitlines()):
+        return None  # a line inside the block looked like a header: the block was cut, never drop what follows
     out: List[Finding] = []
     for line in block.splitlines():
         line = line.strip().lstrip("-*•").strip()
