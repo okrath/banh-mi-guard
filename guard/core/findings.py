@@ -52,17 +52,26 @@ def classify(finding: "Finding", task_text: str) -> "Finding":
     return finding
 
 
+_NEXT_SECTION_RE = re.compile(
+    r"(?:\r?\n)[ \t]*(?:\*{1,2}|#{1,6}[ \t]*)?(?:[A-Z]{3,}|(?i:threat[ \t]*model|unreviewed|technical|ergonomics|remediation|invariants|summary|score))[ \t]*(?::[ \t]*(?:\*{1,2})?|\*{1,2}:)",
+)
+
+
 def parse_findings(text: str, task_text: str) -> Optional[List[Finding]]:
     """
     `FINDINGS:` lines -> classified findings. None when the section is missing or any line is malformed
     (too few fields, an unknown severity or kind): a finding guard cannot read is never dropped or
     demoted into an approval.
     """
-    m = re.search(r"FINDINGS:\s*(.*?)(?=\n[A-Z]{3,}:|\Z)", text, re.DOTALL)
-    if not m:
+    findings_matches = list(re.finditer(r"(?m)^FINDINGS\s*:", text))
+    if len(findings_matches) != 1:
         return None
+    start_pos = findings_matches[0].end()
+    rest = text[start_pos:]
+    end_match = _NEXT_SECTION_RE.search(rest)
+    block = rest[:end_match.start()] if end_match else rest
     out: List[Finding] = []
-    for line in m.group(1).splitlines():
+    for line in block.splitlines():
         line = line.strip().lstrip("-*•").strip()
         if not line or line.lower() == "none":
             continue
