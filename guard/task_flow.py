@@ -877,6 +877,34 @@ def _post_llm_gate(
     )
 
 
+PANEL_PARTS = 2  # a diff reviewed in this many parts or more is large
+PANEL_LINES = 400  # so is one with more changed lines than this
+PANEL_REVIEWERS = 3
+
+
+def _panel_hint(diff_scope: "_PostDiffScope", review_options: Dict[str, Any], approved: bool) -> Dict[str, Any]:
+    """
+    A plain review approved a large or security-sensitive diff: the review panel the agent offers the user
+    (deterministic, no LLM). {} when not approved, when a panel already ran, or when the diff is small and plain.
+    """
+    from guard.core.threat_frame import security_surface
+    if not approved or int((review_options.get("options") or {}).get("reviewers", 1)) > 1:
+        return {}
+    parts = len(partition_diff(diff_scope.task_diff).parts)
+    lines = diff_scope.task_summary.total_insertions + diff_scope.task_summary.total_deletions
+    reasons = [f"{parts} review parts"] if parts >= PANEL_PARTS else []
+    if lines > PANEL_LINES:
+        reasons.append(f"{lines} changed lines")
+    surface = security_surface(diff_scope.task_diff)
+    if surface.sensitive:
+        reasons.append("security-sensitive: " + "; ".join(surface.reasons[:3]))
+    if not reasons:
+        return {}
+    calls = ReviewOptions(reviewers=PANEL_REVIEWERS).cost_hint(max(parts, 1))
+    return {"reasons": reasons, "calls": calls,
+            "command": f"guard post --reviewers {PANEL_REVIEWERS} --max-llm-calls {calls}"}
+
+
 def _post_record_and_report(
     target_repo: Path, session_mgr: SessionManager, session: Optional[Any], pre: Optional[Any],
     diff_scope: _PostDiffScope, rules_res: _PostRulesResult, inv_eval: InvariantResult,
@@ -908,6 +936,7 @@ def _post_record_and_report(
         commit_mode=load_global_config().commit_mode,  # machine-wide choice, whatever the local config says
         review_options=gate_res.review_options, coverage_notes=review_verdict.coverage_notes,
         validation_log=review_verdict.validation_log, llm_calls=review_verdict.llm_calls,
+        panel_hint=_panel_hint(diff_scope, gate_res.review_options, all_passed),
     )
 
     key_error = None

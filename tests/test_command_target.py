@@ -338,20 +338,24 @@ def test_item7_restored_rows_with_benign_counterparts(tmp_path: Path):
         assert strict_target(benign_cmd, cwd_str, shell=sh) == expected_target, f"Expected {expected_target} for {benign_cmd=}"
 
 
-def test_unc_path_timing_under_one_second(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_unc_path_makes_no_filesystem_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cwd_str = str(tmp_path)
     called: list[str] = []
     monkeypatch.setattr(os.path, "isdir", lambda p: called.append(p) or True)
 
-    cmd = r"git -C \\10.255.255.7\s " + CI
-    t0 = time.perf_counter()
-    res = strict_target(cmd, cwd_str)
-    elapsed = time.perf_counter() - t0
+    # Control: a local path does reach the filesystem check, so the patch is effective.
+    (tmp_path / "wt").mkdir(exist_ok=True)
+    strict_target(f"git -C wt {CI}", cwd_str)
+    assert called, "control: a local path must reach os.path.isdir"
+    called.clear()
 
-    assert res is None
-    # Verify rejection happens BEFORE any filesystem call
-    assert len(called) == 0, "os.path.isdir must NOT be called for UNC/device paths"
-    assert elapsed < 1.0, f"UNC path took too long: {elapsed:.2f}s"
+    for cmd in (
+        r"git -C \\10.255.255.7\s " + CI,
+        r"git -C \\?\C:\wt " + CI,
+        r"git -C \\.\pipe\x " + CI,
+    ):
+        assert strict_target(cmd, cwd_str) is None
+    assert called == [], "os.path.isdir must NOT be called for UNC/device paths"
 
 
 @pytest.mark.parametrize("var", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "git_dir", "Git_Dir"])
@@ -411,7 +415,17 @@ def test_linear_regex_timing_100k(shell: str | None, pattern: str, tmp_path: Pat
     assert res1 is None
     assert el1 < 0.5, f"Took {el1:.2f}s within cap"
 
-    # Test 2: above 4096 cap (50,000 repeats) tests fast rejection
+    # Test 1b: just under the 4096 cap, the longest input the regex path accepts
+    prefix = f"cd wt && {GC} -m "
+    inp_under = prefix + (pattern * ((4095 - len(prefix)) // len(pattern)))
+    assert len(inp_under) <= 4096
+    t0 = time.perf_counter()
+    res1b = strict_target(inp_under, cwd_str, shell=shell)
+    el1b = time.perf_counter() - t0
+    assert res1b is None
+    assert el1b < 0.5, f"Took {el1b:.2f}s just under cap"
+
+    # Test 2: above 4096 cap (25,000 repeats) tests fast rejection
     inp_above = f"cd wt && {GC} -m " + (pattern * 25_000)
     t0 = time.perf_counter()
     res2 = strict_target(inp_above, cwd_str, shell=shell)
