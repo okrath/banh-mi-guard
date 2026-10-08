@@ -99,6 +99,12 @@ guard post [options]
 * `--auto-fix`: Trigger self-healing remediation suggestions if verification fails.
 * `--hook`: Git-hook mode. Skips when the repository has no guard session or when guard is not on `PATH`; with an approved session, passes only when staged/committed changes match what was approved. Never runs OCR.
 * `--full`: Full review. Adds an Alibaba OCR review of the task's changes (it reads the repository, costs tokens, takes minutes; see details below). Without it the report says "Alibaba OCR: not run", and an approved report tells the agent to ask you before committing whether you want this full review.
+* `--reviewers <1-5>`: LLM review panel size. Default 1 (one reviewer). See [Review Options](#review-options-stages--limits).
+* `--validate` / `--no-validate`: Check blocking findings of a multi-part diff against the whole diff before they block.
+* `--test-checklist` / `--no-test-checklist`: Add the test-quality checklist to the review prompt.
+* `--threat-frame <off|auto>`: Add a threat-model frame when the diff touches security-sensitive surface.
+
+A flag you do not pass keeps the value from `guard config review`. Five more review options have no flag and are set only there: `coverage_notes`, `part_manifest`, `test_evidence`, `max_llm_calls` and `stage_timeout_s`.
 
 *Output:* Inspects git diff, detects out-of-scope and deleted files, scans the built-in rules and code hygiene, runs the Alibaba OCR review (only with `--full`), executes the build command, runs invariant checks, and requests **Final Gate Approval from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
 
@@ -106,11 +112,51 @@ guard post [options]
 Post audits against the base commit recorded at pre, runs the build command, invariant checks and the removed-symbol reference check, then asks the LLM.
 - **Diff & Baseline Snapshot Errors Force REVISE:** If Git diff inspection or baseline snapshot diff inspection fails, the error is surfaced in `diff_summary.error` and docks 5.0 points from the heuristic score, forcing a `REVISE` verdict (see [Quality Pillars: Scoring and the final verdict](quality-pillars.md#scoring-and-the-final-verdict)). If snapshot creation failed at pre, the report details why and reviews the full diff.
 - **Heuristic vs LLM Gate:** The report names the gate that actually ran. It says "LLM Gate" only when the LLM answered. Otherwise it says "Heuristic Gate (no LLM review)" and records the reason (`llm_error`, `review_mode` in `.guard/session.json`), for example a timeout or a model that refused to review a part. A heuristic REVISE (outright blockers such as build failure, violated invariant, CRITICAL rule, out-of-scope file, diff error, or score below 7.5; see [Quality Pillars](quality-pillars.md#scoring-and-the-final-verdict)) is final; otherwise the LLM decides.
-- **Large Diff Handling:** Large diffs are reviewed in parts of up to 80k characters (one REVISE rejects the whole diff); deleted files are sent as a one-line note; an answer that ignores the SCORE/VERDICT format is retried once. A review request has no time limit: AI review takes as long as it takes, and it ends when the LLM answers or its provider returns an error (`llm.timeout` applies only to `guard config test` pings). Deleting code earns no score bonus.
+- **Large Diff Handling:** Large diffs are reviewed in parts of up to 80k characters, at most 6 parts (one REVISE rejects the whole diff; parts beyond the limit are not reviewed and the report says so under *Not reviewed / limits*); deleted files are sent as a one-line note; an answer that ignores the SCORE/VERDICT format is retried once. A review request has no time limit: AI review takes as long as it takes, and it ends when the LLM answers or its provider returns an error (`llm.timeout` applies only to `guard config test` pings). Deleting code earns no score bonus.
 - **Removed Symbol References (`DEAD-REF`):** Removals that a compiler cannot see are checked over the whole repository: every string key (`case 'edit':`), export and CSS class deleted by the diff is searched for. One that is no longer defined but still referenced raises `DEAD-REF` (HIGH) with the locations. The summary line goes into every LLM review part as verified evidence.
 - **HTML Sinks (`SEC-003`):** Checks every assignment on a line, and a comment that mentions "sanitize" does not silence it. Only an empty literal, a value that is exactly one `DOMPurify.sanitize(...)` call, or an explicit `// guard-allow SEC-003: <reason>` exempts a line, and that marker is still listed as a `LOW` finding.
 - **Alibaba OCR review (`guard post --full`):** OCR is optional: a plain `guard post` does not run it and the report says "Alibaba OCR: not run". When a plain `guard post` is approved, the report tells the agent to ask you before committing whether you want a full review with OCR: say yes and it runs `guard post --full`, say no and the gate approval is enough. Asking for a full review at any time also runs it; Git hooks never run it. `guard config ocr always` runs it on every post and `guard config ocr optional` switches that off; only you can run `guard config ocr`, in an interactive terminal. With `--full`, guard runs `ocr review` from the base commit recorded at pre to a snapshot of the working tree, so commits made mid-task, unstaged edits and new files are all reviewed (the snapshot is a Git object built in a throwaway index; your index, working tree and branches are not touched). The task prompt is passed as `--background`. It takes minutes, not seconds, and has no time limit: guard passes `--timeout 0` and sets OCR's per-request limit, which OCR cannot switch off, to ten years (`OCR_LLM_TIMEOUT`, overriding a shorter value in the environment), so the review ends only when OCR finishes or reports the provider's error; Ctrl+C stops it. A high or critical OCR finding blocks (REVISE); medium and low findings are listed and passed to the LLM gate. OCR not running (not installed, a provider error, a partial review) is `OCR-RUN` (HIGH) and also blocks: the report says "did not run" with the reason, never a pass. Findings on files that were already dirty before pre and that the task left untouched are dropped, and the report counts them; a dirty file the task edits is reviewed like any other. A partial review (the provider failed on some files) is resumed once with `--resume`, so only the failed files run again. A gateway that drops parallel requests needs a lower `ocr.concurrency` in `~/.guard/config.json` (0 keeps OCR's default of 8).
 - **Commit Line:** The post report of approved work ends with a **Commit** line telling the agent which mode is set (`auto` or `ask`); see [guard config commit](#5-guard-config).
+
+### Review Options, Stages & Limits:
+Every option below is off or at its default unless you change it, so a plain `guard post` is one review per diff part. The extra stages cost LLM calls and are opt-in. None of these options changes the Alibaba OCR setting or what `--full` does. They apply to `guard post`; `guard review` always runs with the defaults.
+
+Resolution order: built-in defaults, then the `review` object of the config file (`guard config review`), then the flags of this run. Environment variables are deliberately not read, so nothing in the environment can switch a review stage on or off. When an option differs from its default, `guard post` prints one `Review options:` line naming it, where its value came from, "weaker than default" for an option that reviews less, and the worst-case LLM call count when options add calls.
+
+| Option | Flag | Default | What it does and what it costs |
+| :--- | :--- | :--- | :--- |
+| `coverage_notes` | none | `true` | Shows the *Not reviewed / limits* section described below. No LLM cost. Turning it off is reported as weaker than default. |
+| `part_manifest` | none | `false` | On a multi-part diff, each part's prompt also lists the other parts and the files in them with their added and removed line counts (at most 1,500 characters), so the reviewer knows where a missing piece may live. A longer prompt, no extra calls. |
+| `test_evidence` | none | `false` | Adds facts about changed tests to the evidence the reviewer reads (see *Test-quality evidence*). No extra calls. |
+| `test_checklist` | `--test-checklist` | `false` | Adds a test-quality checklist to the review prompt. A longer prompt, no extra calls. |
+| `threat_frame` | `--threat-frame` | `off` | `auto` adds an adversarial frame when the diff touches security-sensitive surface (see *Threat frame*). No extra calls. |
+| `validate_findings` | `--validate` | `false` | Re-checks blocking findings against the whole diff (see *Finding validation*). Up to 5 extra calls. |
+| `reviewers` | `--reviewers` | `1` | A panel of 1 to 5 reviewers (see *Reviewer panel*). Multiplies the calls. |
+| `max_llm_calls` | none | `12` | Cap on the calls the extra stages (panel and validation) may use. At least 1. |
+| `stage_timeout_s` | none | `900` | Seconds each extra stage may take. At least 30. |
+
+**Calls per part.** One reviewer makes one call per diff part, plus one retry when the answer ignores the required format, so at most 2 calls per part. The worst case is `2 x parts x reviewers`, plus 5 with `validate_findings`; that is the number the `Review options:` line prints (only when `reviewers` is above 1 or validation is on). The calls a review really made are recorded as `llm_calls` in `.guard/session.json`.
+
+**Reviewer panel.** With `reviewers` of N, the first N of these lenses each review every part independently: correctness, requirements, contracts, tests, adversary. Their findings are merged and de-duplicated, and any blocking finding makes the verdict REVISE. The panel replaces the single review; it does not run in addition to it, and it proposes no new invariants. Use it for a change where one pass is likely to miss something and the extra calls are acceptable; it is not a default. The panel needs at least half of its lenses to answer every part, otherwise it falls back to one reviewer. With `test_checklist` the checklist goes to the tests lens, and with an active threat frame the frame goes to the adversary lens.
+
+**The call cap.** The single review always runs, retries included, and is never capped or skipped. `max_llm_calls` limits only the extra stages: the panel starts only when `2 x reviewers x parts` is within the cap, and validation only when its worst case is. At the default of 12, `--reviewers 3` on a diff of 3 parts (18 calls) or `--reviewers 5` on 2 parts (20 calls) does not start; one reviewer runs and the report says so. Raise `max_llm_calls` together with `reviewers`. `stage_timeout_s` bounds how long the panel and validation may take; the single review keeps no time limit (see *Large Diff Handling* above).
+
+**Finding validation.** Runs only when `validate_findings` is on, a finding blocks, and the diff has more than one part (or parts that were cut), because a finding about one part may be answered by another. At most 5 blocking findings are checked, one call each, with the surrounding lines of the whole diff. A finding is demoted to advisory only when the validator answers "refuted" and quotes one line (12 to 160 characters) that literally appears in the diff, in a different file than the finding's own or moved verbatim out of the finding's file, and the finding is not a security finding and the quote is not a comment, docstring or secret. A demoted finding keeps its text with a `[contested: ... evidence: "..."]` note, and the report says `Finding validation: N checked, M demoted (evidence quoted)`. If every blocking finding is demoted, the verdict becomes APPROVED. The stage is fail-safe: an error, a timeout, an unparseable answer or a missing quote leaves every finding exactly as it was.
+
+**Test-quality evidence.** With `test_evidence`, guard reads the diff of test files and gives the reviewer up to 12 factual lines, never a verdict and never a block of their own: fewer assertions after the change than before, an added skip or disable marker, a mutation of process-wide state (path, environment, working directory), an added test with no assertion, and a test file deleted or only shortened. The languages, frameworks and patterns it recognises, and what it leaves to the LLM, are in the table at the top of [`guard/core/test_evidence.py`](../guard/core/test_evidence.py).
+
+**Threat frame.** With `threat_frame` set to `auto`, guard scans the diff without an LLM for security-sensitive surface: paths such as authentication, sessions, tokens, secrets, crypto, permissions, CI workflows, Dockerfiles, hooks, `.env` and key files, and added or removed lines such as process execution, dynamic evaluation, HTML sinks, SQL built from strings, disabled certificate checks, `curl | sh`, or a removed authorization check. The full trigger table is at the top of [`guard/core/threat_frame.py`](../guard/core/threat_frame.py). When something triggers, the evidence names the reasons and the prompt asks for an adversarial review plus two short sections: a threat model (shown in the technical audit as `Threat model: ...`) and a list of what the reviewer did not examine (shown under *Not reviewed / limits*). Suspected issues still go through the normal findings; when nothing triggers, the review is unchanged.
+
+**Not reviewed / limits.** The terminal and `.guard/POST_TASK_REPORT.md` end the review with this section whenever the review left something out; it is absent when the review saw everything. An approved report starts it with "The approval covers only what the review saw." The notes it can show, in this order:
+- `N diff part(s) were NOT reviewed (limit M).` Parts beyond the part limit.
+- `Not shown to the reviewer (assets, lockfiles, images): ...` Files filtered out before review (the first 10, then `+N more`).
+- `Content omitted for deleted file(s): ...` Deleted files, which are sent as a one-line note.
+- `Reviewer did not trace: ...` What the reviewer reported as not examined (threat frame only).
+- `Reviewer panel unavailable (...); one reviewer ran.` The call cap was too low, the panel failed, or too few lenses answered.
+- `Finding validation skipped (budget exceeded).` or `Finding validation timed out after Ns.`
+
+The first three notes are also shown when a hard blocker such as a failed build decided before the LLM was asked.
+
 ### Signed Approvals & State Protection:
 Approvals are cryptographically signed using HMAC-SHA256, automated agent edit tools targeting `.guard/` are blocked, shell modifications to `session.json` trigger warnings, and unsigned or older approvals are rejected on agent commit, stop hooks, and Git pre-commit hooks (`guard post --hook`).
 
@@ -172,10 +218,19 @@ guard config ocr optional # only guard post --full runs it
 # Choose who writes commit messages for approved work (machine-wide):
 guard config commit auto   # the agent writes them (conventional, never mentions guard)
 guard config commit ask    # the agent asks you for every commit message
+
+# Show the effective review options and where each comes from (default, config or cli):
+guard config review
+# Set one review option machine-wide (only the user can run this, in an interactive terminal):
+guard config review <option> <value>   # e.g. reviewers 3, threat_frame auto, validate_findings true
 ```
 
 `guard config ocr` is the user's decision and can only be run by the user in an interactive terminal.
 `guard post` reports the chosen mode in the **Commit** line of an approved report; while no mode is set, the agent is told to ask you which one you want. `guard install` and `guard doctor` list it as "Commit messages".
+
+`guard config review` accepts `coverage_notes`, `part_manifest`, `test_evidence`, `test_checklist`, `validate_findings` (true or false), `threat_frame` (`off` or `auto`), `reviewers` (1 to 5), `max_llm_calls` and `stage_timeout_s`; what each does is in [Review Options, Stages & Limits](#review-options-stages--limits). A wrong value or an unknown option is refused naming the allowed values. The options are stored as the `review` object of `~/.guard/config.json`; when the repository has its own `.guard/config.json`, that file is read instead of the machine-wide one (it is not merged with it). A saved `review` value that cannot be parsed makes `guard post` fail instead of silently using defaults.
+
+**Compatibility.** An older guard does not know the new fields. If it re-saves the config (for example `guard config commit`), it drops the `review` object, and if it re-saves a session, it drops the review fields of that post record (`review_options`, `coverage_notes`, `validation_log`, `llm_calls`). Nothing crashes: the saved review options or the record of how that review ran are lost, and the options return to their defaults.
 
 **LLM Configuration Providers:**
 1. **OpenAI / OpenAI-Compatible**: OpenAI, **Ollama** (`http://localhost:11434/v1`), **DeepSeek** (`https://api.deepseek.com/v1`), OpenRouter, vLLM, or Local Gateways (`http://127.0.0.1:8090/v1`).
