@@ -677,7 +677,7 @@ class _PostOcrResult:
 
 def _post_ocr(
     target_repo: Path, config, pre: Optional[Any], task_diff: str,
-    preexisting_files: List[str], hook: bool, full: bool,
+    preexisting_files: List[str], hook: bool, full: bool, related: Optional[List[str]] = None,
 ) -> _PostOcrResult:
     """Coordinate Alibaba OCR review and start the background build; returns OCR result with findings."""
     # Alibaba OCR (an LLM review that reads the repository) runs only for a full review (--full, never
@@ -693,7 +693,7 @@ def _post_ocr(
 
     def start_build() -> None:
         if "future" not in build:
-            build["future"] = pool.submit(_run_build, target_repo)
+            build["future"] = pool.submit(_run_build, target_repo, related)
 
     # The status always names the setting, so the user knows when OCR runs and how to change it
     setting = (
@@ -826,6 +826,12 @@ def _run_gate_review(gate, target_repo: Path, ocr_res: _PostOcrResult) -> Tuple[
             review_verdict = gate(build_res, False, [])
             if llm_ran:
                 review_verdict.summary += " The LLM review ran in parallel; the failing build decides, so it is not counted."
+    if build_res is not None and build_res.related and build_res.passed and review_verdict.verdict == ReviewVerdict.APPROVED:
+        # Only the related tests ran: an approval needs the full suite, which decides on its own if it fails
+        console.print("[cyan]🧪 The related tests passed and the gate would approve: running the full test suite...[/cyan]")
+        build_res = _run_build(target_repo)
+        if build_res is not None and not build_res.passed:
+            review_verdict = gate(build_res, False, [])
     ocr_res.pool.shutdown(wait=False)
     return review_verdict, build_res
 
@@ -960,7 +966,8 @@ def _execute_post_task(
 
     diff_scope = _post_diff_and_scope_audit(target_repo, pre)
     rules_res = _post_rules_and_hygiene(target_repo, pre, diff_scope, focus)
-    ocr_res = _post_ocr(target_repo, config, pre, diff_scope.task_diff, diff_scope.preexisting_files, hook, full)
+    related = _related_tests(target_repo, config, diff_scope)
+    ocr_res = _post_ocr(target_repo, config, pre, diff_scope.task_diff, diff_scope.preexisting_files, hook, full, related)
     rules_res.violations.extend(ocr_res.violations)
     rules_res.evidence.append(f"Alibaba OCR review: {ocr_res.ocr_status}")
 
@@ -1036,9 +1043,26 @@ def _ocr_cache_key(config, pre) -> Optional[str]:
     return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
 
 
-def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
-    """The project's build and tests (0 tokens); None when the project has no build command."""
+def _related_tests(target_repo: Path, config, diff_scope: "_PostDiffScope") -> List[str]:
+    """With `guard config tests related` and a pytest build: the tests of the task's changed files ([] = all)."""
+    if config.tests_scope != "related" or detect_build_command(target_repo) != "pytest":
+        return []
+    from guard.core.related_tests import related_tests
+    changed = [f.path for f in diff_scope.task_summary.files if f.status != "deleted"]
+    deleted = [f.path for f in diff_scope.task_summary.files if f.status == "deleted"]
+    return [] if deleted else related_tests(target_repo, changed)
+
+
+def _run_build(target_repo: Path, related: Optional[List[str]] = None) -> Optional[BuildCheckResult]:
+    """
+    The project's build and tests (0 tokens); None when the project has no build command. With `related`
+    (test files, only for a pytest build) only those tests run, and the result says so.
+    """
     build_cmd = detect_build_command(target_repo)
+    if build_cmd == "pytest" and related:
+        build_cmd = "pytest " + " ".join(related)  # repository paths checked to be plain [\w./-] by related_tests
+    else:
+        related = []
     build_res: Optional[BuildCheckResult] = None
     if build_cmd:
         start_t = time.perf_counter()
@@ -1064,6 +1088,7 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
                 exit_code=p.returncode,
                 output=stdout_str + stderr_str,
                 duration_s=duration,
+                related=related,
             )
         except Exception as e:
             duration = time.perf_counter() - start_t
@@ -1073,6 +1098,7 @@ def _run_build(target_repo: Path) -> Optional[BuildCheckResult]:
                 exit_code=1,
                 output=str(e),
                 duration_s=duration,
+                related=related,
             )
     return build_res
 

@@ -96,6 +96,7 @@ class BuildCheckResult(BaseModel):
     exit_code: int
     output: str = ""
     duration_s: float
+    related: List[str] = Field(default_factory=list)  # the test files of a related-only run; [] = the full suite
 
 
 class PostTaskRecord(BaseModel):

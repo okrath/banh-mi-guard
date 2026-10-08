@@ -68,6 +68,9 @@ class GuardConfig(BaseModel):
     ocr: OCRConfig = Field(default_factory=OCRConfig)
     # How the agent gets commit messages: "auto" (it writes them) or "ask" (it asks the user). None: not chosen yet
     commit_mode: Optional[Literal["auto", "ask"]] = None
+    # Which tests the build check of `guard post` runs while the gate would not approve: "full" (every test) or
+    # "related" (a pytest build runs only the tests of the changed Python files). An approval always runs the full suite
+    tests_scope: Literal["full", "related"] = "full"
     # The raw "review" object (guard.core.review_options.load_review_options parses and validates it).
     # Any JSON value loads, so a wrong one fails `guard post` closed instead of dropping the whole config
     # (and with it the LLM settings). An older guard drops it when it re-saves the config (e.g. guard config commit).

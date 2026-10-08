@@ -161,6 +161,25 @@ def config_review_cmd(
         console.print("[yellow]This repository has its own .guard/config.json, which is read instead of the machine-wide file.[/yellow]")
 
 
+@config_app.command("tests")
+def config_tests_cmd(
+    scope: str = typer.Argument(..., help="full: every guard post runs all tests; related: only the tests of the changed files until the gate would approve"),
+):
+    """
+    Choose which tests the build check runs (machine-wide, ~/.guard/config.json). With `related`, a pytest build
+    runs only the tests related to the changed Python files; the full suite still runs before any approval.
+    """
+    if scope not in ("full", "related"):
+        console.print("[bold red]❌ The scope is `full` or `related`.[/bold red]")
+        raise typer.Exit(code=1)
+    cfg = load_global_config()
+    cfg.tests_scope = scope  # type: ignore[assignment]  # checked above
+    path = save_config(cfg)
+    what = ("every guard post runs the full test suite" if scope == "full" else
+            "a pytest build runs the related tests first; the full suite runs before any approval")
+    console.print(f"[bold green]✅ Tests `{scope}`: {what}.[/bold green] [dim]Saved to {path}[/dim]")
+
+
 @config_app.command("commit")
 def config_commit_cmd(
     mode: str = typer.Argument(..., help="auto: the agent writes commit messages; ask: the agent asks you for each one"),
