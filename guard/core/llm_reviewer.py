@@ -8,18 +8,31 @@ to act as the Senior Architect & Code Reviewer:
 4. Issues Final Score (0-10) and Verdict: APPROVED or REVISE with Actionable Remediation.
 Supports selective focus mode: `security`, `memory`, `performance`, `ux`, `all`.
 
+Budget semantics: `options.max_llm_calls` caps the extra review stages (reviewer panel and finding validation).
+These extra stages check the remaining budget before starting and skip themselves (with a coverage note)
+when the budget is insufficient. The base single review always runs, retries included, and is never skipped.
+
 If no LLM API key is configured, falls back to deterministic local heuristic evaluation.
 """
-
 from __future__ import annotations
 
+import concurrent.futures
 import re
+import threading
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
 from guard.core.config import GuardConfig, LLMConfig
+from guard.core.diff_partition import (
+    REVIEW_BATCH_CHARS,
+    REVIEW_MAX_BATCHES,
+    DiffPartition,
+    part_manifest,
+    partition_diff,
+)
+from guard.core.finding_validation import validate_findings
 from guard.core.findings import (
     Finding,
     _parse_invariant_proposals,
@@ -29,10 +42,20 @@ from guard.core.findings import (
 from guard.core.invariant_eval import DomainType, InvariantResult
 from guard.core.llm_client import call_llm
 from guard.core.ocr_engine import DiffSummary, RuleViolation
+from guard.core.review_checklists import TEST_QUALITY_CHECKLIST
+from guard.core.review_coverage import build_coverage_notes
+from guard.core.review_ensemble import run_ensemble
+from guard.core.review_lenses import build_lenses
+from guard.core.review_options import ReviewOptions
 from guard.core.session import BuildCheckResult, DomainContract, LockedInvariant
+from guard.core.test_evidence import test_evidence_lines
+from guard.core.threat_frame import (
+    THREAT_FRAME_INSTRUCTIONS,
+    SurfaceReport,
+    parse_threat_sections,
+    security_surface,
+)
 
-REVIEW_BATCH_CHARS = 80000
-REVIEW_MAX_BATCHES = 6
 FORMAT_REMINDER = (
     "\nYour previous answer could not be parsed. Answer again, starting with exactly these lines:\n"
     "SCORE: <0.0-10.0>\nSUMMARY: <one paragraph>\n"
@@ -61,7 +84,10 @@ class LLMReviewVerdict(BaseModel):
     findings: List[Finding] = Field(default_factory=list)  # structured; the verdict is computed from them
     review_mode: str = "heuristic"  # "heuristic" or "llm_deep"
     llm_error: Optional[str] = None
-
+    coverage_notes: List[str] = Field(default_factory=list)
+    validation_log: List[dict] = Field(default_factory=list)
+    llm_calls: int = 0
+    llm_chars: int = 0
 
 class LLMReviewerEngine:
     """
@@ -86,9 +112,11 @@ class LLMReviewerEngine:
         evidence: Optional[List[str]] = None,
         ledger: Optional[List[dict]] = None,
         known_rules: Optional[List[dict]] = None,
+        options: Optional[ReviewOptions] = None,
     ) -> LLMReviewVerdict:
         violations = violations or []
         focus_str = (focus or "all").lower()
+        opts = options if options is not None else ReviewOptions()
 
         # 1. Deterministic Heuristic Scoring (Safety baseline)
         heuristic_verdict = self._evaluate_heuristics(
@@ -101,6 +129,13 @@ class LLMReviewerEngine:
 
         # If hard blockers triggered (build failed, invariant broken, secret leaked), reject immediately
         if heuristic_verdict.verdict == ReviewVerdict.REVISE:
+            if opts.coverage_notes:
+                partition = partition_diff(
+                    diff_summary.raw_diff if diff_summary else "",
+                    batch_chars=REVIEW_BATCH_CHARS,
+                    max_batches=REVIEW_MAX_BATCHES,
+                )
+                heuristic_verdict.coverage_notes = build_coverage_notes(partition, [])
             return heuristic_verdict
 
         # 2. Deep LLM Review using the configured LLM (OpenAI, Anthropic, Ollama, DeepSeek, etc.)
@@ -119,6 +154,7 @@ class LLMReviewerEngine:
                     evidence=evidence or [],
                     ledger=ledger or [],
                     known_rules=known_rules or [],
+                    options=opts,
                 )
                 if llm_verdict:
                     return llm_verdict
@@ -130,7 +166,16 @@ class LLMReviewerEngine:
 
         if llm_error:
             heuristic_verdict.llm_error = llm_error
+            heuristic_verdict.llm_calls = getattr(self, "_last_llm_calls", 0)
+            heuristic_verdict.llm_chars = getattr(self, "_last_llm_chars", 0)
             heuristic_verdict.summary += f" LLM review did NOT run ({llm_error})."
+            if opts.coverage_notes:
+                partition = partition_diff(
+                    diff_summary.raw_diff if diff_summary else "",
+                    batch_chars=REVIEW_BATCH_CHARS,
+                    max_batches=REVIEW_MAX_BATCHES,
+                )
+                heuristic_verdict.coverage_notes = build_coverage_notes(partition, [])
         return heuristic_verdict
 
     @staticmethod
@@ -394,12 +439,26 @@ class LLMReviewerEngine:
         ) or "- none recorded"
         evidence_info = "\n".join(f"- {e}" for e in (evidence or [])) or "- none"
         known_info = "\n".join(f"- {r.get('id')}: {r.get('description')}" for r in (known_rules or [])) or "- none"
-        ledger_info = "\n".join(
-            f"- [{f.get('id')}] round {f.get('round')}, {f.get('status', 'open')}"
-            + (f" ({f.get('note')})" if f.get("note") else "")
-            + f": {f.get('severity')} {f.get('kind')} {f.get('location')}: {f.get('description')}"
-            for f in (ledger or [])
-        ) or "- none"
+        ledger_lines = []
+        for f in (ledger or []):
+            desc = f.get("description", "")
+            if "[contested:" in desc:
+                status = "contested (a validation step disputed it; re-check it against the current diff)"
+            else:
+                status = f.get("status", "open")
+            note_str = f" ({f.get('note')})" if f.get("note") else ""
+            ledger_lines.append(
+                f"- [{f.get('id')}] round {f.get('round')}, {status}{note_str}: {f.get('severity')} {f.get('kind')} {f.get('location')}: {desc}"
+            )
+        ledger_info = "\n".join(ledger_lines) or "- none"
+        has_contested = any("[contested:" in f.get("description", "") for f in (ledger or []))
+        ledger_title = (
+            "Findings so far in this session (id, round, status, your earlier wording; "
+            "the instruction not to raise findings already raised does NOT apply to contested entries; "
+            "re-check them against the current diff):"
+            if has_contested
+            else "Findings so far in this session (id, round, status, your earlier wording):"
+        )
 
         return f"""
 Domain: {domain_str}
@@ -418,7 +477,7 @@ Every project rule that exists now (team file, local file, learned earlier in th
 {known_info}
 Verified evidence (computed by guard over the whole repository, valid for every diff part):
 {evidence_info}
-Findings so far in this session (id, round, status, your earlier wording):
+{ledger_title}
 {ledger_info}
 """
 
@@ -430,22 +489,42 @@ Findings so far in this session (id, round, status, your earlier wording):
         system_prompt: str,
         model_name: str,
         focus: str,
+        options: Optional[ReviewOptions] = None,
+        counted_call: Optional[Callable[[str, str], str]] = None,
+        partition: Optional[DiffPartition] = None,
     ) -> Optional[List[LLMReviewVerdict]]:
+        opts = options or ReviewOptions()
+        caller = counted_call or (
+            lambda sys, pr: call_llm(
+                cfg=review_cfg,
+                prompt=pr,
+                system_prompt=sys,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+        )
         verdicts: List[LLMReviewVerdict] = []
+        self._last_unreviewed = []
         for i, batch in enumerate(batches, start=1):
-            part = f"Diff part {i}/{len(batches)} (other parts are reviewed separately; judge only this part):\n" if len(batches) > 1 else ""
+            if len(batches) > 1:
+                part = f"Diff part {i}/{len(batches)} (other parts are reviewed separately; judge only this part):\n"
+                if opts.part_manifest and partition is not None:
+                    manifest = part_manifest(partition, i)
+                    if manifest:
+                        part += f"{manifest}\n"
+            else:
+                part = ""
             prompt_text = f"{header}\n{part}Git Diff:\n```\n{batch}\n```\n"
             verdict = None
+            raw_response = None
             for attempt in range(2):  # one retry when the answer ignores the SCORE/FINDINGS format
-                raw_response = call_llm(
-                    cfg=review_cfg,
-                    prompt=prompt_text if attempt == 0 else prompt_text + FORMAT_REMINDER,
-                    system_prompt=system_prompt,
-                    temperature=0.1,
-                    max_tokens=2000,  # room for one line per finding
+                raw_response = caller(
+                    system_prompt,
+                    prompt_text if attempt == 0 else prompt_text + FORMAT_REMINDER,
                 )
                 verdict = self._parse_llm_response(raw_response, model_name=model_name, focus=focus)
                 if verdict is not None:
+                    self._last_unreviewed.extend(getattr(verdict, "_unreviewed_topics", []))
                     break
             if verdict is None:
                 self.last_failure = f"part {i}/{len(batches)} answer was not a review: {(raw_response or '').strip()[:160]}"
@@ -466,16 +545,43 @@ Findings so far in this session (id, round, status, your earlier wording):
         evidence: Optional[List[str]] = None,
         ledger: Optional[List[dict]] = None,
         known_rules: Optional[List[dict]] = None,
+        options: Optional[ReviewOptions] = None,
     ) -> Optional[LLMReviewVerdict]:
         if not self.config or not self.config.llm:
             return None
         self._task_text = prompt  # what a quoted requirement is checked against
+        opts = options if options is not None else ReviewOptions()
 
         model_name = self.config.llm.model
         domain_str = domain.value if isinstance(domain, DomainType) else str(domain)
 
+        # 1. Partition diff
+        raw_diff = diff_summary.raw_diff if diff_summary else ""
+        partition = partition_diff(
+            raw_diff,
+            batch_chars=REVIEW_BATCH_CHARS,
+            max_batches=REVIEW_MAX_BATCHES,
+        )
+        batches = partition.parts
+
+        # 2. Header and evidence additions
+        evidence_list = list(evidence or [])
+        if opts.test_evidence:
+            evidence_list.extend(test_evidence_lines(raw_diff))
+
+        surface: Optional[SurfaceReport] = None
+        threat_active = False
+        if opts.threat_frame == "auto":
+            surface = security_surface(raw_diff)
+            if surface.sensitive:
+                threat_active = True
+                evidence_list.append(f"Security-sensitive surface detected: {', '.join(surface.reasons)}")
+
         focus_instruction = self._build_focus_instruction(focus)
         system_prompt = self._build_system_prompt(model_name, focus_instruction)
+        if opts.test_checklist:
+            system_prompt = f"{system_prompt}\n\n{TEST_QUALITY_CHECKLIST}"
+
         header = self._build_review_header(
             prompt=prompt,
             domain_str=domain_str,
@@ -485,21 +591,177 @@ Findings so far in this session (id, round, status, your earlier wording):
             violations=violations,
             invariant_result=invariant_result,
             contracts=contracts,
-            evidence=evidence,
+            evidence=evidence_list,
             ledger=ledger,
             known_rules=known_rules,
         )
+        if threat_active:
+            header = f"{header}\n{THREAT_FRAME_INSTRUCTIONS}\n"
 
-        # No time limit on a review: it ends when the LLM answers or its provider returns an error.
-        # llm.timeout is only for `guard config test` pings.
         review_cfg = self.config.llm.model_copy(update={"timeout": None})
 
-        # A large diff is reviewed in parts instead of being truncated, so no change goes unreviewed.
-        batches = self._prepare_diff_batches(diff_summary)
-        verdicts = self._review_diff_batches(review_cfg, batches, header, system_prompt, model_name, focus)
-        if verdicts is None:
-            return None
-        return self._merge_verdicts(verdicts)
+        # 3. Thread-safe call counter setup
+        counter_lock = threading.Lock()
+        calls_count = 0
+        chars_count = 0
+
+        def counted_call(sys_text: str, pr_text: str) -> str:
+            nonlocal calls_count, chars_count
+            with counter_lock:
+                calls_count += 1
+                chars_count += len(sys_text or "") + len(pr_text or "")
+            return call_llm(
+                cfg=review_cfg,
+                prompt=pr_text,
+                system_prompt=sys_text,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+
+        # 4. Stage 1: Ensemble or Single Reviewer
+        panel_note: Optional[str] = None
+        validation_note: Optional[str] = None
+        unreviewed_topics: List[str] = []
+        merged_verdict: Optional[LLMReviewVerdict] = None
+
+        if opts.reviewers > 1:
+            worst_case_panel = 2 * opts.reviewers * len(batches)
+            remaining_budget = opts.max_llm_calls - calls_count
+            if worst_case_panel > remaining_budget:
+                panel_note = "Reviewer panel unavailable (budget exceeded); one reviewer ran."
+            else:
+                extra_dict = {}
+                if opts.test_checklist:
+                    extra_dict["tests"] = TEST_QUALITY_CHECKLIST
+                if threat_active:
+                    extra_dict["adversary"] = THREAT_FRAME_INSTRUCTIONS
+                try:
+                    panel_lenses = build_lenses(extra=extra_dict)[:opts.reviewers]
+                    ensemble_res = run_ensemble(
+                        lenses=panel_lenses,
+                        call=counted_call,
+                        header=header,
+                        parts=batches,
+                        parse=lambda t: parse_findings(t, self._task_text),
+                        max_calls=remaining_budget,
+                        format_reminder=FORMAT_REMINDER,
+                        system_prompt=system_prompt,
+                        stage_timeout_s=float(opts.stage_timeout_s),
+                    )
+                except Exception as e:
+                    ensemble_res = None
+                    panel_note = f"Reviewer panel unavailable ({type(e).__name__}); one reviewer ran."
+                if ensemble_res is None:
+                    if not panel_note:
+                        panel_note = "Reviewer panel unavailable (insufficient usable lenses); one reviewer ran."
+                else:
+                    panel_findings = ensemble_res.findings
+                    is_rejected = any(f.blocking for f in panel_findings)
+                    panel_score = 6.0 if is_rejected else 8.5
+                    remed = [f"[{f.id}] {f.location}: {f.description}" for f in panel_findings if f.blocking]
+                    merged_verdict = LLMReviewVerdict(
+                        verdict=ReviewVerdict.REVISE if is_rejected else ReviewVerdict.APPROVED,
+                        score=panel_score,
+                        summary=f"Reviewer panel ({ensemble_res.usable} lenses) evaluated {len(batches)} diff parts.",
+                        reviewer_model=f"Panel ({len(panel_lenses)} lenses)",
+                        focus_area=focus,
+                        technical_audit=[f"[{f.id}] {f.location}: {f.description}" for f in panel_findings],
+                        ergonomics_ux=[],
+                        remediation_steps=remed,
+                        findings=panel_findings,
+                        proposed_invariants=[],
+                        review_mode="llm_deep",
+                    )
+
+        if merged_verdict is None:
+            verdicts = self._review_diff_batches(
+                review_cfg=review_cfg,
+                batches=batches,
+                header=header,
+                system_prompt=system_prompt,
+                model_name=model_name,
+                focus=focus,
+                options=opts,
+                counted_call=counted_call,
+                partition=partition,
+            )
+            if verdicts is None:
+                self._last_llm_calls = calls_count
+                self._last_llm_chars = chars_count
+                return None
+            unreviewed_topics.extend(getattr(self, "_last_unreviewed", []))
+            merged_verdict = self._merge_verdicts(verdicts)
+
+        # 5. Stage 2: Finding Validation (opt-in)
+        validation_records: List[dict] = []
+        if (
+            opts.validate_findings
+            and any(f.blocking for f in merged_verdict.findings)
+            and (len(batches) > 1 or partition.cut_parts > 0)
+        ):
+            remaining_for_val = opts.max_llm_calls - calls_count
+            blocking_count = sum(1 for f in merged_verdict.findings if f.blocking)
+            worst_case_val = min(5, blocking_count)
+            if worst_case_val > remaining_for_val:
+                validation_note = "Finding validation skipped (budget exceeded)."
+            else:
+                def do_validate():
+                    return validate_findings(
+                        findings=merged_verdict.findings,
+                        full_diff=raw_diff,
+                        task_text=prompt,
+                        call=counted_call,
+                        max_validations=min(5, remaining_for_val),
+                    )
+
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    future = pool.submit(do_validate)
+                    try:
+                        updated_findings, val_objs = future.result(timeout=float(opts.stage_timeout_s))
+                        merged_verdict.findings = updated_findings
+                        for vr in val_objs:
+                            validation_records.append({
+                                "finding_id": vr.finding_id,
+                                "verdict": vr.verdict,
+                                "evidence_verified": vr.evidence_verified,
+                                "reason": vr.reason,
+                            })
+                        still_blocking = any(f.blocking for f in updated_findings)
+                        if not still_blocking:
+                            merged_verdict.verdict = ReviewVerdict.APPROVED
+                            merged_verdict.score = max(merged_verdict.score, 8.0)
+                            merged_verdict.remediation_steps = []
+                        else:
+                            merged_verdict.verdict = ReviewVerdict.REVISE
+                            merged_verdict.remediation_steps = [
+                                f"[{f.id}] {f.location}: {f.description}"
+                                for f in updated_findings if f.blocking
+                            ]
+                    except concurrent.futures.TimeoutError:
+                        validation_note = f"Finding validation timed out after {opts.stage_timeout_s}s."
+                    except Exception:
+                        pass
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+
+        # 6. Final verdict fields
+        merged_verdict.validation_log = validation_records
+        merged_verdict.llm_calls = calls_count
+        merged_verdict.llm_chars = chars_count
+        self._last_llm_calls = calls_count
+        self._last_llm_chars = chars_count
+        if opts.coverage_notes:
+            notes = build_coverage_notes(partition, unreviewed_topics)
+            if panel_note:
+                notes.append(panel_note)
+            if validation_note:
+                notes.append(validation_note)
+            merged_verdict.coverage_notes = notes
+        else:
+            merged_verdict.coverage_notes = []
+
+        return merged_verdict
 
     @staticmethod
     def _merge_verdicts(verdicts: List[LLMReviewVerdict]) -> LLMReviewVerdict:
@@ -523,46 +785,10 @@ Findings so far in this session (id, round, status, your earlier wording):
             review_mode="llm_deep",
         )
 
-
     def _prepare_diff_batches(self, diff_summary: Optional[DiffSummary]) -> List[str]:
         """Code diff split on file boundaries into parts of at most REVIEW_BATCH_CHARS characters."""
-        if not diff_summary or not diff_summary.raw_diff:
-            return ["No diff"]
-        # Filter out asset files, binary/data files, and large non-code JSON tables
-        code_chunks = []
-        # File headers start a line; "diff --git " inside a changed line (a test fixture, a doc) is content
-        for c in re.split(r"(?m)^diff --git ", diff_summary.raw_diff):
-            if not c.strip():
-                continue
-            first_line = c.splitlines()[0] if c.splitlines() else ""
-            if any(k in first_line for k in ["assets/", ".lock", "-lock.", ".svg", ".png", ".onnx", "tokenizer.json"]):
-                continue
-            chunk = "diff --git " + c
-            if "\ndeleted file mode" in chunk.split("@@", 1)[0]:
-                # A deleted file's full content adds little to a review (removed-symbol references are
-                # checked separately) and large blocks of removed code can make a model refuse the part
-                head = chunk.split("\n@@", 1)[0]
-                removed = sum(1 for line in chunk.splitlines() if line.startswith("-") and not line.startswith("---"))
-                chunk = f"{head}\n[file deleted: {removed} lines removed; content omitted]\n"
-            # A single oversized file is split too, never cut off; every piece names its file
-            prefix = f"{chunk.splitlines()[0]}\n[continued: next part of this file's diff]\n"
-            code_chunks.append(chunk[:REVIEW_BATCH_CHARS])
-            step = max(1, REVIEW_BATCH_CHARS - len(prefix))  # the prefix counts toward the part limit
-            for k in range(REVIEW_BATCH_CHARS, len(chunk), step):
-                code_chunks.append(prefix + chunk[k:k + step])
-        if not code_chunks:
-            return ["No code diff (only lockfiles/assets changed)"]
-        batches, current = [], ""
-        for chunk in code_chunks:
-            if current and len(current) + len(chunk) > REVIEW_BATCH_CHARS:
-                batches.append(current)
-                current = ""
-            current += chunk
-        batches.append(current)
-        return batches[:REVIEW_MAX_BATCHES] + (
-            [f"[{len(batches) - REVIEW_MAX_BATCHES} more diff parts were NOT reviewed (limit {REVIEW_MAX_BATCHES}); treat them as unreviewed]"]
-            if len(batches) > REVIEW_MAX_BATCHES else []
-        )
+        raw = diff_summary.raw_diff if diff_summary else ""
+        return partition_diff(raw, batch_chars=REVIEW_BATCH_CHARS, max_batches=REVIEW_MAX_BATCHES).parts
 
     def _parse_llm_response(self, text: str, model_name: str = "LLM", focus: str = "all") -> Optional[LLMReviewVerdict]:
         try:
@@ -584,12 +810,15 @@ Findings so far in this session (id, round, status, your earlier wording):
             ergo_items = self._extract_bullet_items(text, "ERGONOMICS")
             remed_items = self._extract_bullet_items(text, "REMEDIATION")
             proposals = _parse_invariant_proposals(text)
+            tm_text, unreviewed_items = parse_threat_sections(text)
+            if tm_text:
+                tech_items.append(f"Threat model: {tm_text}")
             if any(item.lower() == "none" for item in remed_items):
                 remed_items = []
             # What to fix is what blocks; advisory findings are follow-ups, not remediation
             remed_items = [f"[{f.id}] {f.location}: {f.description}" for f in findings if f.blocking]
 
-            return LLMReviewVerdict(
+            v = LLMReviewVerdict(
                 verdict=verdict,
                 score=score,
                 summary=summary,
@@ -602,12 +831,14 @@ Findings so far in this session (id, round, status, your earlier wording):
                 findings=findings,
                 review_mode="llm_deep",
             )
+            v._unreviewed_topics = unreviewed_items  # type: ignore[attr-defined]
+            return v
         except Exception:
             # Parsing boundary: return None so caller falls back to heuristic
             return None
 
     def _extract_bullet_items(self, text: str, section_header: str) -> List[str]:
-        pattern = rf"{section_header}:\s*(.+?)(?=\n[A-Z]+:|$)"
+        pattern = rf"{section_header}:\s*(.+?)(?=\n[ \t]*(?:\*{{1,2}}|#{{1,6}}[ \t]*)?(?:[A-Z]+|(?i:threat[ \t]*model|unreviewed))[ \t]*(?::|\*{{1,2}}:)|$)"
         match = re.search(pattern, text, re.DOTALL)
         if not match:
             return []

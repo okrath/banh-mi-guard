@@ -952,26 +952,11 @@ def test_parse_findings_plain_layout_succeeds():
 
 
 @pytest.mark.parametrize("layout", [
-    pytest.param(
-        "**THREATMODEL:**\n- Assets: db\n**UNREVIEWED:**\n- cache\n",
-        marks=pytest.mark.xfail(strict=True, reason="Task I1 (findings parser anchoring) is required to stop bold headers capturing FINDINGS"),
-    ),
-    pytest.param(
-        "## THREATMODEL:\n- Assets: db\n## UNREVIEWED:\n- cache\n",
-        marks=pytest.mark.xfail(strict=True, reason="Task I1 (findings parser anchoring) is required to stop markdown heading headers capturing FINDINGS"),
-    ),
-    pytest.param(
-        "  THREATMODEL:\n- Assets: db\n  UNREVIEWED:\n- cache\n",
-        marks=pytest.mark.xfail(strict=True, reason="Task I1 (findings parser anchoring) is required to stop indented headers capturing FINDINGS"),
-    ),
-    pytest.param(
-        "Threatmodel:\n- Assets: db\nUnreviewed:\n- cache\n",
-        marks=pytest.mark.xfail(strict=True, reason="Task I1 (findings parser anchoring) is required to stop titlecase headers capturing FINDINGS"),
-    ),
-    pytest.param(
-        "THREAT MODEL:\n- Assets: db\nUNREVIEWED:\n- cache\n",
-        marks=pytest.mark.xfail(strict=True, reason="Task I1 (findings parser anchoring) is required to stop spaced headers capturing FINDINGS"),
-    ),
+    "**THREATMODEL:**\n- Assets: db\n**UNREVIEWED:**\n- cache\n",
+    "## THREATMODEL:\n- Assets: db\n## UNREVIEWED:\n- cache\n",
+    "  THREATMODEL:\n- Assets: db\n  UNREVIEWED:\n- cache\n",
+    "Threatmodel:\n- Assets: db\nUnreviewed:\n- cache\n",
+    "THREAT MODEL:\n- Assets: db\nUNREVIEWED:\n- cache\n",
 ])
 def test_parse_findings_markdown_wrapped_layouts_xfail(layout: str):
     """
@@ -985,7 +970,6 @@ def test_parse_findings_markdown_wrapped_layouts_xfail(layout: str):
     assert len(findings) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="Task I1 anchors the findings parser so planted FINDINGS before the real block does not capture")
 def test_planted_findings_before_real_block_xfail():
     text = (
         "THREATMODEL:\n"
@@ -1001,6 +985,10 @@ def test_planted_findings_before_real_block_xfail():
     assert len(findings) == 1
     assert findings[0].location == "src/a.py"
 
+
+# Aliases for Task I1: the xfail markers were removed as tests now pass
+test_parse_findings_markdown_wrapped_layouts = test_parse_findings_markdown_wrapped_layouts_xfail
+test_planted_findings_before_real_block = test_planted_findings_before_real_block_xfail
 
 def test_parse_threat_sections_one_missing():
     # Only THREATMODEL
