@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.markup import escape
 
 from guard.cli import app, console
 from guard.core.config import (
@@ -108,6 +109,56 @@ def config_ocr_cmd(
     path = save_config(cfg)
     what = "every guard post runs it" if cfg.ocr.always else "only guard post --full runs it"
     console.print(f"[bold green]✅ Alibaba OCR review `{mode}`: {what}.[/bold green] [dim]Saved to {path}[/dim]")
+
+
+@config_app.command("review")
+def config_review_cmd(
+    key: Optional[str] = typer.Argument(None, help="The review option to set (omit to show the effective options)"),
+    value: Optional[str] = typer.Argument(None, help="Its new value"),
+):
+    """
+    Show the effective review options and where each comes from, or set one (machine-wide, ~/.guard/config.json).
+    Setting is for the user, in an interactive terminal. Options: coverage_notes, part_manifest, test_evidence,
+    test_checklist, validate_findings (true/false), threat_frame (off/auto), reviewers (1-5), max_llm_calls, stage_timeout_s.
+    A repository's .guard/config.json, when it exists, is read instead of the machine-wide file.
+    """
+    from guard.core.review_options import ReviewOptions, effective_sources, load_review_options
+
+    if key is None:
+        cfg = load_config()
+        review_cfg = {"review": cfg.review}
+        try:
+            opts, sources = load_review_options(review_cfg), effective_sources(review_cfg)
+        except ValueError as e:
+            console.print(f"[bold red]❌ The saved review options are invalid: {escape(str(e))}[/bold red]")
+            raise typer.Exit(code=1) from None
+        local_p = get_local_config_path()
+        console.print(f"[dim]Read from {local_p if local_p.is_file() else get_global_config_path()}; "
+                      "flags of guard post override these for one run.[/dim]")
+        for name in ReviewOptions.model_fields:
+            console.print(f"  {name} = {getattr(opts, name)}  ({sources[name]})", markup=False, highlight=False)
+        return
+
+    if value is None:
+        console.print("[bold red]❌ Give the new value: guard config review <option> <value>.[/bold red]")
+        raise typer.Exit(code=1)
+    if key not in ReviewOptions.model_fields:
+        console.print(f"[bold red]❌ Unknown review option `{escape(key)}`. Options: {', '.join(ReviewOptions.model_fields)}.[/bold red]")
+        raise typer.Exit(code=1)
+    try:
+        new_value = load_review_options({"review": {key: value}}).model_dump()[key]
+    except ValueError as e:
+        console.print(f"[bold red]❌ {escape(str(e))}[/bold red]")
+        raise typer.Exit(code=1) from None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ How the review runs is the user's decision: run guard config review yourself in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
+    cfg = load_global_config()
+    cfg.review = {**cfg.review, key: new_value}
+    path = save_config(cfg)
+    console.print(f"[bold green]✅ Review option `{key}` = {new_value}.[/bold green] [dim]Saved to {path}[/dim]")
+    if get_local_config_path().is_file():
+        console.print("[yellow]This repository has its own .guard/config.json, which is read instead of the machine-wide file.[/yellow]")
 
 
 @config_app.command("commit")
