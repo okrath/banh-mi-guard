@@ -109,13 +109,15 @@ def post_cmd(
     validate: Optional[bool] = typer.Option(None, "--validate/--no-validate", help="Check blocking findings of a multi-part diff against the whole diff before they block"),
     test_checklist: Optional[bool] = typer.Option(None, "--test-checklist/--no-test-checklist", help="Add the test-quality checklist to the review prompt"),
     threat_frame: Optional[str] = typer.Option(None, "--threat-frame", help="Threat-model frame for security-sensitive diffs: off or auto"),
+    max_llm_calls: Optional[int] = typer.Option(None, "--max-llm-calls", min=1, help="Cap on the LLM calls of the extra review stages (panel, validation); default 12"),
 ):
     """
     Run Post-Task Guard: diff audit, build checks, invariant checks & LLM final verification.
     Review options not passed here come from `guard config review` (see it for the effective values).
     """
     # only the flags the user passed: an unset flag must not override the config
-    flags = {"reviewers": reviewers, "validate_findings": validate, "test_checklist": test_checklist, "threat_frame": threat_frame}
+    flags = {"reviewers": reviewers, "validate_findings": validate, "test_checklist": test_checklist, "threat_frame": threat_frame,
+             "max_llm_calls": max_llm_calls}
     review_cli = {k: v for k, v in flags.items() if v is not None}
     passed = execute_post_task(
         repo_path=Path(repo) if repo else None, auto_fix=auto_fix, focus=focus, hook=hook, full=full,
