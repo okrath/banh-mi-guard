@@ -13,7 +13,7 @@ import shutil
 import subprocess
 from enum import Enum
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
 from rich.console import Console
@@ -69,8 +69,9 @@ class GuardConfig(BaseModel):
     # How the agent gets commit messages: "auto" (it writes them) or "ask" (it asks the user). None: not chosen yet
     commit_mode: Optional[Literal["auto", "ask"]] = None
     # The raw "review" object (guard.core.review_options.load_review_options parses and validates it).
-    # An older guard drops it when it re-saves the config (e.g. guard config commit).
-    review: dict = Field(default_factory=dict)
+    # Any JSON value loads, so a wrong one fails `guard post` closed instead of dropping the whole config
+    # (and with it the LLM settings). An older guard drops it when it re-saves the config (e.g. guard config commit).
+    review: Any = Field(default_factory=dict)
 
 
 def get_global_config_path() -> Path:

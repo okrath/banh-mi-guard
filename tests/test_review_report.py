@@ -156,6 +156,28 @@ def test_an_invalid_threat_frame_or_config_value_refuses_the_post_and_names_the_
     assert calls == []
 
 
+@pytest.mark.parametrize("review", [None, "loud", [1]])
+def test_a_review_value_that_is_not_an_object_keeps_the_rest_of_the_config_and_refuses_the_post(
+        tmp_path, monkeypatch, review):
+    repo = edited_repo(tmp_path)
+    calls = fake_reviewer(monkeypatch)
+    (repo / ".guard" / "config.json").write_text(json.dumps({"review": review, "commit_mode": "ask"}), encoding="utf-8")
+
+    assert guard_config.load_config(repo).commit_mode == "ask"  # the config is not dropped (with its LLM settings)
+    result = post(repo)
+    assert result.exit_code == 1 and "must be an object" in result.output and calls == []
+
+
+def test_an_invalid_review_config_never_blocks_a_hook_commit_in_a_repository_without_a_session(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    write_local_config(repo, {"reviewers": 9})
+    calls = fake_reviewer(monkeypatch)
+
+    result = post(repo, "--hook")
+
+    assert result.exit_code == 0 and "no guard session" in result.output and calls == []
+
+
 def test_review_options_line_lists_every_difference_with_cost_and_weakness():
     assert review_options_line(ReviewOptions(), {}) == ""
     opts = ReviewOptions(reviewers=3, validate_findings=True, coverage_notes=False, max_llm_calls=4)

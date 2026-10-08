@@ -940,19 +940,22 @@ def _execute_post_task(
     for msg in ensure_repo_setup(target_repo, create_invariants=not hook):
         console.print(f"[cyan]🔧 guard setup: {msg}[/cyan]")
     config = load_config(target_repo)
-    # defaults < the config's "review" object (local-then-global, as load_config reads it) < the flags passed
+    session_mgr = SessionManager(target_repo)
+
+    proceed, result, session = _post_check_hook_and_session(target_repo, session_mgr, hook)
+    if not proceed:
+        return result
+    # defaults < the config's "review" object (local-then-global, as load_config reads it) < the flags passed.
+    # Resolved only for a session that is reviewed: a hook with nothing to check never fails on it
     try:
+        if not isinstance(config.review, dict):
+            raise ValueError(f'"review" in the guard config must be an object, not {type(config.review).__name__}')
         review_cfg = {"review": config.review}
         review_opts = load_review_options(review_cfg, review_cli)
         review_sources = effective_sources(review_cfg, review_cli)
     except ValueError as e:
         console.print(f"[bold red]❌ Invalid review option: {escape(str(e))}[/bold red]")
         return False
-    session_mgr = SessionManager(target_repo)
-
-    proceed, result, session = _post_check_hook_and_session(target_repo, session_mgr, hook)
-    if not proceed:
-        return result
     pre = session.pre if session else None
 
     diff_scope = _post_diff_and_scope_audit(target_repo, pre)
