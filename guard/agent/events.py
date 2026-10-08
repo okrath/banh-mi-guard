@@ -26,6 +26,7 @@ from guard.agent.bash import (
     content_hash,
     is_git_commit,
     is_read_only,
+    strict_target,
     worktree_fingerprint,
 )
 from guard.core.ocr_engine import GitDiffInspector
@@ -124,6 +125,74 @@ def normalise(event: str, payload: Any, fields: Optional[Dict[str, List[str]]] =
 def _repo(cwd: str) -> Optional[Path]:
     from guard.core.repo_setup import git_root
     return git_root(Path(cwd or ".").resolve())
+
+
+# The dialect strict_target parses a tool's command in; any other tool's command is parsed as unknown
+SHELL_DIALECTS = {"bash": "bash", "powershell": "powershell"}
+
+
+def _same_repo(a: Path, b: Path) -> bool:
+    return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
+
+
+def _commit_repo(ev: AgentEvent, tool: str, cwd_repo: Path) -> Path:
+    """
+    The repository a commit command clearly runs in (`git -C <wt> commit`, `Set-Location <wt>; git commit`),
+    or the cwd repository whenever that is not certain: the git pre-commit hook backstops the rest.
+    """
+    from guard.core.repo_setup import repo_for_path
+    if not ev.command:
+        return cwd_repo
+    target = strict_target(ev.command, str(Path(ev.cwd or ".").resolve()), shell=SHELL_DIALECTS.get(tool))
+    return (repo_for_path(target) if target else None) or cwd_repo
+
+
+def _command_repos(ev: AgentEvent, tool: str, cwd_repo: Path) -> List[Path]:
+    """
+    The cwd repository, then every other repository the command names a directory of (`cd <wt> && ...`).
+    Only measured and claimed, never trusted to allow anything: naming one too many costs time only.
+    """
+    from guard.core.repo_setup import repo_for_path
+    out = [cwd_repo, _commit_repo(ev, tool, cwd_repo)]
+    cwd = Path(ev.cwd or ".").resolve()
+    for tok in _tokenize(ev.command or "")[:64]:
+        word = tok.strip("\"'")
+        # never a UNC or device path (an unreachable host stalls the call), an option, a variable or a bare drive
+        if not word or word.startswith(("\\\\", "//", "-")) or "$" in word or word.endswith(":"):
+            continue
+        p = Path(word) if Path(word).is_absolute() else cwd / word
+        try:
+            if p.is_dir():
+                out.append(repo_for_path(p) or cwd_repo)
+        except OSError:
+            continue
+    unique: List[Path] = []
+    for r in out:
+        if not any(_same_repo(r, u) for u in unique):
+            unique.append(r)
+    return unique
+
+
+def _touched(cwd_repo: Path, ev: AgentEvent) -> List[Path]:
+    """Other repositories this agent session worked in (recorded in the cwd repository's state) that still exist."""
+    raw = session_state(load_state(cwd_repo), session_key(ev)).get("repos") or []
+    return [Path(r) for r in raw if isinstance(r, str) and Path(r).is_dir() and not _same_repo(Path(r), cwd_repo)]
+
+
+def _touch(cwd_repo: Path, ev: AgentEvent, repos: List[Path]) -> None:
+    others = [str(r) for r in repos if not _same_repo(r, cwd_repo)]
+    if others:
+        def add(state):
+            own = session_state(state, session_key(ev))
+            own["repos"] = sorted(set(own.get("repos") or []) | set(others))
+        update_state(cwd_repo, add)
+
+
+def _in_repo(decision: Decision, repo: Path, cwd_repo: Path) -> Decision:
+    """A decision about another repository than the cwd's names the repository it checked."""
+    if decision.reason.startswith("Guard:") and not _same_repo(repo, cwd_repo):
+        decision.reason = f"Guard ({repo}):{decision.reason[len('Guard:'):]}"
+    return decision
 
 
 def _state_path(repo: Path) -> Path:
@@ -444,6 +513,11 @@ PRE_HINT = ('run `guard pre "<the user\'s request>" --scope <files you will chan
 
 
 def decide(ev: AgentEvent) -> Decision:
+    """
+    Each check runs against the repository the event acts in: a commit's target (`git -C <wt> commit`),
+    each edited file's repository, and for shell commands, stop and the prompt notice, the cwd repository
+    plus the other repositories this agent session worked in.
+    """
     repo = _repo(ev.cwd)
     if repo is None:
         return Decision()  # guard protects Git repositories only
@@ -451,21 +525,29 @@ def decide(ev: AgentEvent) -> Decision:
     tool = (ev.tool or "").lower()
     other = _from_another_session(ev, session)  # judged on its own work, not the owner's
 
+    def load(r: Path):
+        """The repository's guard session, and whether this event comes from another agent session than its owner."""
+        s = session if _same_repo(r, repo) else SessionManager(r).load_local_session()
+        return s, _from_another_session(ev, s)
+
     if ev.event == "prompt":
         if ev.prompt:
             update_state(repo, lambda s: session_state(s, session_key(ev)).update(
                 user_prompt=ev.prompt, prompt_at=datetime.now(timezone.utc).isoformat()))
-        if _active_pre(session):
+        if any(_active_pre(s) for s in [session] + [load(r)[0] for r in _touched(repo, ev)]):
             return Decision()
         return Decision(action="notify", reason=f"Guard: before editing files, {PRE_HINT}.")
 
     if ev.event == "before-commit" or (ev.event == "before-edit" and ev.command is not None
                                        and is_git_commit(ev.command, repo)):
-        if other:
-            return Decision(action="block", reason=(
-                f"Guard: {_held_reason(session)}; its approval is not yours to commit. Use `git worktree add` "
-                "for parallel work, or wait until it is committed."))
-        return _commit_decision(repo, session)  # a harness hook dedicated to commits: always gated
+        target = _commit_repo(ev, tool, repo)
+        _touch(repo, ev, [target])
+        t_session, t_other = load(target)
+        if t_other:
+            return _in_repo(Decision(action="block", reason=(
+                f"Guard: {_held_reason(t_session)}; its approval is not yours to commit. Use `git worktree add` "
+                "for parallel work, or wait until it is committed.")), target, repo)
+        return _in_repo(_commit_decision(target, t_session), target, repo)  # a harness hook dedicated to commits: always gated
 
     if ev.event == "before-edit":
         if tool in READ_TOOLS:
@@ -473,30 +555,69 @@ def decide(ev: AgentEvent) -> Decision:
         shell = tool in SHELL_TOOLS or (ev.command is not None and not ev.file_paths)
         unclassified = bool(tool) and tool not in EDIT_TOOLS and not shell and not ev.file_paths
         if shell and ev.command and ev.agent_session and GUARD_PRE.search(ev.command):
-            # the guard pre this command starts belongs to this agent session (its owner)
-            s_key = session_key(ev)
-            if s_key:
-                update_state(repo, lambda s: _claim(s, s_key, ev.agent))
+            # the guard pre this command starts belongs to this agent session (its owner), in whichever
+            # repository it runs; the user's prompt goes with the claim, for that pre to record
+            s_key = session_key(ev) or ""
+            own = session_state(load_state(repo), s_key)
+            prompt = {k: own[k] for k in ("user_prompt", "prompt_at") if own.get(k)}
+            for r in _command_repos(ev, tool, repo):
+                def claim(state, r=r):
+                    _claim(state, s_key, ev.agent)
+                    if not _same_repo(r, repo):
+                        session_state(state, s_key).update(prompt)
+                update_state(r, claim)
         if (shell and ev.command and not is_read_only(ev.command)) or unclassified:
             # An unknown command, or a tool guard cannot classify that names no file: it runs, and
-            # what it changed is measured afterwards (the after-tool event)
-            fingerprint = worktree_fingerprint(repo)
-            session_json = repo / ".guard" / "session.json"
-            fingerprint[".guard/session.json"] = content_hash(session_json) if session_json.is_file() else ""
-            if ev.command:
-                fingerprint["__command__"] = ev.command
-            update_state(repo, lambda s: session_state(s, session_key(ev)).setdefault("bash", {}).__setitem__(
-                ev.call_id or "last", fingerprint))
+            # what it changed is measured afterwards (the after-tool event), in the cwd repository and in every
+            # other repository it names that guard already works in (a `.guard` folder: nothing new is written elsewhere)
+            named = _command_repos(ev, tool, repo)[1:] if shell and ev.command else []
+            repos = [repo] + [r for r in named if (r / ".guard").is_dir()]
+            for r in repos:
+                fingerprint = worktree_fingerprint(r)
+                session_json = r / ".guard" / "session.json"
+                fingerprint[".guard/session.json"] = content_hash(session_json) if session_json.is_file() else ""
+                if ev.command:
+                    fingerprint["__command__"] = ev.command
+                update_state(r, lambda s, f=fingerprint: session_state(s, session_key(ev)).setdefault("bash", {}).__setitem__(
+                    ev.call_id or "last", f))
+            others = [str(r) for r in repos[1:]]
+            if others:
+                _touch(repo, ev, repos)
+                update_state(repo, lambda s: session_state(s, session_key(ev)).setdefault("bash_repos", {}).__setitem__(
+                    ev.call_id or "last", others))
             return Decision()
         if shell:
             return Decision()  # read-only command
-        return _edit_decision(repo, session, ev, other)
+        from guard.core.repo_setup import group_by_repo
+        groups = group_by_repo(ev.file_paths, base=Path(ev.cwd or ".").resolve())
+        _touch(repo, ev, [r for r in groups if r is not None])
+        for r, paths in groups.items():
+            if r is None:
+                continue  # outside every repository: not guarded, as before
+            r_session, r_other = load(r)
+            decision = _edit_decision(r, r_session, ev.model_copy(update={"file_paths": paths}), r_other)
+            if decision.action == "block":
+                return _in_repo(decision, r, repo)
+        return Decision()
 
     if ev.event == "after-bash":
-        return _after_bash(repo, session, ev, other)
+        extra = update_state(repo, lambda s: (session_state(s, session_key(ev)).get("bash_repos") or {}).pop(
+            ev.call_id or "last", None)) or []
+        decisions = [_after_bash(repo, session, ev, other)]
+        for r in (Path(x) for x in extra if isinstance(x, str) and Path(x).is_dir()):
+            r_session, r_other = load(r)
+            decisions.append(_in_repo(_after_bash(r, r_session, ev, r_other), r, repo))
+        reasons = [d.reason for d in decisions if d.action != "allow"]
+        return Decision(action="notify", reason=" ".join(reasons)) if reasons else Decision()
 
     if ev.event == "stop":
-        return _stop_decision(repo, session, ev, other)
+        deadline = time.monotonic() + POST_WAIT_S  # one wait for every repository, under the harness's hook limit
+        decisions = [_stop_decision(repo, session, ev, other, deadline)]
+        for r in _touched(repo, ev):
+            r_session, r_other = load(r)
+            decisions.append(_in_repo(_stop_decision(r, r_session, ev, r_other, deadline), r, repo))
+        return next((d for d in decisions if d.action == "block"),
+                    next((d for d in decisions if d.action != "allow"), Decision()))
 
     return Decision()
 
@@ -691,20 +812,22 @@ def _post_in_progress(repo: Path) -> bool:
 POST_WAIT_S = 540  # under the harness's 600 s hook limit
 
 
-def _wait_for_post(repo: Path) -> bool:
+def _wait_for_post(repo: Path, deadline: Optional[float] = None) -> bool:
     """
     Wait while a guard post runs (its marker names a live process), then let the caller decide on
     the session as it is then. A marker proves nothing (anyone can write one), so it only buys time:
-    it never allows a stop by itself. True when a post was running.
+    it never allows a stop by itself. True when a post was running. `deadline` (monotonic) is shared
+    when several repositories are checked in one hook call.
     """
-    deadline, waited = time.monotonic() + POST_WAIT_S, False
+    deadline, waited = deadline if deadline is not None else time.monotonic() + POST_WAIT_S, False
     while _post_in_progress(repo) and time.monotonic() < deadline:
         waited = True
         time.sleep(max(0.0, min(2.0, deadline - time.monotonic())))  # never past the limit
     return waited
 
 
-def _stop_decision(repo: Path, session, ev: AgentEvent, other: bool = False) -> Decision:
+def _stop_decision(repo: Path, session, ev: AgentEvent, other: bool = False,
+                   deadline: Optional[float] = None) -> Decision:
     if ev.loop:
         return Decision()  # the harness already blocked once; never trap the agent
     if other:
@@ -719,7 +842,7 @@ def _stop_decision(repo: Path, session, ev: AgentEvent, other: bool = False) -> 
                 f"Guard: you changed {', '.join(own)} while {_held_reason(session)}. Undo it, or move the work "
                 "to a separate `git worktree add`, then tell the user."))
         return Decision()
-    if _wait_for_post(repo):  # the agent waits for a running guard post: decide on its result, once
+    if _wait_for_post(repo, deadline):  # the agent waits for a running guard post: decide on its result, once
         if _post_in_progress(repo):
             # Still running when the hook must answer (a full review takes longer than a hook may wait):
             # keep the agent from stopping, but never send it to start a second post
