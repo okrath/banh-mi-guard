@@ -30,7 +30,7 @@ python -m bench.variants list
 python -m bench.variants run panel3 --max-calls 40 --repeats 1 --out bench/results/panel3.json
 ```
 
-Everything after the variant name goes to `python -m bench run`: `--cases`, `--label {defect,clean,unlabelled,all}`, `--repeats`, `--max-calls`, `--out` and `--dry-run`. `--max-calls` is required for a real run and is the hard cap on LLM calls for the whole run; a run that would exceed it stops. For an option set that has no variant, pass the options yourself with repeatable `--variant key=value` to `python -m bench run`. Without `--out`, the result is written to `bench/results/run_<timestamp>.json`; `bench/results/` is Git-ignored.
+Everything after the variant name goes to `python -m bench run`: `--cases`, `--label {defect,clean,unlabelled,all}`, `--repeats`, `--max-calls`, `--out` and `--dry-run`. `--max-calls` is required for a real run and is the hard cap on LLM calls for the whole run; a run that would exceed it stops. Before each case the runner reserves its worst case (`ReviewOptions.cost_hint` for the case's part count, bounded by the variant's `max_llm_calls` when that is lower) and stops when the remaining budget is smaller; the stage cap itself is not the reservation. For an option set that has no variant, pass the options yourself with repeatable `--variant key=value` to `python -m bench run`. Without `--out`, the result is written to `bench/results/run_<timestamp>.json`; `bench/results/` is Git-ignored.
 
 Always run a baseline (`python -m bench.variants run baseline ...`) with the same `--repeats`, `--label` and cases as the variant you want to judge.
 
@@ -52,7 +52,7 @@ python -m bench compare BASELINE.json VARIANT.json [--opt-in-by-design] [--out P
 
 Treat a comparison with care:
 
-- Compare runs with the same number of repeats. The checks compare totals, so a one-repeat variant against a two-repeat baseline distorts both the cost ratio and the lost and gained defects.
+- Compare runs with the same number of repeats. The checks compare totals and unions over repeats, so when the two results were measured with different repeat counts `compare` reports "inconclusive: repeats differ" and never adopts.
 - A single run of a non-deterministic model is noisy. A difference in one or two cases is not evidence; look at the stability of the baseline before reading a gain into it.
 - The corpus is small and comes from one project, and its labels were written by people and models of the same kind that are being measured. A result describes this corpus, not review quality in general.
 - A variant that reports no gain here is not proven useless, only unmeasured at this noise level.
