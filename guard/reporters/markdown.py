@@ -73,7 +73,26 @@ def commit_instruction(post: PostTaskRecord) -> str:
         "Commit mode not set: ask the user whether you write commit messages (`auto`) or they type them (`ask`), "
         "then run `guard config commit auto` or `guard config commit ask`."
     ))
-    if post.ocr_status.startswith("not run"):
+    hint = post.panel_hint or {}
+    ocr_not_run = post.ocr_status.startswith("not run")
+    if hint.get("command"):
+        # A large or security-sensitive diff approved by one reviewer: one question about a deeper review first
+        panel = f"a review panel of three LLM reviewers (`{hint['command']}`, up to {hint['calls']} LLM calls)"
+        why = f"This change is large or sensitive ({'; '.join(hint.get('reasons') or [])}). "
+        if ocr_not_run:
+            message = (
+                why + "Before committing, ask the user one question: is this gate approval enough, or do they want a deeper "
+                f"review first: {panel}, a full review with Alibaba OCR (`guard post --full`, takes minutes), or both "
+                f"(`{hint['command']} --full`)? Run what they choose and follow its report; if they want neither, this "
+                "approval is enough. Tell them `guard config ocr always` runs OCR on every post, if they want that. "
+                + message
+            )
+        else:
+            message = (
+                why + f"Before committing, ask the user whether they want a deeper review by {panel}. If yes, run it and "
+                "follow its report; if no, this approval is enough. " + message
+            )
+    elif ocr_not_run:
         # Approved by the gate alone: the user decides whether a full Alibaba OCR review comes first
         message = (
             "Before committing, ask the user whether they want a full review with Alibaba OCR first "
