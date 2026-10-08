@@ -4,13 +4,16 @@ effective rules agree with them; unresolvable paths are handled errors, never cr
 """
 
 import pathlib
+import subprocess
 import threading
 
+import pytest
 from test_untracked import exclude_text, make_repo
 from typer.testing import CliRunner
 
 from guard.cli import app, execute_pre_task
-from guard.core.git_exclude import ensure_excluded, remove_excluded
+from guard.core import git_exclude
+from guard.core.git_exclude import ensure_excluded, exclude_file, remove_excluded, write_bytes_atomic
 from guard.core.ocr_engine import GitDiffInspector
 from guard.core.session import SessionManager
 from guard.core.untracked import DECISIONS_FILE, RegistryError, decide, load_decisions, undecided
@@ -114,3 +117,50 @@ def test_an_unresolvable_registry_path_is_a_handled_error(tmp_path, monkeypatch,
     assert "scratch.md" not in exclude_text(repo)
     assert execute_pre_task("Fix src/chat.ts", repo_path=repo) is False
     assert "could not check untracked paths" in capsys.readouterr().out
+
+
+def test_a_worktree_under_a_non_ascii_folder_finds_the_shared_exclude(tmp_path):
+    folder = tmp_path / "tài liệu"  # git prints the main repository's path as UTF-8, whatever the code page
+    folder.mkdir()
+    repo = make_repo(folder)
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", str(wt)], cwd=repo, check=True, capture_output=True)
+    found = exclude_file(wt)
+    assert found is not None and found.resolve() == exclude_file(repo).resolve()  # type: ignore[union-attr]
+
+
+def _held(times: int):
+    """An os.replace that another process blocks `times` times (Windows: the file is open), then works."""
+    real, refusals = git_exclude.os.replace, []
+
+    def replace(src, dst):
+        if len(refusals) < times:
+            refusals.append(dst)
+            raise PermissionError(13, "Access is denied")
+        real(src, dst)
+    return replace, refusals
+
+
+def test_replacing_info_exclude_waits_while_another_process_holds_it(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"old\n")
+    replace, refusals = _held(2)
+    monkeypatch.setattr(git_exclude.os, "replace", replace)
+    monkeypatch.setattr(git_exclude, "WINDOWS", True)
+    monkeypatch.setattr(git_exclude.time, "sleep", lambda s: None)
+    write_bytes_atomic(target, b"new\n")
+    assert target.read_bytes() == b"new\n" and len(refusals) == 2
+    assert not list(tmp_path.glob("*.guard-tmp"))  # no temporary file left behind
+
+
+def test_replacing_info_exclude_gives_up_after_its_attempts(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"old\n")
+    replace, refusals = _held(10**6)
+    monkeypatch.setattr(git_exclude.os, "replace", replace)
+    monkeypatch.setattr(git_exclude, "WINDOWS", True)
+    monkeypatch.setattr(git_exclude.time, "sleep", lambda s: None)
+    with pytest.raises(PermissionError):
+        write_bytes_atomic(target, b"new\n")
+    assert len(refusals) == git_exclude.REPLACE_ATTEMPTS and target.read_bytes() == b"old\n"
+    assert not list(tmp_path.glob("*.guard-tmp"))
