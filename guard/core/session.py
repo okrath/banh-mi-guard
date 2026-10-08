@@ -136,6 +136,9 @@ class PostTaskRecord(BaseModel):
     coverage_notes: List[str] = Field(default_factory=list)  # what the review did not see (not already in the report)
     validation_log: List[Dict] = Field(default_factory=list)  # one entry per finding the validation stage checked
     llm_calls: int = 0  # LLM calls this review made (retries and extra stages included)
+    # An approved, large or security-sensitive diff reviewed by one reviewer: {"reasons", "command", "calls"} of the
+    # review panel the agent offers the user before committing; {} when there is nothing to offer
+    panel_hint: Dict = Field(default_factory=dict)
 
 
 class GuardSession(BaseModel):

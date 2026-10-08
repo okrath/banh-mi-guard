@@ -514,6 +514,17 @@ def _is_valid_llm_case_row(row: dict) -> bool:
     return True
 
 
+def _repeat_count(s: dict) -> Optional[int]:
+    """Repeats a result was measured with: the summary's own count, else the largest per-case count, else unknown."""
+    top = _to_int(s.get("repeats"))
+    if top > 0:
+        return top
+    rows = s.get("per_case_rows", s.get("rows", []))
+    per_row = [_to_int(r.get("repeats")) for r in rows if isinstance(r, dict)]
+    per_row = [n for n in per_row if n > 0]
+    return max(per_row) if per_row else None
+
+
 def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) -> dict:
     """
     Judge variant against baseline using the decision rule in plan.md.
@@ -522,7 +533,13 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     Only considers cases that are labelled AND ran with an LLM in BOTH runs.
     Keyed by (case_id, defect_id).
     With opt_in_by_design (the panel), adopt is ALWAYS False and recommendation is reported.
+    The checks compare totals and unions over repeats, so results measured with different repeat counts
+    are not comparable: the verdict is then "inconclusive" and adopt is False.
     """
+    b_repeats = _repeat_count(baseline)
+    v_repeats = _repeat_count(variant)
+    # Doubt is inconclusive: differing counts, or a count known for only one side (older result files).
+    inconclusive = (b_repeats is None) != (v_repeats is None) or b_repeats != v_repeats
     baseline_calls = _to_int(baseline.get("calls", 0))
     variant_calls = _to_int(variant.get("calls", 0))
     call_ratio = variant_calls / max(baseline_calls, 1)
@@ -604,7 +621,10 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     else:
         recall_gained_per_extra_call = 0.0
 
-    if opt_in_by_design:
+    if inconclusive:
+        adopt = False
+        recommendation = f"inconclusive: repeats differ or unknown (baseline {b_repeats}, variant {v_repeats}); rerun with the same --repeats"
+    elif opt_in_by_design:
         # The panel is opt-in by design: adopt must ALWAYS be False
         adopt = False
         if clause_a and clause_b and clause_c:
@@ -634,6 +654,7 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
         "clause_b": clause_b,
         "clause_c": clause_c,
         "clause_d": clause_d,
+        "inconclusive": inconclusive,
     }
     if opt_in_by_design or extra_calls > 0:
         result["recall_gained_per_extra_call"] = recall_gained_per_extra_call

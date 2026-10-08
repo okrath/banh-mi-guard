@@ -53,7 +53,7 @@ guard post
 git commit -m "feat: add responsive navigation drawer"
 ```
 
-To run deep repository inspection with Alibaba OCR, use `guard post --full`.
+To run deep repository inspection with Alibaba OCR, use `guard post --full`. For a large or security-sensitive change, the post report asks you (through your agent) whether you want a deeper review by a panel of three reviewers, a full OCR review, or both.
 
 ---
 

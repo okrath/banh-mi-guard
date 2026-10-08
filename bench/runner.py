@@ -38,27 +38,22 @@ class ReviewResult:
 
 def estimate_case_worst_calls(diff: str, variant: Optional[dict] = None, repeats: int = 1) -> int:
     """
-    Worst-case LLM call bound for one case using the real partitioner:
-    guard.core.diff_partition.partition_diff(diff).parts (including trailing sentinel),
-    times 2 for retries, times reviewers (1..5), plus 5 when validation is on.
+    Worst-case LLM call bound for one case, reserved against the budget before it runs.
+
+    Uses the real partitioner (guard.core.diff_partition.partition_diff) for the part count and
+    ReviewOptions(**variant).cost_hint(parts) for the per-run bound (2 x parts x reviewers, plus 5 when
+    validation is on). When the variant sets a stage cap (max_llm_calls) lower than that bound, the cap wins.
+    The cap is never used as the reservation itself: a single-part case is reserved what it can spend.
     """
     from guard.core.diff_partition import partition_diff
+    from guard.core.review_options import ReviewOptions
 
-    partition = partition_diff(diff or "")
-    num_parts = max(1, len(partition.parts))
-    reviewers = 1
-    validate_on = False
-    if isinstance(variant, dict):
-        rev = variant.get("reviewers")
-        if rev is not None and not isinstance(rev, bool):
-            try:
-                r_int = int(rev)
-                reviewers = max(1, min(5, r_int))
-            except (ValueError, TypeError):
-                reviewers = 1
-        validate_on = bool(variant.get("validate_findings", False))
-
-    calls_per_run = 2 * num_parts * reviewers + (5 if validate_on else 0)
+    num_parts = max(1, len(partition_diff(diff or "").parts))
+    # Keys starting with "_" are runner-internal (e.g. _budget_remaining), not ReviewOptions fields.
+    options = ReviewOptions(**{k: v for k, v in (variant or {}).items() if not k.startswith("_")})
+    calls_per_run = options.cost_hint(num_parts)
+    if variant and "max_llm_calls" in variant:
+        calls_per_run = min(calls_per_run, options.max_llm_calls)
     return calls_per_run * max(1, repeats)
 
 
@@ -343,8 +338,8 @@ def run_corpus(
     """
     Run an entire corpus of cases within a hard LLM call budget.
 
-    Checks worst-case call bound before each case; skips remaining cases if budget would be exceeded.
-    Stops immediately if BudgetExceeded is raised.
+    Checks the worst-case call bound before each case and skips a case that would not fit, then goes on with
+    the next one. Stops immediately if BudgetExceeded is raised.
     """
     if repeats < 1:
         raise ValueError(f"repeats must be at least 1, got {repeats}")
@@ -377,21 +372,20 @@ def run_corpus(
         worst_case = estimate_case_worst_calls(case.get("diff", ""), variant=variant, repeats=repeats)
 
         if remaining_budget < worst_case:
-            # Hard budget cap: skip this case and all remaining cases
-            for skipped_case in filtered_cases[i:]:
-                for _ in range(repeats):
-                    out = case_outcome(
-                        skipped_case,
-                        verdict="skipped (budget)",
-                        findings=[],
-                        calls=0,
-                        chars_sent=0,
-                        seconds=0.0,
-                    )
-                    out["skipped"] = True
-                    out["skip_reason"] = "budget"
-                    all_outcomes.append(out)
-            break
+            # This case could exceed the hard cap: skip it alone; a smaller case after it may still fit
+            for _ in range(repeats):
+                out = case_outcome(
+                    case,
+                    verdict="skipped (budget)",
+                    findings=[],
+                    calls=0,
+                    chars_sent=0,
+                    seconds=0.0,
+                )
+                out["skipped"] = True
+                out["skip_reason"] = "budget"
+                all_outcomes.append(out)
+            continue
 
         # Run repeats for this case with budget guard
         budget_blown = False

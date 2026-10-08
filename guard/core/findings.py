@@ -69,7 +69,7 @@ def parse_findings(text: str, task_text: str) -> Optional[List[Finding]]:
     (too few fields, an unknown severity or kind): a finding guard cannot read is never dropped or
     demoted into an approval.
     """
-    findings_matches = list(re.finditer(r"(?m)^FINDINGS\s*:", text))
+    findings_matches = list(re.finditer(r"(?m)^(?:\*{1,2}|#{1,6}[ \t]*)?FINDINGS(?:\s*:[ \t]*(?:\*{1,2})?|\*{1,2}[ \t]*:)", text))
     if len(findings_matches) != 1:
         return None
     start_pos = findings_matches[0].end()

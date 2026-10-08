@@ -140,6 +140,8 @@ class LLMReviewerEngine:
 
         # 2. Deep LLM Review using the configured LLM (OpenAI, Anthropic, Ollama, DeepSeek, etc.)
         llm_error: Optional[str] = None
+        self._last_llm_calls = 0  # per review: an error path never reports the previous review's counts
+        self._last_llm_chars = 0
         if use_llm and self.config and self.config.llm and self.config.llm.ready:
             try:
                 llm_verdict = self._evaluate_with_llm(
@@ -605,11 +607,17 @@ Verified evidence (computed by guard over the whole repository, valid for every 
         calls_count = 0
         chars_count = 0
 
+        validation_cancelled = threading.Event()
+
         def counted_call(sys_text: str, pr_text: str) -> str:
             nonlocal calls_count, chars_count
             with counter_lock:
+                if validation_cancelled.is_set():
+                    raise RuntimeError("finding validation was cancelled after its stage timed out")
                 calls_count += 1
                 chars_count += len(sys_text or "") + len(pr_text or "")
+                self._last_llm_calls = calls_count
+                self._last_llm_chars = chars_count
             return call_llm(
                 cfg=review_cfg,
                 prompt=pr_text,
@@ -739,9 +747,12 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                                 for f in updated_findings if f.blocking
                             ]
                     except concurrent.futures.TimeoutError:
+                        with counter_lock:
+                            validation_cancelled.set()  # late calls from the abandoned thread are refused
                         validation_note = f"Finding validation timed out after {opts.stage_timeout_s}s."
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Fail safe: the findings stay as the reviewers left them, and the crash is visible
+                        validation_note = f"Finding validation failed ({type(e).__name__}); findings unchanged."
                 finally:
                     pool.shutdown(wait=False, cancel_futures=True)
 
@@ -838,7 +849,13 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             return None
 
     def _extract_bullet_items(self, text: str, section_header: str) -> List[str]:
-        pattern = rf"{section_header}:\s*(.+?)(?=\n[ \t]*(?:\*{{1,2}}|#{{1,6}}[ \t]*)?(?:[A-Z]+|(?i:threat[ \t]*model|unreviewed))[ \t]*(?::|\*{{1,2}}:)|$)"
+        # A section ends at an unindented `WORD:` header, or at a known section name however it is indented or
+        # wrapped in markdown; an indented `SQL:` inside a bullet list is content
+        known = r"(?i:threat[ \t]*model|unreviewed|technical|ergonomics|remediation|invariants|findings|summary|score|verdict)"
+        pattern = (
+            rf"{section_header}:\s*(.+?)(?=\n(?:(?:\*{{1,2}}|#{{1,6}}[ \t]*)?[A-Z]+[ \t]*(?::|\*{{1,2}}:)"
+            rf"|[ \t]*(?:\*{{1,2}}|#{{1,6}}[ \t]*)?{known}[ \t]*(?::|\*{{1,2}}:))|$)"
+        )
         match = re.search(pattern, text, re.DOTALL)
         if not match:
             return []
