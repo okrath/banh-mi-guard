@@ -540,7 +540,7 @@ def strict_target(
             if idx >= len(seg):
                 return None
             sub_tok, sub_is_q = seg[idx]
-            if sub_is_q or not sub_tok.isascii() or sub_tok not in _GIT_ALLOWED_SUBCOMMANDS:
+            if sub_is_q or sub_tok not in _GIT_ALLOWED_SUBCOMMANDS:
                 return None
             idx += 1
 
@@ -551,8 +551,8 @@ def strict_target(
                     return None
                 if (
                     arg_val == "-C"
-                    or arg_val in ("-x", "--exec", "--extcmd", "--ext-diff", "--textconv", "-o")
-                    or arg_val.startswith(("--git-dir", "--work-tree", "--exec-path", "--exec", "--extcmd", "--output", "--ext-diff", "--textconv"))
+                    or arg_val in ("-x", "-o")
+                    or arg_val.startswith(("--git-dir", "--work-tree", "--exec", "--extcmd", "--output", "--ext-diff", "--textconv"))
                 ):
                     return None
 
