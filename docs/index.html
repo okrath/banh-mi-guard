@@ -453,7 +453,7 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
           <tr>
             <td><code>guard post</code></td>
             <td>Run Post-Task Guard: diff audit, rules, build, invariants, LLM final gate</td>
-            <td><code>--focus &lt;area&gt;</code>, <code>--hook</code>, <code>--full</code></td>
+            <td><code>--focus &lt;area&gt;</code>, <code>--hook</code>, <code>--full</code>, <code>--reviewers</code>, <code>--validate</code>, <code>--test-checklist</code>, <code>--threat-frame</code></td>
           </tr>
           <tr>
             <td><code>guard run "&lt;prompt&gt;" -- &lt;cmd&gt;</code></td>
@@ -519,6 +519,11 @@ guard uninstall [--workspace path/to/workspace]</code></pre>
             <td><code>guard config commit</code></td>
             <td>Choose who writes commit messages: the agent (<code>auto</code>) or you (<code>ask</code>)</td>
             <td><code>auto</code> | <code>ask</code></td>
+          </tr>
+          <tr>
+            <td><code>guard config review</code></td>
+            <td>Show the effective review options and where each comes from, or set one (interactive terminal only); the extra review stages are opt-in</td>
+            <td><code>&lt;option&gt; &lt;value&gt;</code></td>
           </tr>
           <tr>
             <td><code>guard hook refresh</code></td>
