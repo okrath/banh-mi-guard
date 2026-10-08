@@ -39,7 +39,7 @@ from guard.core.findings import (
     _resolved_script,
     parse_findings,
 )  # noqa: F401
-from guard.core.invariant_eval import DomainType, InvariantResult
+from guard.core.invariant_eval import HINT, DomainType, InvariantResult
 from guard.core.llm_client import call_llm
 from guard.core.ocr_engine import DiffSummary, RuleViolation
 from guard.core.review_checklists import TEST_QUALITY_CHECKLIST
@@ -178,6 +178,15 @@ class LLMReviewerEngine:
                     max_batches=REVIEW_MAX_BATCHES,
                 )
                 heuristic_verdict.coverage_notes = build_coverage_notes(partition, [])
+        # A keyword hint on a template invariant is the LLM's to judge; with no LLM verdict it stays a blocker
+        hints = [c for c in (invariant_result.checks if invariant_result else []) if c.notes.startswith(HINT)]
+        if hints and heuristic_verdict.verdict == ReviewVerdict.APPROVED:
+            heuristic_verdict.verdict = ReviewVerdict.REVISE
+            heuristic_verdict.summary += " No LLM judged the invariant hints, so they decide: " + "; ".join(
+                f"[{c.id}] {c.notes[len(HINT):]}" for c in hints) + "."
+            heuristic_verdict.remediation_steps.extend(
+                f"Invariant [{c.id}] {c.description}: {c.notes[len(HINT):]}. Restore it, or run guard post with an LLM "
+                "configured so the hint is judged from the diff." for c in hints)
         return heuristic_verdict
 
     @staticmethod

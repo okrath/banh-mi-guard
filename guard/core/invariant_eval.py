@@ -54,6 +54,24 @@ class InvariantResult(BaseModel):
     unverified_count: int = 0
 
 
+# A keyword match on a template invariant: a lead for the LLM gate, not a verdict
+HINT = "Keyword hint, not a check (judge it from the diff): "
+
+
+def _removed_lines(git_diff: str) -> List[str]:
+    """Lines the diff removes from files that still exist: a deleted file's lines are not a removed handler or state."""
+    out: List[str] = []
+    deleted = False
+    for line in git_diff.splitlines():
+        if line.startswith("diff --git "):
+            deleted = False
+        elif line.startswith("deleted file mode") or line.startswith("+++ /dev/null"):
+            deleted = True
+        elif line.startswith("-") and not line.startswith("---") and not deleted:
+            out.append(line[1:].strip())
+    return out
+
+
 def evaluate_invariants(
     invariants: List[Dict[str, object]],
     git_diff: str,
@@ -64,13 +82,15 @@ def evaluate_invariants(
     Evaluate invariants locked in pre-task.
     - Invariants with `checks` (project-defined) run deterministic regex checks on current files.
     - Generic template invariants only get diff keyword heuristics; when no heuristic applies
-      they are reported as UNVERIFIED instead of being silently marked as maintained.
+      they are reported as UNVERIFIED instead of being silently marked as maintained. A keyword match is
+      not a check either (it reads one language's syntax and guesses): it is reported as UNVERIFIED with
+      a hint the LLM gate judges from the diff, never as a failed invariant that blocks the gate by itself.
     """
     from guard.core.project_invariants import STATUS_FAILED, STATUS_PASSED, STATUS_UNVERIFIED, evaluate_checks
 
     start = time.perf_counter()
     checks: List[InvariantCheck] = []
-    removed_lines = [line[1:].strip() for line in git_diff.splitlines() if line.startswith("-") and not line.startswith("---")]
+    removed_lines = _removed_lines(git_diff)
     added_lines = [line[1:] for line in git_diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
     for inv in invariants:
@@ -89,19 +109,19 @@ def evaluate_invariants(
                 status, note = STATUS_PASSED, "No keyboard/escape handler removed in diff"
                 # Key-handling signals only; identifiers such as escapeHtml / escapedText are not handlers
                 if any(KEY_HANDLER_REGEX.search(line) for line in removed_lines):
-                    status, note = STATUS_FAILED, "Detected removal of keyboard/escape handler in diff"
+                    status, note = STATUS_UNVERIFIED, HINT + "the diff removes a keyboard/escape handler"
             elif "disabled" in desc_lower:
                 status, note = STATUS_PASSED, "No disabled state removed in diff"
                 if any("disabled" in line.lower() for line in removed_lines):
-                    status, note = STATUS_FAILED, "Detected removal of disabled state in diff"
+                    status, note = STATUS_UNVERIFIED, HINT + "the diff removes a disabled state"
             elif "timeout" in desc_lower:
                 status, note = STATUS_PASSED, "No timeout construct added in diff"
                 if any("timeout" in line.lower() for line in added_lines):
-                    status, note = STATUS_FAILED, "Detected forbidden addition of timeout construct"
+                    status, note = STATUS_UNVERIFIED, HINT + "the diff adds a timeout construct"
             elif "secret" in desc_lower:
                 status, note = STATUS_PASSED, "No hardcoded secret added in diff"
                 if any(re.search(r"\b(api_key|secret|password)\s*[:=]\s*['\"].+['\"]", line.lower()) for line in added_lines):
-                    status, note = STATUS_FAILED, "Detected potential hardcoded secret in diff additions"
+                    status, note = STATUS_UNVERIFIED, HINT + "the diff adds what looks like a hardcoded secret"
 
         checks.append(InvariantCheck(
             id=inv_id,

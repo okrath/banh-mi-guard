@@ -74,8 +74,10 @@ def test_e2e_frontend_regression_flow(tmp_path):
     reloaded = mgr.load_session()
     assert reloaded.post is not None
     assert reloaded.post.muse_verdict == "REVISE"
-    assert reloaded.post.invariant_result.all_passed is False
-    assert any("Escape" in c.description for c in reloaded.post.invariant_result.checks if not c.passed)
+    # No LLM is configured here: the keyword hint on the template invariant decides (an LLM would judge it)
+    assert reloaded.post.review_mode == "heuristic"
+    assert any("Escape" in c.description and c.status == "unverified" and c.notes.startswith("Keyword hint")
+               for c in reloaded.post.invariant_result.checks)
 
 
 def test_e2e_backend_security_and_scope_violation_flow(tmp_path):
