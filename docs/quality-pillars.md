@@ -10,7 +10,7 @@
 | **Project invariant** | A regex check you (or the LLM gate, locally) wrote in `guard.invariants.json` / `.guard/invariants.json`. Evaluated on the current files at pre and post. |
 | **LLM review** | Something the configured LLM is asked to look at in the diff (the default 360° audit, or a `--focus` area). Not a deterministic check. |
 
-When a repository has no project invariants, guard adds a few generic **template invariants** for the detected domain (frontend, backend, fullstack, infra, mobile). Most of them are only heuristics on the diff and are reported as `UNVERIFIED` when no heuristic applies.
+When a repository has no project invariants, guard adds a few generic **template invariants** for the detected domain (frontend, backend, fullstack, infra, mobile). Most of them are only heuristics on the diff and are reported as `UNVERIFIED` when no heuristic applies. A heuristic that matches is not a check either: it reports the invariant as `UNVERIFIED` with a "Keyword hint, not a check" note that the LLM gate judges from the diff, so it never blocks before the LLM is asked; when no LLM review ran (none configured, or it failed), the hint still makes the heuristic verdict `REVISE`. Lines of deleted files do not count as removed handlers or states. Only invariants with `checks` fail and block.
 
 ---
 
@@ -95,7 +95,7 @@ These line rules read added lines only, and skip docs (Markdown and text files, 
 
 | Concern | How | ID |
 | :--- | :--- | :--- |
-| Removed keyboard handlers (`keydown`, `'Escape'`, `keyCode 27`) when a template invariant asks to keep them | Template invariant heuristic | frontend template |
+| Removed keyboard handlers (`keydown`, `'Escape'`, `keyCode 27`) in files that still exist, when a template invariant asks to keep them | Template invariant heuristic (a hint the LLM gate judges; it blocks only when no LLM review ran) | frontend template |
 | Keyboard focus ring removed (`outline: none` / `outline: 0` in CSS or markup), a hint to check for a `:focus-visible` style | Rule | `UX-001` (LOW) |
 | Image without alt text (an `<img>` tag on one line with no `alt`, `[alt]` or `{alt}`, props not spread) | Rule | `UX-002` (MEDIUM) |
 | A long-running Kubernetes workload with no liveness or readiness probe | LLM review | — |

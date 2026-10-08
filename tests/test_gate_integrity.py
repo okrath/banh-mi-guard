@@ -463,7 +463,8 @@ def test_escape_heuristic_ignores_identifiers_named_escape():
     ident = evaluate_invariants(inv, "-function formatInline(escapedText: string) {\n-  return escapeHtml(x);\n", [])
     assert ident.checks[0].status == "passed"
     for removed in ["-  if (e.key === 'Escape') close();", "-  window.addEventListener('keydown', onKey);"]:
-        assert evaluate_invariants(inv, removed, []).checks[0].status == "failed"
+        check = evaluate_invariants(inv, removed, []).checks[0]
+        assert check.status == "unverified" and "keyboard/escape handler" in check.notes  # a hint for the LLM gate
 
 
 def test_removed_symbols_still_referenced_are_reported(tmp_path):
