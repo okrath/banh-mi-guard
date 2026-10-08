@@ -223,7 +223,13 @@ guard config commit ask    # the agent asks you for every commit message
 guard config review
 # Set one review option machine-wide (only the user can run this, in an interactive terminal):
 guard config review <option> <value>   # e.g. reviewers 3, threat_frame auto, validate_findings true
+
+# Choose which tests the build check runs (machine-wide):
+guard config tests full      # every guard post runs the whole test suite (the default)
+guard config tests related   # a pytest build runs only the related tests until the gate would approve
 ```
+
+`guard config tests related` shortens the rounds that fail. It applies only when the build command is `pytest`, and only when every file the task changed is Python code: guard then runs the changed test files and the tracked test files that import a changed module or are named after it. Any other change (a non-Python file, `conftest.py`, `pyproject.toml`, a package `__init__.py`, a deleted file), or no matching test, runs the whole suite as before. When the related tests pass and the gate would approve, guard runs the whole suite before approving, and a failure there rejects the change, so every approval and every commit has a full test run behind it. The build line of the report says "Related tests only (N file(s))" when only related tests ran. The setting is stored as `tests_scope` in `~/.guard/config.json`; a repository's own `.guard/config.json` is read instead when it exists, and an older guard that re-saves the config drops it (the scope returns to `full`).
 
 `guard config ocr` is the user's decision and can only be run by the user in an interactive terminal.
 `guard post` reports the chosen mode in the **Commit** line of an approved report; while no mode is set, the agent is told to ask you which one you want. `guard install` and `guard doctor` list it as "Commit messages".

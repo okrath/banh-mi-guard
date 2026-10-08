@@ -270,6 +270,8 @@ def _markdown_build_check(post: PostTaskRecord) -> list:
     if post.build_check:
         icon = "✅" if post.build_check.passed else "❌"
         md.append(f"  - {icon} Command: `{post.build_check.command}` (Exit Code: {post.build_check.exit_code}, Duration: {post.build_check.duration_s:.1f}s)")
+        if post.build_check.related:
+            md.append(f"  - Related tests only ({len(post.build_check.related)} file(s)); the full suite runs before any approval.")
         if not post.build_check.passed:
             md.append(f"    ```\n    {post.build_check.output[:400]}\n    ```")
     else:
