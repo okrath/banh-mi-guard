@@ -38,27 +38,22 @@ class ReviewResult:
 
 def estimate_case_worst_calls(diff: str, variant: Optional[dict] = None, repeats: int = 1) -> int:
     """
-    Worst-case LLM call bound for one case using the real partitioner:
-    guard.core.diff_partition.partition_diff(diff).parts (including trailing sentinel),
-    times 2 for retries, times reviewers (1..5), plus 5 when validation is on.
+    Worst-case LLM call bound for one case, reserved against the budget before it runs.
+
+    Uses the real partitioner (guard.core.diff_partition.partition_diff) for the part count and
+    ReviewOptions(**variant).cost_hint(parts) for the per-run bound (2 x parts x reviewers, plus 5 when
+    validation is on). When the variant sets a stage cap (max_llm_calls) lower than that bound, the cap wins.
+    The cap is never used as the reservation itself: a single-part case is reserved what it can spend.
     """
     from guard.core.diff_partition import partition_diff
+    from guard.core.review_options import ReviewOptions
 
-    partition = partition_diff(diff or "")
-    num_parts = max(1, len(partition.parts))
-    reviewers = 1
-    validate_on = False
-    if isinstance(variant, dict):
-        rev = variant.get("reviewers")
-        if rev is not None and not isinstance(rev, bool):
-            try:
-                r_int = int(rev)
-                reviewers = max(1, min(5, r_int))
-            except (ValueError, TypeError):
-                reviewers = 1
-        validate_on = bool(variant.get("validate_findings", False))
-
-    calls_per_run = 2 * num_parts * reviewers + (5 if validate_on else 0)
+    num_parts = max(1, len(partition_diff(diff or "").parts))
+    # Keys starting with "_" are runner-internal (e.g. _budget_remaining), not ReviewOptions fields.
+    options = ReviewOptions(**{k: v for k, v in (variant or {}).items() if not k.startswith("_")})
+    calls_per_run = options.cost_hint(num_parts)
+    if variant and "max_llm_calls" in variant:
+        calls_per_run = min(calls_per_run, options.max_llm_calls)
     return calls_per_run * max(1, repeats)
 
 

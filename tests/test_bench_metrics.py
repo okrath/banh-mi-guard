@@ -1170,3 +1170,69 @@ def test_real_reviewer_call_llm_path(monkeypatch: pytest.MonkeyPatch):
     assert call_llm_invoked is True
     assert res.verdict == "APPROVED"
     assert res.calls == 1
+
+
+def test_estimate_reserves_real_worst_case_not_stage_cap():
+    """A single-part case under panel3 with a stage cap of 40 reserves 6 calls, not 40."""
+    variant = {"reviewers": 3, "max_llm_calls": 40}
+    assert estimate_case_worst_calls("diff --git a/x b/x", variant=variant) == 6
+    assert estimate_case_worst_calls("diff --git a/x b/x", variant=variant, repeats=2) == 12
+    # validation adds its 5 calls; a lower stage cap bounds the reservation
+    assert estimate_case_worst_calls("diff --git a/x b/x", variant={"validate_findings": True, "max_llm_calls": 40}) == 7
+    assert estimate_case_worst_calls("diff --git a/x b/x", variant={"reviewers": 3, "max_llm_calls": 4}) == 4
+
+
+def test_run_corpus_panel_stage_cap_does_not_skip_cases_that_fit():
+    cases = [{"id": f"n{i}", "label": "clean", "diff": "diff --git a/x b/x", "defects": []} for i in range(3)]
+
+    def review(case: dict, variant: Any = None) -> ReviewResult:
+        return ReviewResult(verdict="APPROVED", calls=3)
+
+    summary = run_corpus(cases, review, max_calls=12, variant={"reviewers": 3, "max_llm_calls": 40})
+    assert summary["skipped_count"] == 0
+    assert summary["calls"] == 9
+
+
+def _repeat_result(repeats: int, calls: int, caught: list, label: str = "defect") -> dict:
+    return {
+        "repeats": repeats,
+        "calls": calls,
+        "rows": [{"case_id": "c1", "label": label, "verdict": "REVISE", "caught_blocking": caught}],
+    }
+
+
+def test_compare_inconclusive_when_repeats_differ():
+    base = _repeat_result(2, 20, [])
+    var = _repeat_result(1, 10, [("c1", "d1")])
+    res = compare(base, var)
+    assert res["inconclusive"] is True
+    assert res["adopt"] is False
+    assert res["recommendation"].startswith("inconclusive")
+    assert compare(base, var, opt_in_by_design=True)["recommendation"].startswith("inconclusive")
+
+
+def test_compare_same_repeats_still_adopts():
+    res = compare(_repeat_result(2, 20, []), _repeat_result(2, 30, [("c1", "d1")]))
+    assert res["inconclusive"] is False
+    assert res["adopt"] is True
+
+
+def test_compare_inconclusive_when_only_one_side_has_repeats():
+    base = {"calls": 10, "rows": [{"case_id": "c1", "label": "defect", "verdict": "REVISE", "caught_blocking": []}]}
+    var = _repeat_result(1, 10, [("c1", "d1")])
+    assert compare(base, var)["inconclusive"] is True
+    assert compare(var, base)["adopt"] is False
+
+
+def test_compare_repeats_read_from_rows_when_summary_lacks_them():
+    def res(row_repeats: int) -> dict:
+        row = {"case_id": "c1", "label": "defect", "verdict": "REVISE", "caught_blocking": [], "repeats": row_repeats}
+        return {"calls": 10, "rows": [row]}
+
+    assert compare(res(2), res(1))["inconclusive"] is True
+    assert compare(res(2), res(2))["inconclusive"] is False
+
+
+def test_estimate_ignores_runner_internal_keys():
+    variant = {"reviewers": 3, "_budget_remaining": 99}
+    assert estimate_case_worst_calls("diff --git a/x b/x", variant=variant) == 6
