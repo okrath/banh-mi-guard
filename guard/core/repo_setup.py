@@ -87,6 +87,9 @@ def replace_legacy_parts(text: str) -> str:
 
 
 AGENT_DOC_NAMES = ("CLAUDE.md", "AGENT.md", "AGENTS.md", "GEMINI.md")
+# State key: the global agent docs `guard install` wrote (one the user deleted since is not written again)
+AGENT_DOCS_KEY = "agent_docs"
+
 GLOBAL_AGENT_DOCS = (
     Path(".claude") / "CLAUDE.md",
     Path(".codex") / "AGENTS.md",
@@ -606,8 +609,18 @@ def install_global(cwd: Path) -> Tuple[bool, List[str]]:
 
     ok, messages = HookInstaller.install_global_git_hooks()
     docs = global_agent_docs()
+    # A global doc guard wrote once and the user deleted since is the user's choice: it is not written again
+    state = _read_json(_state_file(), {})
+    written = set(state.get(AGENT_DOCS_KEY) or [])
     for doc in docs:
+        if str(doc) in written and not doc.exists():
+            messages.append(f"skipped {doc}: you deleted it after guard wrote it; to add the guard directives again, "
+                            "create the file (it may be empty) and run guard install")
+            continue
         messages.append(add_directive_block(doc))
+        written.add(str(doc))
+    state[AGENT_DOCS_KEY] = sorted(written)
+    _write_json(_state_file(), state)
     if not docs:
         messages.append("WARN no agent config directory found (~/.claude, ~/.codex, ~/.gemini, ~/.config/opencode); "
                         "use `guard install --workspace <dir>` so agents see the guard directives")
@@ -670,6 +683,9 @@ def uninstall_global() -> List[str]:
         msg = remove_directive_block(doc)
         if msg:
             messages.append(msg)
+    state = _read_json(_state_file(), {})
+    if state.pop(AGENT_DOCS_KEY, None) is not None:  # a later install writes every agent's doc again
+        _write_json(_state_file(), state)
     if _registry_file().exists():
         _registry_file().unlink()  # recorded repositories are no longer refreshed
         messages.append("forgot the repositories guard had set up")

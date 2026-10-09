@@ -65,6 +65,31 @@ def test_global_install_writes_hooks_and_agent_docs_of_installed_agents(fake_mac
     assert any("removed" in m for m in msgs) and any("deleted" in m for m in msgs)
 
 
+def test_an_agent_doc_the_user_deleted_is_not_written_again(fake_machine, tmp_path):
+    codex = fake_machine / ".codex" / "AGENTS.md"
+    install_global(tmp_path)
+    assert codex.is_file()
+
+    codex.unlink()  # the user does not want guard's directives for Codex
+    _, msgs = install_global(tmp_path)
+    assert not codex.exists()
+    assert any(m.startswith(f"skipped {codex}") and "create the file" in m for m in msgs)
+    assert DIRECTIVE_START in (fake_machine / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")  # others still kept
+
+    codex.write_text("", encoding="utf-8")  # the user asks for it again
+    install_global(tmp_path)
+    assert DIRECTIVE_START in codex.read_text(encoding="utf-8")
+
+
+def test_uninstall_forgets_which_docs_were_written_so_a_new_install_writes_them_all(fake_machine, tmp_path):
+    codex = fake_machine / ".codex" / "AGENTS.md"
+    install_global(tmp_path)
+    codex.unlink()
+    uninstall_global()
+    install_global(tmp_path)
+    assert DIRECTIVE_START in codex.read_text(encoding="utf-8")
+
+
 def test_global_uninstall_keeps_a_foreign_hooks_path(fake_machine):
     subprocess.run(["git", "config", "--global", "core.hooksPath", "/somewhere/else"], check=True)
     msgs = uninstall_global()
