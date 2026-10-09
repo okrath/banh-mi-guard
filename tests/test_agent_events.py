@@ -5,6 +5,7 @@ outside the scope, when it stops, and when it commits.
 
 import json
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -282,7 +283,7 @@ def test_a_commit_in_an_unclear_repository_says_so_instead_of_asking_for_a_post(
     unclear = f"cd {there} && git commit -q -F - <<'EOF'\nfix chat\nEOF\ngit status --short | wc -l"
     blocked = bash(here, unclear)
     assert blocked.action == "block" and "cannot tell which repository" in blocked.reason
-    suggested = f"git -C {there.as_posix()} commit -F msg.txt"
+    suggested = f"git -C {shlex.quote(there.as_posix())} commit -F msg.txt"  # quoted when the temp path needs it
     assert suggested.replace("msg.txt", "<message file>") in blocked.reason and "guard post" not in blocked.reason
 
     assert bash(here, suggested).action == "allow"  # the suggested form commits the approval
@@ -294,6 +295,28 @@ def test_a_commit_in_an_unclear_repository_says_so_instead_of_asking_for_a_post(
     # a certain target keeps its own verdict even when the command mentions the other repository
     certain = bash(here, f'git commit -m "see {there.as_posix()}"')
     assert certain.action == "block" and "cannot tell" not in certain.reason
+
+
+def test_an_unclear_commit_names_every_repository_and_quotes_paths_with_spaces(tmp_path):
+    here, spaced, other = make_repo(tmp_path / "here"), make_repo(tmp_path / "my repo"), make_repo(tmp_path / "other")
+    unclear = (f"cd '{spaced.as_posix()}' && cd '{other.as_posix()}' && git commit -q -F - <<'EOF'\nm\nEOF\n"
+               "git status --short | wc -l")
+    blocked = bash(here, unclear)
+    assert blocked.action == "block" and "cannot tell" in blocked.reason
+    quoted = f"git -C {shlex.quote(spaced.as_posix())} commit -F <message file>"
+    assert quoted.startswith("git -C '")  # the space makes it quoted
+    assert quoted in blocked.reason and f"git -C {shlex.quote(other.as_posix())} commit -F <message file>" in blocked.reason
+    # the quoted suggestion reads as certain: it gets its own repository's verdict, not "cannot tell" again
+    retried = bash(here, quoted.replace("<message file>", "msg.txt"))
+    assert retried.action == "block" and "cannot tell" not in retried.reason
+
+
+def test_shell_quote_follows_the_tool():
+    from guard.agent.events import _shell_quote
+    assert _shell_quote("C:/a/b", "bash") == "C:/a/b"
+    assert _shell_quote("C:/my repo", "bash") == "'C:/my repo'"
+    assert _shell_quote("C:/it's", "bash") == "'C:/it'\"'\"'s'"
+    assert _shell_quote("C:/it's", "powershell") == "'C:/it''s'"
 
 
 def test_a_dedicated_commit_hook_is_always_gated(tmp_path):
