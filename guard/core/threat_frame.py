@@ -52,6 +52,8 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from guard.core.unified_diff import walk_diff
+
 # Limits for ReDoS and large-diff safety
 MAX_DIFF_LINES = 20_000
 MAX_LINE_CHARS = 2_000
@@ -208,41 +210,6 @@ _REMOVED_SIGNATURE_CHECK_RE = re.compile(
 _REMOVED_ASSERT_CHECK_RE = re.compile(
     r"(?i)\b(?:assert|require|enforce).{0,80}(?:authoriz\w*|authenticat\w*|permission|signature|valid)",
 )
-
-
-def _clean_path(raw_path: str) -> str:
-    """Normalize git diff paths by removing leading prefixes and standardizing slashes."""
-    p = raw_path.strip().strip("\"'")
-    if p.startswith("a/") or p.startswith("b/"):
-        p = p[2:]
-    elif p.startswith("a\\") or p.startswith("b\\"):
-        p = p[2:]
-    return p.replace("\\", "/")
-
-
-def _parse_diff_git_line(line: str) -> tuple[str, str] | None:
-    """Fast non-backtracking parser for `diff --git` headers with mixed quote handling."""
-    if not line.startswith("diff --git "):
-        return None
-    rest = line[11:].strip()
-    if rest.startswith('"'):
-        idx = rest.find('" "')
-        if idx != -1:
-            p1 = rest[1:idx]
-            p2 = rest[idx + 3:].rstrip('"')
-            return _clean_path(p1), _clean_path(p2)
-    elif rest.endswith('"'):
-        idx = rest.rfind(' "')
-        if idx != -1:
-            p1 = rest[:idx].strip()
-            p2 = rest[idx + 2:].rstrip('"')
-            return _clean_path(p1), _clean_path(p2)
-    idx = rest.rfind(" b/")
-    if idx != -1:
-        p1 = rest[:idx].strip()
-        p2 = rest[idx + 1:].strip()
-        return _clean_path(p1), _clean_path(p2)
-    return None
 
 
 def _is_doc_file(path: str) -> bool:
@@ -403,25 +370,17 @@ def security_surface(raw_diff: str) -> SurfaceReport:
     triggered_files: list[str] = []
     seen_paths: set[str] = set()
 
-    current_file = ""
-    current_old_line = 0
-    current_new_line = 0
     scanned_lines = 0
     unscanned_lines_after_cap = 0
     hit_line_limit = False
     in_hunk = False
 
-    for raw_line in raw_diff.splitlines():
-        # Cut line to max chars to defend against ReDoS and large-line attacks
-        line = raw_line[:MAX_LINE_CHARS]
-
+    for d in walk_diff(raw_diff):
+        current_file = d.path
         # Diff header tracking: always process diff --git lines, even after the content cap
-        if line.startswith("diff --git "):
+        if d.kind == "file":
             in_hunk = False
-            parsed = _parse_diff_git_line(line)
-            if parsed:
-                p1, p2 = parsed
-                current_file = p1 if p2 in ("dev/null", "/dev/null") else p2
+            if current_file:
                 _check_path_triggers(current_file, seen_paths, reasons, triggered_files)
             continue
 
@@ -431,59 +390,25 @@ def security_surface(raw_diff: str) -> SurfaceReport:
             unscanned_lines_after_cap += 1
             continue
 
-        # File path headers only occur outside of hunks
-        if not in_hunk:
-            if line.startswith("--- "):
-                p = line[4:].strip()
-                cleaned = _clean_path(p)
-                if cleaned not in ("dev/null", "/dev/null"):
-                    current_file = cleaned
-                    _check_path_triggers(current_file, seen_paths, reasons, triggered_files)
-                continue
-
-            if line.startswith("+++ "):
-                p = line[4:].strip()
-                cleaned = _clean_path(p)
-                if cleaned not in ("dev/null", "/dev/null"):
-                    current_file = cleaned
-                    _check_path_triggers(current_file, seen_paths, reasons, triggered_files)
-                continue
-
-        # Hunk header tracking
-        if line.startswith("@@"):
+        if d.kind == "header":
+            path = d.old_path if d.raw.startswith("--- ") else d.path
+            if path:
+                _check_path_triggers(path, seen_paths, reasons, triggered_files)
+            continue
+        if d.kind == "hunk":
             in_hunk = True
-            m = re.match(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@", line)
-            if m:
-                current_old_line = int(m.group(1))
-                current_new_line = int(m.group(2))
             continue
-
-        # Added lines (within a hunk, even '+++' or '++i' is treated as an added line)
-        if in_hunk and line.startswith("+"):
-            line_no = current_new_line if current_new_line > 0 else 1
-            current_new_line += 1
-            if not _is_doc_file(current_file):
-                content = line[1:].strip()
-                res = _check_content_added(content, current_file or "unknown", line_no)
-                if res:
-                    _add_trigger(reasons, triggered_files, res[0], res[1])
+        # Content within a hunk ('+++', '++i' or a removed '---' SQL comment included); lines are cut to
+        # MAX_LINE_CHARS to defend against ReDoS and large-line attacks
+        if not in_hunk or d.kind not in ("+", "-") or _is_doc_file(current_file):
             continue
-
-        # Removed lines (within a hunk, even '---' SQL comment is treated as a removed line)
-        if in_hunk and line.startswith("-"):
-            line_no = current_old_line if current_old_line > 0 else 1
-            current_old_line += 1
-            if not _is_doc_file(current_file):
-                content = line[1:].strip()
-                res = _check_content_removed(content, current_file or "unknown", line_no)
-                if res:
-                    _add_trigger(reasons, triggered_files, res[0], res[1])
-            continue
-
-        # Context lines
-        if in_hunk:
-            current_old_line += 1
-            current_new_line += 1
+        content = d.raw[1:MAX_LINE_CHARS].strip()
+        if d.kind == "+":
+            res = _check_content_added(content, current_file or "unknown", max(d.new_no, 1))
+        else:
+            res = _check_content_removed(content, current_file or "unknown", max(d.old_no, 1))
+        if res:
+            _add_trigger(reasons, triggered_files, res[0], res[1])
 
     if hit_line_limit:
         cap_note = f"scan capped: {unscanned_lines_after_cap} lines not read"

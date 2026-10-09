@@ -35,6 +35,7 @@ from guard.core.rules import (
     _unsafe_yaml_load,
     shell_backtick_at,
 )  # noqa: F401
+from guard.core.unified_diff import walk_diff
 
 
 class OCRRulebookRunner:
@@ -64,11 +65,11 @@ class OCRRulebookRunner:
     @staticmethod
     def _collect_docker_users(diff_text: str) -> set[str]:
         last_user, name = {}, None
-        for line in diff_text.splitlines():
-            if line.startswith("+++ b/"):
-                name = line[6:].strip()
-            elif name and line[:1] in ("+", " "):
-                user = re.match(r"(?i)^USER\s+(\S+)", line[1:].strip())
+        for d in walk_diff(diff_text):
+            if d.kind == "header" and d.raw.startswith("+++ ") and not d.deleted:
+                name = d.path
+            elif name and d.kind in ("+", " "):
+                user = re.match(r"(?i)^USER\s+(\S+)", d.text.strip())
                 if user:
                     last_user[name.replace("\\", "/").lower()] = user.group(1).split(":")[0].lower()
         # Dockerfiles that end as another user may switch to root for a build step
@@ -205,27 +206,25 @@ class OCRRulebookRunner:
         self._open_key = {}  # Info.plist -> (line, text, added) of a <key> whose value is on the next line
         self._open_string = {}
 
-        for line in diff_text.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:].strip()
+        for d in walk_diff(diff_text):
+            if d.kind == "header" and d.raw.startswith("+++ ") and not d.deleted:
+                current_file = d.path
                 line_num = 0
                 self._stages = set()
                 self._open_string.pop(current_file.replace("\\", "/").lower(), None)
                 continue
-            if line.startswith(" "):
+            if d.kind == " ":
                 line_num += 1
-                violations.extend(self._handle_context_line(current_file, line_num, line[1:]))
+                violations.extend(self._handle_context_line(current_file, line_num, d.text))
                 continue
-            if line.startswith("@@"):
-                match = re.search(r"\+(\d+)", line)
-                if match:
-                    line_num = int(match.group(1)) - 1
+            if d.kind == "hunk":
+                line_num = d.new_no - 1
                 self._reset_hunk_state(current_file.replace("\\", "/").lower())
                 continue
 
-            if line.startswith("+") and not line.startswith("+++"):
+            if d.kind == "+":
                 line_num += 1
-                violations.extend(self._scan_added_line(current_file, line_num, line[1:].strip()))
+                violations.extend(self._scan_added_line(current_file, line_num, d.text.strip()))
 
         return violations
 

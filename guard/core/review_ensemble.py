@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from guard.core.findings import Finding
 from guard.core.review_lenses import LENSES, Lens
+from guard.core.unified_diff import parse_hunk_header, walk_diff
 
 SEVERITY_ORDER: Dict[str, int] = {
     "critical": 0,
@@ -87,12 +88,9 @@ def _parse_diff(parts: Sequence[str]) -> Dict[str, FileDiffInfo]:
     """
     Parse diff parts into FileDiffInfo for each touched file.
 
-    Matches diff headers at column 0 and avoids misidentifying body lines
-    (such as removed SQL or Lua comments) as diff headers.
+    Removed SQL or Lua comments inside a hunk are content, never file headers.
     """
     files: Dict[str, FileDiffInfo] = {}
-    current_files: List[str] = []
-    in_hunk = False
 
     def get_or_create(p: str) -> FileDiffInfo:
         norm = _normalize_path(p)
@@ -101,66 +99,25 @@ def _parse_diff(parts: Sequence[str]) -> Dict[str, FileDiffInfo]:
         return files[norm]
 
     for part in parts:
-        in_hunk = False
-        current_files = []
-        for raw_line in part.splitlines():
-            line = raw_line[:2000]
-
-            # diff --git a/... b/... (starts at column 0)
-            if line.startswith("diff --git a/"):
-                in_hunk = False
-                after = line[len("diff --git a/"):]
-                if " b/" in after:
-                    p_old, p_new = after.split(" b/", 1)
-                    s_old, s_new = p_old.strip(), p_new.strip()
-                    current_files = [s_old] if s_old == s_new else [s_old, s_new]
-                    for fp in current_files:
-                        get_or_create(fp)
+        current_files: List[str] = []
+        for d in walk_diff(part):
+            if d.kind == "file":
+                current_files = [p for p in dict.fromkeys((d.old_path, d.path)) if p]
+            elif d.kind == "header":
+                fp = d.old_path if d.raw.startswith("--- ") else d.path
+                if fp and fp not in current_files:
+                    current_files.append(fp)
+            elif d.kind == "hunk" and current_files:
+                old_start, old_count, new_start, new_count = parse_hunk_header(d.raw) or (0, 0, 0, 0)
+                old_end = old_start + old_count - 1 if old_count > 0 else old_start
+                new_end = new_start + new_count - 1 if new_count > 0 else new_start
+                for fp in current_files:
+                    info = get_or_create(fp)
+                    info.old_ranges.append((old_start, old_end))
+                    info.new_ranges.append((new_start, new_end))
                 continue
-
-            # Outside hunks: match file headers
-            if not in_hunk:
-                if line.startswith("--- a/"):
-                    fp = line[len("--- a/"):].strip()
-                    if fp not in current_files:
-                        current_files.append(fp)
-                    get_or_create(fp)
-                    continue
-                if line.startswith("--- /dev/null"):
-                    continue
-                if line.startswith("+++ b/"):
-                    fp = line[len("+++ b/"):].strip()
-                    if fp not in current_files:
-                        current_files.append(fp)
-                    get_or_create(fp)
-                    continue
-                if line.startswith("+++ /dev/null"):
-                    for fp in current_files:
-                        get_or_create(fp).is_deleted = True
-                    continue
-                if line.startswith("deleted file mode") or line.startswith("[file deleted:"):
-                    for fp in current_files:
-                        get_or_create(fp).is_deleted = True
-                    continue
-
-            # Hunk header: @@ -old_start,old_count +new_start,new_count @@
-            if line.startswith("@@ "):
-                in_hunk = True
-                m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-                if m and current_files:
-                    old_start = int(m.group(1))
-                    old_count = int(m.group(2)) if m.group(2) is not None else 1
-                    new_start = int(m.group(3))
-                    new_count = int(m.group(4)) if m.group(4) is not None else 1
-
-                    old_end = old_start + old_count - 1 if old_count > 0 else old_start
-                    new_end = new_start + new_count - 1 if new_count > 0 else new_start
-
-                    for fp in current_files:
-                        info = get_or_create(fp)
-                        info.old_ranges.append((old_start, old_end))
-                        info.new_ranges.append((new_start, new_end))
-                continue
+            for fp in current_files:
+                get_or_create(fp).is_deleted |= d.deleted or d.raw.startswith("[file deleted:")
 
     return files
 

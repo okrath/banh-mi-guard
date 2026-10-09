@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from guard.core.unified_diff import walk_diff
+
 
 class FileDiffStat(BaseModel):
     path: str
@@ -289,23 +291,21 @@ class GitDiffInspector:
 
         files_map: Dict[str, FileDiffStat] = {}
         current_file: Optional[str] = None
-        current_status = "modified"
 
-        for line in diff_text.splitlines():
-            if line.startswith("diff --git"):
-                match = re.search(r"diff --git a/(.*) b/(.*)", line)
-                if match:
-                    current_file = match.group(2)
-                    current_status = "modified"
-                    if current_file:
-                        files_map[current_file] = FileDiffStat(path=current_file, status=current_status)
-            elif line.startswith("new file mode") and current_file:
+        for d in walk_diff(diff_text):
+            if d.kind == "file":
+                current_file = d.path or None
+                if current_file:
+                    files_map[current_file] = FileDiffStat(path=current_file, status="modified")
+            elif not current_file:
+                continue
+            elif d.raw.startswith("new file mode"):
                 files_map[current_file].status = "added"
-            elif line.startswith("deleted file mode") and current_file:
+            elif d.raw.startswith("deleted file mode"):
                 files_map[current_file].status = "deleted"
-            elif line.startswith("+") and not line.startswith("+++") and current_file:
+            elif d.kind == "+":
                 files_map[current_file].insertions += 1
-            elif line.startswith("-") and not line.startswith("---") and current_file:
+            elif d.kind == "-":
                 files_map[current_file].deletions += 1
 
         stats_list = list(files_map.values())
