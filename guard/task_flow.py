@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
+from guard.core.build_command import build_argv, build_command, collected_no_tests
 from guard.core.config import load_config, load_global_config
 from guard.core.diff_partition import partition_diff
 from guard.core.hygiene_engine import HygieneEngine
@@ -43,7 +44,7 @@ from guard.core.review_options import ReviewOptions, effective_sources, load_rev
 from guard.core.session import ApprovalKeyError, BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
 from guard.core.simplicity_engine import SimplicityEngine
 from guard.core.unified_diff import parse_git_header, split_file_chunks
-from guard.domains.detector import detect_build_command, extract_contracts_and_invariants
+from guard.domains.detector import extract_contracts_and_invariants
 from guard.domains.pre_analysis import analyze_task
 from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
@@ -817,7 +818,7 @@ def _run_gate_review(gate, target_repo: Path, ocr_res: _PostOcrResult) -> Tuple[
         build_res = ocr_res.build_future.result()
         review_verdict = gate(build_res, True, [])
     else:  # the LLM reviews while the build runs; a failing build still rejects on its own
-        build_cmd = detect_build_command(target_repo)
+        build_cmd = build_command(target_repo)[0]
         notes = [
             f"The build and tests ({build_cmd}) run in parallel with this review; guard rejects the change by "
             "itself if they fail, so do not raise findings about missing test evidence."
@@ -1078,7 +1079,7 @@ def _ocr_cache_key(config, pre) -> Optional[str]:
 
 def _related_tests(target_repo: Path, config, diff_scope: "_PostDiffScope") -> List[str]:
     """With `guard config tests related` and a pytest build: the tests of the task's changed files ([] = all)."""
-    if config.tests_scope != "related" or detect_build_command(target_repo) != "pytest":
+    if config.tests_scope != "related" or build_command(target_repo)[0] != "pytest":
         return []
     from guard.core.related_tests import related_tests
     changed = [f.path for f in diff_scope.task_summary.files if f.status != "deleted"]
@@ -1091,7 +1092,7 @@ def _run_build(target_repo: Path, related: Optional[List[str]] = None) -> Option
     The project's build and tests (0 tokens); None when the project has no build command. With `related`
     (test files, only for a pytest build) only those tests run, and the result says so.
     """
-    build_cmd = detect_build_command(target_repo)
+    build_cmd, configured = build_command(target_repo)
     if build_cmd == "pytest" and related:
         build_cmd = "pytest " + " ".join(related)  # repository paths checked to be plain [\w./-] by related_tests
     else:
@@ -1100,11 +1101,11 @@ def _run_build(target_repo: Path, related: Optional[List[str]] = None) -> Option
     if build_cmd:
         start_t = time.perf_counter()
         try:
-            # detect_build_command returns guard's own fixed commands (never user config); shell=True needed for npm/pnpm on Windows.
-            # Turn into an argument list before ever reading a build command from config.
+            # A command set with `guard config build` runs as an argument list, never through a shell. A detected
+            # one is guard's own fixed command; shell=True finds npm/pnpm on Windows.
             p = subprocess.run(
-                build_cmd,
-                shell=True,
+                build_argv(build_cmd) if configured else build_cmd,
+                shell=not configured,
                 cwd=str(target_repo),
                 capture_output=True,
                 text=True,
@@ -1115,13 +1116,16 @@ def _run_build(target_repo: Path, related: Optional[List[str]] = None) -> Option
             duration = time.perf_counter() - start_t
             stdout_str = p.stdout or ""
             stderr_str = p.stderr or ""
+            no_tests = collected_no_tests(build_cmd, p.returncode)  # nothing to run is not a failure, nor a pass
             build_res = BuildCheckResult(
                 command=build_cmd,
-                passed=(p.returncode == 0),
+                passed=(p.returncode == 0 or no_tests),
                 exit_code=p.returncode,
                 output=stdout_str + stderr_str,
                 duration_s=duration,
                 related=related,
+                no_tests=no_tests,
+                configured=configured,
             )
         except Exception as e:
             duration = time.perf_counter() - start_t
@@ -1132,6 +1136,7 @@ def _run_build(target_repo: Path, related: Optional[List[str]] = None) -> Option
                 output=str(e),
                 duration_s=duration,
                 related=related,
+                configured=configured,
             )
     return build_res
 

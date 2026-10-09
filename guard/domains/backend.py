@@ -13,6 +13,17 @@ from guard.core.session import LockedInvariant
 from guard.domains.base import BaseDomainAnalyzer
 
 
+def _pytest_config(repo_path: Path) -> bool:
+    """`[tool.pytest...]` in pyproject.toml, or `[tool:pytest]` in setup.cfg."""
+    for name, marker in (("pyproject.toml", "[tool.pytest"), ("setup.cfg", "[tool:pytest]")):
+        try:
+            if marker in (repo_path / name).read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 class BackendDomainAnalyzer(BaseDomainAnalyzer):
     @property
     def name(self) -> str:
@@ -38,9 +49,12 @@ class BackendDomainAnalyzer(BaseDomainAnalyzer):
         if (repo_path / "Cargo.toml").exists():
             return "cargo test"
         if (repo_path / "pyproject.toml").exists() or (repo_path / "requirements.txt").exists():
-            if (repo_path / "pytest.ini").exists() or (repo_path / "tests").exists():
+            # a Python test command only with Python tests in sight: a monorepo of other languages can keep
+            # a root pyproject.toml, and unittest that finds no test fails the build
+            if any((repo_path / p).exists() for p in ("pytest.ini", "conftest.py", "tests", "test")) or _pytest_config(repo_path):
                 return "pytest"
-            return "python -m unittest"
+            if any(repo_path.glob("test_*.py")) or any(repo_path.glob("*_test.py")):
+                return "python -m unittest"
         if (repo_path / "package.json").exists():
             return "npm test"
         return None

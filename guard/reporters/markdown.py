@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from guard.core.build_command import BUILD_HINT
 from guard.core.impact import ImpactRange, is_test
 from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 
@@ -287,14 +288,17 @@ def _markdown_impact_range(post: PostTaskRecord, pre: Optional[PreTaskRecord]) -
 def _markdown_build_check(post: PostTaskRecord) -> list:
     md = ["\n* **Build & Project Health Check:**"]
     if post.build_check:
-        icon = "✅" if post.build_check.passed else "❌"
-        md.append(f"  - {icon} Command: `{post.build_check.command}` (Exit Code: {post.build_check.exit_code}, Duration: {post.build_check.duration_s:.1f}s)")
+        icon = "ℹ️" if post.build_check.no_tests else "✅" if post.build_check.passed else "❌"
+        source = ", set with `guard config build`" if post.build_check.configured else ""
+        md.append(f"  - {icon} Command: `{post.build_check.command}` (Exit Code: {post.build_check.exit_code}, Duration: {post.build_check.duration_s:.1f}s{source})")
+        if post.build_check.no_tests:
+            md.append(f"  - It found no test to run: nothing was tested. {BUILD_HINT}")
         if post.build_check.related:
             md.append(f"  - Related tests only ({len(post.build_check.related)} file(s)); the full suite runs before any approval.")
         if not post.build_check.passed:
             md.append(f"    ```\n    {post.build_check.output[:400]}\n    ```")
     else:
-        md.append("  - ℹ️ No automated build command detected.")
+        md.append(f"  - ℹ️ No automated build command detected. {BUILD_HINT}")
     return md
 
 

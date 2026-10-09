@@ -182,6 +182,50 @@ def config_tests_cmd(
         console.print("[yellow]This repository has its own .guard/config.json, which is read instead of the machine-wide file.[/yellow]")
 
 
+@config_app.command("build")
+def config_build_cmd(
+    command: Optional[str] = typer.Argument(None, help='The build and test command, e.g. "pnpm -r test"'),
+    clear: bool = typer.Option(False, "--clear", help="Remove the set command: guard detects one again"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Target repository directory"),
+):
+    """
+    Show or set the build command `guard post` runs for this repository (every worktree of it). Setting it is
+    for the user, in an interactive terminal. One command, run without a shell: no `&&`, pipes or redirections.
+    """
+    from guard.core.build_command import build_command, command_problem, set_build_command
+    from guard.core.repo_setup import git_root
+    target = Path(repo or ".").resolve()
+    target = git_root(target) or target
+    if command is None and not clear:
+        current, configured = build_command(target)
+        source = "set with guard config build" if configured else "detected"
+        console.print(f"Build command: [bold]{escape(current)}[/bold] ({source})" if current else
+                      "No build command: guard post runs no build check. Set one with guard config build \"<command>\".")
+        return
+    if command is not None and clear:
+        console.print("[bold red]❌ Give a command or --clear, not both.[/bold red]")
+        raise typer.Exit(code=1)
+    if command is not None:
+        command = command.strip()
+        problem = command_problem(command)
+        if problem:
+            console.print(f"[bold red]❌ The build command runs as one command without a shell, and {escape(problem)}. "
+                          "Use one command that runs everything (e.g. `pnpm -r test`) or a script.[/bold red]")
+            raise typer.Exit(code=1)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[bold red]❌ The build command decides the build check: run guard config build yourself in an interactive terminal.[/bold red]")
+        raise typer.Exit(code=1)
+    try:
+        path = set_build_command(target, command)
+    except OSError as e:
+        console.print(f"[bold red]❌ {escape(str(e))}[/bold red]")
+        raise typer.Exit(code=1) from None
+    if command is None:
+        console.print(f"[bold green]✅ Build command removed: guard detects one again.[/bold green] [dim]{path}[/dim]")
+    else:
+        console.print(f"[bold green]✅ guard post runs `{escape(command)}` for this repository.[/bold green] [dim]Saved to {path}[/dim]")
+
+
 @config_app.command("commit")
 def config_commit_cmd(
     mode: str = typer.Argument(..., help="auto: the agent writes commit messages; ask: the agent asks you for each one"),
