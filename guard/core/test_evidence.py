@@ -57,6 +57,8 @@ from guard.core.code_text import (
 )
 from guard.core.rulebook import OCRRulebookRunner
 from guard.core.rules import LINE_RULES
+from guard.core.unified_diff import decode_git_path as decode_git_path  # re-exported: it used to live here
+from guard.core.unified_diff import walk_diff
 
 # Bounded limit constants
 MAX_SCANNED_LINES = 20_000
@@ -425,37 +427,6 @@ def shorten_path(path: str, max_chars: int = MAX_PATH_CHARS) -> str:
     return f"{dir_part}/.../{filename[:max_chars - len(dir_part) - 8]}...{ext}"
 
 
-def decode_git_path(path: str) -> str:
-    """Decode git C-style quoted paths with octal escapes (e.g. \\303\\251 -> UTF-8)."""
-    p = path.strip()
-    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
-        inner = p[1:-1]
-        try:
-            def _replace_escape(m: re.Match) -> bytes:
-                seq = m.group(0).decode("latin1")
-                if len(seq) > 1 and seq[1] in "01234567":
-                    return bytes([int(seq[1:], 8)])
-                escapes: dict[str, bytes] = {
-                    "\\\\": b"\\",
-                    '\\"': b'"',
-                    "\\n": b"\n",
-                    "\\t": b"\t",
-                    "\\r": b"\r",
-                    "\\b": b"\b",
-                    "\\f": b"\f",
-                }
-                val = escapes.get(seq)
-                if val is not None:
-                    return val
-                return seq.encode("latin1")
-
-            raw_bytes = re.sub(rb'\\[0-7]{1,3}|\\[\\ntrbf"]', _replace_escape, inner.encode("latin1"))
-            return raw_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            return inner
-    return p
-
-
 def is_test_path(path: str) -> bool:
     """
     True if path matches known test directory or file patterns across ecosystems.
@@ -663,80 +634,36 @@ def _parse_unified_diff(raw_diff: str, budget: _ScanBudget | None = None) -> tup
     files: list[_ParsedFileDiff] = []
     current_file: _ParsedFileDiff | None = None
     current_hunk: _DiffHunk | None = None
-    old_line_num = 0
-    new_line_num = 0
     open_comments_old: dict[str, str] = {}
     open_comments_new: dict[str, str] = {}
 
-    hunk_header_re = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
-    diff_git_re = re.compile(r'^diff --git (?:\"a/(.+?)\"|a/(\S+?)) (?:\"b/(.+?)\"|b/(\S+?))$')
-
-    for raw_line in lines:
+    for raw_line, d in zip(lines, walk_diff([raw[:MAX_LINE_CHARS] for raw in lines]), strict=True):
         was_cut = len(raw_line) > MAX_LINE_CHARS
-        line = raw_line[:MAX_LINE_CHARS]
+        line = d.raw
 
-        if line.startswith("diff --git"):
-            m = diff_git_re.match(line)
+        if d.kind == "file":
             current_hunk = None
-            if m:
-                new_raw = m.group(3) or m.group(4) or ""
-                old_raw = m.group(1) or m.group(2) or ""
-                path_raw = new_raw if new_raw != "/dev/null" else old_raw
-                path = decode_git_path('"' + path_raw + '"' if "\\" in path_raw else path_raw)
-                current_file = _ParsedFileDiff(path=path)
+            current_file = _ParsedFileDiff(path=d.path) if d.path else None
+            if current_file:
                 files.append(current_file)
-            else:
-                current_file = None
             continue
 
-        if current_file is None:
-            if line.startswith("--- a/") or line.startswith('--- "a/'):
-                p_raw = line[4:].strip()
-                current_file = _ParsedFileDiff(path=decode_git_path(p_raw)[2:])
-                files.append(current_file)
-                continue
-            if line == "--- /dev/null":
+        if d.kind == "header" and (current_file is None or current_hunk is None):
+            if current_file is None:  # a diff without `diff --git` lines
                 current_file = _ParsedFileDiff(path="")
                 files.append(current_file)
-                continue
-            if line.startswith("+++ b/") or line.startswith('+++ "b/'):
-                p_raw = line[4:].strip()
-                current_file = _ParsedFileDiff(path=decode_git_path(p_raw)[2:])
-                files.append(current_file)
-                continue
+            current_file.path = d.path or d.old_path
+        if current_file is None:
             continue
+        current_file.is_deleted = current_file.is_deleted or d.deleted
 
-        if line.startswith("deleted file mode"):
-            current_file.is_deleted = True
-            continue
-        if line.startswith("new file mode"):
-            continue
-
-        # File headers outside hunks
-        if current_hunk is None:
-            if line.startswith("--- a/") or line == "--- /dev/null" or line.startswith('--- "a/'):
-                continue
-            if line.startswith("+++ b/") or line == "+++ /dev/null" or line.startswith('+++ "b/'):
-                if line == "+++ /dev/null":
-                    current_file.is_deleted = True
-                else:
-                    p_raw = line[4:].strip()
-                    current_file.path = decode_git_path(p_raw)[2:]
-                continue
-
-        m_hunk = hunk_header_re.match(line)
-        if m_hunk:
-            old_line_num = int(m_hunk.group(1))
-            new_line_num = int(m_hunk.group(2))
+        if d.kind == "hunk":
             current_hunk = _DiffHunk()
             current_file.hunks.append(current_hunk)
             continue
 
-        if current_hunk is None:
-            continue
-
-        if line.startswith("\\"):
-            # Git metadata marker (e.g. \ No newline at end of file) - skip without shifting lines
+        # Only content inside a hunk counts; `\ No newline at end of file` shifts no lines
+        if current_hunk is None or d.kind not in ("+", "-", " "):
             continue
 
         fp = current_file.path
@@ -763,9 +690,8 @@ def _parse_unified_diff(raw_diff: str, budget: _ScanBudget | None = None) -> tup
             else:
                 is_assert = False
                 is_comment = False
-            current_hunk.added_lines.append((new_line_num, content, is_assert, is_comment, was_cut))
+            current_hunk.added_lines.append((d.new_no, content, is_assert, is_comment, was_cut))
             current_file.total_insertions += 1
-            new_line_num += 1
         elif line.startswith("-"):
             content = line[1:]
             if is_tp:
@@ -786,9 +712,8 @@ def _parse_unified_diff(raw_diff: str, budget: _ScanBudget | None = None) -> tup
             else:
                 is_assert = False
                 is_comment = False
-            current_hunk.removed_lines.append((old_line_num, content, is_assert, is_comment, was_cut))
+            current_hunk.removed_lines.append((d.old_no, content, is_assert, is_comment, was_cut))
             current_file.total_deletions += 1
-            old_line_num += 1
         else:
             # Context line: updates both old and new side comment state if applicable
             if is_tp:
@@ -802,8 +727,6 @@ def _parse_unified_diff(raw_diff: str, budget: _ScanBudget | None = None) -> tup
                             _carry_comment(open_comments_old, fp_lower, ctx_code)
                         if open_comments_new.get(fp_lower) or ("/*" in line) or ("<!--" in line) or (fp_lower.endswith(".rb") and ("=begin" in line or "=end" in line)):
                             _carry_comment(open_comments_new, fp_lower, ctx_code)
-            new_line_num += 1
-            old_line_num += 1
 
     return files, exceeded
 

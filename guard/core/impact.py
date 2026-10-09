@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from guard.core.ocr_engine import GitDiffInspector, RuleViolation, glob_to_regex
 from guard.core.removal_check import CODE_EXTS, REMOVED_CSS_CLASS, REMOVED_EXPORT, REMOVED_KEY, STYLE_EXTS
+from guard.core.unified_diff import walk_diff
 
 MAX_FILES = 40
 MAX_SYMBOLS_PER_FILE = 60
@@ -36,7 +37,6 @@ JS_FN_VAR = re.compile(
     r"""(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=>)"""
 )
 TEST_PATH = re.compile(r"""(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|_test\.[^/.]+$|\.(test|spec)\.[^/]+$""")
-HUNK = re.compile(r"""^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@""")
 
 
 class ImpactSymbol(BaseModel):
@@ -184,46 +184,31 @@ def _decorator(path: str, line: str) -> bool:
 def _diff_changes(raw_diff: str) -> Dict[str, Tuple[Set[int], List[str]]]:
     """path -> (lines of the current file the diff touched, removed lines) per file of a unified diff."""
     changes: Dict[str, Tuple[Set[int], List[str]]] = {}
-    old = current = ""
-    new_line = 0
     in_removed_def = False
-    for line in raw_diff.splitlines():
-        if line.startswith("diff --git "):
-            old = current = ""
-            in_removed_def = False
+    for d in walk_diff(raw_diff):
+        if d.kind == "header" and d.raw.startswith("+++ "):
+            changes.setdefault(d.path, (set(), []))  # a deleted file keeps its old path
             continue
-        if line.startswith("--- "):
-            old = line[6:] if line.startswith("--- a/") else ""
-            continue
-        if line.startswith("+++ "):
-            current = line[6:] if line.startswith("+++ b/") else old  # a deleted file keeps its old path
-            changes.setdefault(current, (set(), []))
-            continue
-        m = HUNK.match(line)
-        if m:
-            new_line = int(m.group(1))
+        if d.kind in ("file", "hunk"):
             in_removed_def = False  # a removed definition's body never continues into another hunk
             continue
-        if not current or not line or line[0] not in "+- ":
+        if d.kind not in ("+", "-", " ") or d.path not in changes:
             continue
-        touched, removed = changes[current]
-        blank = not line[1:].strip()  # blank lines between definitions belong to no symbol's change
-        if line[0] == "+":
+        touched, removed = changes[d.path]
+        blank = not d.text.strip()  # blank lines between definitions belong to no symbol's change
+        if d.kind == "+":
             if not blank:
-                touched.add(new_line)
-            new_line += 1
-        elif line[0] == "-":
+                touched.add(d.new_no)
+        elif d.kind == "-":
             # Removed code belongs to the symbol of the line before it, unless it follows a removed
             # definition: then it is that symbol's body, gone with it
-            in_removed_def = in_removed_def or bool(definitions(current, line[1:]))
-            if _decorator(current, line[1:]):
-                touched.add(new_line)  # a removed decorator belongs to the definition below it
+            in_removed_def = in_removed_def or bool(definitions(d.path, d.text))
+            if _decorator(d.path, d.text):
+                touched.add(d.new_no)  # a removed decorator belongs to the definition below it
             elif not blank and not in_removed_def:
-                touched.add(max(new_line - 1, 1))
-            removed.append(line[1:])
-        else:
-            new_line += 1
-        if line[0] != "-":
+                touched.add(max(d.new_no - 1, 1))
+            removed.append(d.text)
+        if d.kind != "-":
             in_removed_def = False
     return changes
 

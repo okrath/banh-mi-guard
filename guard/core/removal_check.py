@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from guard.core.ocr_engine import RuleViolation
+from guard.core.unified_diff import walk_diff
 
 CODE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".html", ".py")
 STYLE_EXTS = (".css", ".scss", ".sass", ".less")
@@ -28,18 +29,9 @@ REMOVED_CSS_CLASS = re.compile(r"""\.(-?[A-Za-z_][\w-]*)""")
 def _collect_removed(raw_diff: str) -> Dict[str, Tuple[str, str]]:
     """name -> (kind, file) for every key/export/CSS class on a removed line."""
     removed: Dict[str, Tuple[str, str]] = {}
-    current = ""
-    for line in raw_diff.splitlines():
-        if line.startswith("--- "):
-            continue
-        if line.startswith("+++ "):
-            current = line[6:] if line.startswith("+++ b/") else ""
-            continue
-        if line.startswith("diff --git "):
-            m = re.search(r" b/(.+)$", line)
-            current = m.group(1) if m else ""
-            continue
-        if not line.startswith("-") or not current:
+    for d in walk_diff(raw_diff):
+        current, line = d.path, d.raw
+        if d.kind != "-" or d.deleted or not current:
             continue
         if current.endswith(STYLE_EXTS):
             selector = line[1:].split("{", 1)[0]

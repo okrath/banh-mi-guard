@@ -21,6 +21,7 @@ from typing import Callable, Literal, Optional
 
 from guard.core.findings import Finding
 from guard.core.rulebook import OCRRulebookRunner
+from guard.core.unified_diff import chunk_paths, parse_hunk_header, split_file_chunks, walk_diff
 
 STOP_WORDS = {
     "about", "above", "after", "again", "against", "all", "also", "always",
@@ -173,92 +174,37 @@ def _parse_diff(full_diff: str) -> tuple[list[_DiffLineTuple], list[_DiffHunkTup
 
     current_file = ""
     in_hunk = False
+    headers: list[str] = []
+    hunk_header = ""
+    hunk_lines: list[str] = []
+    counts = (0, 0, 0, 0)
 
-    current_file_headers: list[str] = []
-    current_hunk_header = ""
-    current_hunk_lines: list[str] = []
-    current_old_start = 0
-    current_old_count = 0
-    current_new_start = 0
-    current_new_count = 0
+    def flush() -> None:
+        _flush_hunk(diff_hunks, current_file, headers, hunk_header, hunk_lines, *counts)
 
-    for line in full_diff.splitlines():
-        # Check diff --git header: ends previous file/hunk
-        git_m = re.match(r"^diff --git a/(.*?)\s+b/(.*)", line)
-        if git_m:
-            _flush_hunk(
-                diff_hunks, current_file, current_file_headers, current_hunk_header,
-                current_hunk_lines, current_old_start, current_old_count,
-                current_new_start, current_new_count,
-            )
-            current_hunk_lines = []
-            current_hunk_header = ""
-            current_file = _norm_path(git_m.group(2))
-            current_file_headers = [line]
+    for d in walk_diff(full_diff):
+        if d.kind in ("file", "hunk") or (in_hunk and d.kind in ("meta", "header")):
+            flush()  # a file header, the next hunk or a line outside the hunk ends the current hunk
+            hunk_lines = []
+            hunk_header = ""
             in_hunk = False
-            continue
-
-        # Check hunk header: ends previous hunk, starts new hunk
-        hunk_m = re.match(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@", line)
-        if hunk_m:
-            _flush_hunk(
-                diff_hunks, current_file, current_file_headers, current_hunk_header,
-                current_hunk_lines, current_old_start, current_old_count,
-                current_new_start, current_new_count,
-            )
-            current_hunk_lines = []
-            current_hunk_header = line
-            current_old_start = int(hunk_m.group(1))
-            current_old_count = int(hunk_m.group(2)) if hunk_m.group(2) else 1
-            current_new_start = int(hunk_m.group(3))
-            current_new_count = int(hunk_m.group(4)) if hunk_m.group(4) else 1
+        if d.kind == "file":
+            current_file = _norm_path(d.path)
+            headers = [d.raw]
+        elif d.kind == "hunk":
+            current_file = current_file or _norm_path(d.path)
+            hunk_header = d.raw
+            counts = parse_hunk_header(d.raw) or (0, 0, 0, 0)
             in_hunk = True
-            continue
+        elif in_hunk and d.kind in ("+", "-", " "):
+            diff_lines.append((d.kind, d.text.strip(), d.raw, current_file))
+            hunk_lines.append(d.raw)
+        elif in_hunk and d.kind == "\\":
+            hunk_lines.append(d.raw)
+        elif d.kind == "header" or current_file:
+            headers.append(d.raw)
 
-        # Check --- / +++ file headers: only outside hunks
-        if not in_hunk:
-            if line.startswith("--- "):
-                current_file_headers.append(line)
-                continue
-            if line.startswith("+++ "):
-                current_file_headers.append(line)
-                plus_m = re.match(r"^\+\+\+\s+(?:b/)?(.*)", line)
-                if plus_m and not current_file:
-                    current_file = _norm_path(plus_m.group(1))
-                continue
-
-        # Content lines inside hunks
-        if in_hunk:
-            if line.startswith("+"):
-                diff_lines.append(("+", line[1:].strip(), line, current_file))
-                current_hunk_lines.append(line)
-            elif line.startswith("-"):
-                diff_lines.append(("-", line[1:].strip(), line, current_file))
-                current_hunk_lines.append(line)
-            elif line.startswith(" "):
-                diff_lines.append((" ", line[1:].strip(), line, current_file))
-                current_hunk_lines.append(line)
-            elif line.startswith("\\"):
-                current_hunk_lines.append(line)
-            else:
-                # Line does not start with '+', '-', ' ' or '\\': ends the current hunk
-                _flush_hunk(
-                    diff_hunks, current_file, current_file_headers, current_hunk_header,
-                    current_hunk_lines, current_old_start, current_old_count,
-                    current_new_start, current_new_count,
-                )
-                current_hunk_lines = []
-                current_hunk_header = ""
-                in_hunk = False
-        else:
-            if current_file:
-                current_file_headers.append(line)
-
-    _flush_hunk(
-        diff_hunks, current_file, current_file_headers, current_hunk_header,
-        current_hunk_lines, current_old_start, current_old_count,
-        current_new_start, current_new_count,
-    )
+    flush()
     return diff_lines, diff_hunks
 
 
@@ -330,18 +276,9 @@ def relevant_context(finding: Finding, full_diff: str, max_chars: int = 12000) -
 
     # Fallback to finding's file, or full_diff capped
     if finding_file:
-        file_lines: list[str] = []
-        capturing = False
-        for line in full_diff.splitlines():
-            if line.startswith("diff --git ") or line.startswith("--- "):
-                if finding_file in line.lower():
-                    capturing = True
-                elif capturing and line.startswith("diff --git "):
-                    break
-            if capturing:
-                file_lines.append(line)
-        if file_lines:
-            return "\n".join(file_lines)[:max_chars]
+        for chunk in split_file_chunks(full_diff)[1]:
+            if finding_file in {_norm_path(p) for p in chunk_paths(chunk) if p}:
+                return chunk.rstrip("\r\n")[:max_chars]
 
     return full_diff[:max_chars]
 

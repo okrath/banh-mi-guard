@@ -42,6 +42,7 @@ from guard.core.repo_setup import ensure_repo_setup
 from guard.core.review_options import ReviewOptions, effective_sources, load_review_options
 from guard.core.session import ApprovalKeyError, BuildCheckResult, PostTaskRecord, SessionManager, SessionStatus
 from guard.core.simplicity_engine import SimplicityEngine
+from guard.core.unified_diff import parse_git_header, split_file_chunks
 from guard.domains.detector import detect_build_command, extract_contracts_and_invariants
 from guard.domains.pre_analysis import analyze_task
 from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
@@ -73,14 +74,17 @@ def _file_at(repo: Path, ref: Optional[str], path: str) -> Optional[str]:
 
 
 def _drop_diff_files(raw_diff: str, drop: set) -> str:
-    """Remove the per-file chunks of `drop` paths from a unified diff."""
+    """Remove the per-file chunks of `drop` paths from a unified diff.
+
+    A chunk goes by the old path on its `diff --git` line: a task file renamed onto a pre-existing
+    path stays in the audit, and an untracked file (`--- /dev/null`) still matches its own path.
+    """
     if not drop:
         return raw_diff
-    chunks = raw_diff.split("diff --git ")
-    kept = [c for c in chunks[1:] if not any(c.startswith(f"a/{p} b/") for p in drop)]
-    header = chunks[0]
+    header, chunks = split_file_chunks(raw_diff)
+    kept = [c for c in chunks if (parse_git_header(c.splitlines()[0]) or ("", ""))[0] not in drop]
     if kept:
-        return header + "".join("diff --git " + c for c in kept)
+        return header + "".join(kept)
     if "# [ERROR:" in header:
         return header
     return ""

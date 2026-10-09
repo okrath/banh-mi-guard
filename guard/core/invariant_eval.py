@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, model_validator
 
+from guard.core.unified_diff import walk_diff
+
 
 class DomainType(str, Enum):
     FRONTEND = "frontend"
@@ -61,14 +63,9 @@ HINT = "Keyword hint, not a check (judge it from the diff): "
 def _removed_lines(git_diff: str) -> List[str]:
     """Lines the diff removes from files that still exist: a deleted file's lines are not a removed handler or state."""
     out: List[str] = []
-    deleted = False
-    for line in git_diff.splitlines():
-        if line.startswith("diff --git "):
-            deleted = False
-        elif line.startswith("deleted file mode") or line.startswith("+++ /dev/null"):
-            deleted = True
-        elif line.startswith("-") and not line.startswith("---") and not deleted:
-            out.append(line[1:].strip())
+    for d in walk_diff(git_diff):
+        if d.kind == "-" and not d.deleted:
+            out.append(d.text.strip())
     return out
 
 
@@ -91,7 +88,7 @@ def evaluate_invariants(
     start = time.perf_counter()
     checks: List[InvariantCheck] = []
     removed_lines = _removed_lines(git_diff)
-    added_lines = [line[1:] for line in git_diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    added_lines = [d.text for d in walk_diff(git_diff) if d.kind == "+"]
 
     for inv in invariants:
         inv_id = str(inv.get("id", "INV-UNKNOWN"))

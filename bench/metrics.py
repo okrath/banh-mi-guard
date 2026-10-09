@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Set
 
+from guard.core.unified_diff import walk_diff
+
 # For backwards compatibility with callers importing ItemList
 ItemList = list
 
@@ -36,19 +38,7 @@ def _extract_location_file(location: str) -> str:
 
 def _extract_diff_files(raw_diff: str) -> set[str]:
     """Extract touched target file paths from a unified diff."""
-    files: set[str] = set()
-    if not raw_diff:
-        return files
-    for line in raw_diff.splitlines():
-        if line.startswith("diff --git "):
-            parts = line[len("diff --git ") :].split(" ")
-            if len(parts) >= 2:
-                b_part = parts[-1].strip()
-                if b_part.startswith("b/"):
-                    files.add(b_part[2:].strip('"'))
-                elif b_part.startswith('"b/'):
-                    files.add(b_part[3:].rstrip('"'))
-    return files
+    return {d.path for d in walk_diff(raw_diff or "") if d.kind == "file" and d.path}
 
 
 def _path_suffix_match(p1: str, p2: str) -> bool:

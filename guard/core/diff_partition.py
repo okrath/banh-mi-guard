@@ -9,20 +9,26 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from guard.core.unified_diff import GIT_HEADER, chunk_paths, parse_git_header, split_file_chunks, walk_diff
+
 REVIEW_BATCH_CHARS = 80000
 REVIEW_MAX_BATCHES = 6
 
 
 def _extract_filename(first_line: str) -> str:
     """Extract file path from the diff header line following 'diff --git '."""
+    parsed = parse_git_header(GIT_HEADER + first_line.strip())
+    if parsed:
+        return parsed[1]
     line = first_line.strip()
-    if line.startswith('"a/') and '" "b/' in line:
-        return line.split('" "b/', 1)[1].rstrip('"')
-    if " b/" in line:
-        return line.rsplit(" b/", 1)[1].strip().strip('"')
-    if line.startswith("a/"):
-        return line[2:].strip().strip('"')
-    return line
+    return line[2:] if line.startswith("a/") else line
+
+
+def _file_chunks(raw_diff: str) -> list[tuple[str, str]]:
+    """(file name, chunk) per file of a diff; text before the first file (an error note) is a chunk of its own."""
+    head, chunks = split_file_chunks(raw_diff)
+    out = [(head.strip().splitlines()[0], head)] if head.strip() else []
+    return out + [(chunk_paths(c)[1] or _extract_filename(c.splitlines()[0][len(GIT_HEADER):]), c) for c in chunks]
 
 
 @dataclass
@@ -56,19 +62,15 @@ def partition_diff(
     skipped_files: list[str] = []
     omitted_deleted: list[str] = []
 
-    for c in re.split(r"(?m)^diff --git ", raw_diff):
-        if not c.strip():
-            continue
-        first_line = c.splitlines()[0] if c.splitlines() else ""
-        fname = _extract_filename(first_line)
+    for fname, chunk in _file_chunks(raw_diff):
+        first_line = chunk.splitlines()[0]
         if any(k in first_line for k in ["assets/", ".lock", "-lock.", ".svg", ".png", ".onnx", "tokenizer.json"]):
             skipped_files.append(fname)
             continue
-        chunk = "diff --git " + c
         if "\ndeleted file mode" in chunk.split("@@", 1)[0]:
             omitted_deleted.append(fname)
             head = chunk.split("\n@@", 1)[0]
-            removed = sum(1 for line in chunk.splitlines() if line.startswith("-") and not line.startswith("---"))
+            removed = sum(1 for d in walk_diff(chunk) if d.kind == "-")
             chunk = f"{head}\n[file deleted: {removed} lines removed; content omitted]\n"
         prefix = f"{chunk.splitlines()[0]}\n[continued: next part of this file's diff]\n"
         code_chunks.append(chunk[:batch_chars])
@@ -130,24 +132,14 @@ def partition_diff(
 def _part_file_stats(part_text: str) -> list[tuple[str, int, int]]:
     """Extract (file_path, insertions, deletions) for each file in a diff part."""
     file_map: dict[str, list[int]] = {}
-    for c in re.split(r"(?m)^diff --git ", part_text):
-        if not c.strip():
-            continue
-        first_line = c.splitlines()[0] if c.splitlines() else ""
-        fname = _extract_filename(first_line)
-        chunk = "diff --git " + c
+    for fname, chunk in _file_chunks(part_text):
         if "[file deleted:" in chunk:
             m = re.search(r"\[file deleted:\s*(\d+)\s*lines removed", chunk)
             del_count = int(m.group(1)) if m else 0
             ins = 0
         else:
-            ins = 0
-            del_count = 0
-            for line in chunk.splitlines():
-                if line.startswith("+") and not line.startswith("+++"):
-                    ins += 1
-                elif line.startswith("-") and not line.startswith("---"):
-                    del_count += 1
+            kinds = [d.kind for d in walk_diff(chunk)]
+            ins, del_count = kinds.count("+"), kinds.count("-")
         if fname not in file_map:
             file_map[fname] = [ins, del_count]
         else:
