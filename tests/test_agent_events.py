@@ -271,6 +271,31 @@ def test_normalise_reads_common_harness_fields():
     assert ev.loop is True
 
 
+def test_a_commit_in_an_unclear_repository_says_so_instead_of_asking_for_a_post(tmp_path, fake_ocr_review):
+    here, there = make_repo(tmp_path / "here"), make_repo(tmp_path / "there")
+    assert execute_pre_task("Fix src/chat.ts", repo_path=there) is True
+    (there / "src" / "chat.ts").write_text("export const a = 2;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=there, check=True, capture_output=True)
+    assert execute_post_task(repo_path=there) is True
+
+    # a here-document and a pipe after the commit: the target cannot be read for certain
+    unclear = f"cd {there} && git commit -q -F - <<'EOF'\nfix chat\nEOF\ngit status --short | wc -l"
+    blocked = bash(here, unclear)
+    assert blocked.action == "block" and "cannot tell which repository" in blocked.reason
+    suggested = f"git -C {there.as_posix()} commit -F msg.txt"
+    assert suggested.replace("msg.txt", "<message file>") in blocked.reason and "guard post" not in blocked.reason
+
+    assert bash(here, suggested).action == "allow"  # the suggested form commits the approval
+    (there / "src" / "chat.ts").write_text("export const a = 3;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=there, check=True, capture_output=True)
+    stale = bash(here, suggested)
+    assert stale.action == "block" and "after the last approval" in stale.reason
+    assert bash(here, "git commit -m x").action == "block"  # names no other repository: the cwd verdict stands
+    # a certain target keeps its own verdict even when the command mentions the other repository
+    certain = bash(here, f'git commit -m "see {there.as_posix()}"')
+    assert certain.action == "block" and "cannot tell" not in certain.reason
+
+
 def test_a_dedicated_commit_hook_is_always_gated(tmp_path):
     repo = make_repo(tmp_path)
     no_command = decide(AgentEvent(event="before-commit", cwd=str(repo)))
