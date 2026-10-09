@@ -141,10 +141,15 @@ def _commit_repo(ev: AgentEvent, tool: str, cwd_repo: Path) -> Path:
     or the cwd repository whenever that is not certain: the git pre-commit hook backstops the rest.
     """
     from guard.core.repo_setup import repo_for_path
-    if not ev.command:
-        return cwd_repo
-    target = strict_target(ev.command, str(Path(ev.cwd or ".").resolve()), shell=SHELL_DIALECTS.get(tool))
+    target = _strict_commit_target(ev, tool)
     return (repo_for_path(target) if target else None) or cwd_repo
+
+
+def _strict_commit_target(ev: AgentEvent, tool: str) -> Optional[str]:
+    """The directory a commit command certainly runs in, or None when the command does not say for certain."""
+    if not ev.command:
+        return None
+    return strict_target(ev.command, str(Path(ev.cwd or ".").resolve()), shell=SHELL_DIALECTS.get(tool))
 
 
 def _command_repos(ev: AgentEvent, tool: str, cwd_repo: Path) -> List[Path]:
@@ -549,7 +554,17 @@ def decide(ev: AgentEvent) -> Decision:
             return _in_repo(Decision(action="block", reason=(
                 f"Guard: {_held_reason(t_session)}; its approval is not yours to commit. Use `git worktree add` "
                 "for parallel work, or wait until it is committed.")), target, repo)
-        return _in_repo(_commit_decision(target, t_session), target, repo)  # a harness hook dedicated to commits: always gated
+        decision = _commit_decision(target, t_session)  # a harness hook dedicated to commits: always gated
+        named = [r for r in _command_repos(ev, tool, repo) if not _same_repo(r, target)]
+        if decision.action == "block" and _same_repo(target, repo) and named and not _strict_commit_target(ev, tool):
+            # The target could not be read for certain, so the cwd repository was checked: its verdict
+            # would send the agent to approve the wrong repository. Forward slashes: bash never reads a
+            # backslash path as certain, so the suggested command would be refused again
+            other = named[0].as_posix()
+            return Decision(action="block", reason=(
+                f"Guard: cannot tell which repository this commit runs in; it names {other}. Commit there "
+                f"with one plain command, nothing chained after it: `git -C {other} commit -F <message file>`."))
+        return _in_repo(decision, target, repo)
 
     if ev.event == "before-edit":
         if tool in READ_TOOLS:
