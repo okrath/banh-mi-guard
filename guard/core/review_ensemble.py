@@ -116,8 +116,9 @@ def _parse_diff(parts: Sequence[str]) -> Dict[str, FileDiffInfo]:
                     info.old_ranges.append((old_start, old_end))
                     info.new_ranges.append((new_start, new_end))
                 continue
-            for fp in current_files:
-                get_or_create(fp).is_deleted |= d.deleted or d.raw.startswith("[file deleted:")
+            if d.kind in ("file", "header", "meta"):  # file details sit outside hunks
+                for fp in current_files:
+                    get_or_create(fp).is_deleted |= d.deleted or d.raw.startswith("[file deleted:")
 
     return files
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from guard.core.ocr_engine import DiffSummary, RuleViolation
+from guard.core.unified_diff import walk_diff
 
 # Known redundant npm packages easily replaced by native modern JS/TS runtime APIs
 REDUNDANT_NPM_PACKAGES = {
@@ -128,17 +129,12 @@ class SimplicityEngine:
         to catch unnecessary new dependencies when native or stdlib suffices.
         """
         violations: List[RuleViolation] = []
-        current_file = ""
-
-        for line in raw_diff.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:].strip()
+        for d in walk_diff(raw_diff):
+            if d.kind != "+":
                 continue
 
-            if not (line.startswith("+") and not line.startswith("+++")):
-                continue
-
-            added_content = line[1:].strip()
+            current_file = d.path
+            added_content = d.text.strip()
             cf_lower = current_file.replace("\\", "/").lower()
             manifest = next((m[1:] for m in MANIFESTS if m[0](cf_lower)), None)
             if not manifest or (cf_lower.endswith("go.mod") and added_content.endswith("// indirect")):

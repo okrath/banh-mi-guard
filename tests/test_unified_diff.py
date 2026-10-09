@@ -170,3 +170,20 @@ def test_diff_inspector_reads_a_path_holding_b_slash(tmp_path):
     diff = "diff --git a/x b/y.py b/x b/y.py\n--- a/x b/y.py\n+++ b/x b/y.py\n@@ -1 +1 @@\n-a\n+b\n"
     summary = GitDiffInspector(tmp_path).parse_diff(diff)
     assert [(f.path, f.insertions, f.deletions) for f in summary.files] == [("x b/y.py", 1, 1)]
+
+
+def test_dependency_scan_does_not_switch_file_on_an_added_plus_plus_line():
+    from guard.core.simplicity_engine import SimplicityEngine
+
+    real = 'diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -1 +1,2 @@\n+  "is-odd": "^3.0.1",\n {\n'
+    assert [v.rule_id for v in SimplicityEngine().scan_dependency_bloat(real)] == ["LAZY-001"]
+    fake = 'diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -0,0 +1,2 @@\n+++ b/package.json\n+  "is-odd": "^3.0.1",\n'
+    assert SimplicityEngine().scan_dependency_bloat(fake) == []
+
+
+def test_bench_reads_whole_paths_with_spaces():
+    from bench.metrics import _extract_diff_files
+
+    diff = 'diff --git a/my file.py b/my file.py\n@@ -1 +1 @@\n-a\n+b\ndiff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+    assert _extract_diff_files(diff) == {"my file.py", "café.py"}
+    assert _extract_diff_files("") == set()
