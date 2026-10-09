@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from guard.core.build_command import BUILD_HINT
 from guard.core.session import PostTaskRecord, PreTaskRecord, describe_owner
 from guard.reporters.markdown import (
     commit_instruction,
@@ -185,14 +186,22 @@ def _render_post_diff_and_build(post: PostTaskRecord) -> None:
         console.print(diff_table)
 
     if post.build_check:
-        b_color = "green" if post.build_check.passed else "red"
-        b_icon = "✅" if post.build_check.passed else "❌"
-        b_text = f"{b_icon} Command: [bold]{post.build_check.command}[/bold] | Exit Code: {post.build_check.exit_code} | Duration: {post.build_check.duration_s:.1f}s"
+        no_tests = post.build_check.no_tests
+        b_color = "yellow" if no_tests else "green" if post.build_check.passed else "red"
+        b_icon = "ℹ️" if no_tests else "✅" if post.build_check.passed else "❌"
+        b_text = f"{b_icon} Command: [bold]{escape(post.build_check.command)}[/bold] | Exit Code: {post.build_check.exit_code} | Duration: {post.build_check.duration_s:.1f}s"
+        if post.build_check.configured:
+            b_text += " | set with guard config build"
+        if no_tests:
+            b_text += f"\n[yellow]It found no test to run: nothing was tested. {escape(BUILD_HINT)}[/yellow]"
         if post.build_check.related:
             b_text += f"\n[dim]Related tests only ({len(post.build_check.related)} file(s)); the full suite runs before any approval.[/dim]"
         if not post.build_check.passed:
             b_text += f"\n[dim]{post.build_check.output[:300]}[/dim]"
         console.print(Panel(b_text, title="⚙️ Project Health & Build Verification", border_style=b_color))
+    else:
+        console.print(Panel(f"ℹ️ No automated build command detected. {escape(BUILD_HINT)}",
+                            title="⚙️ Project Health & Build Verification", border_style="yellow"))
 
 
 def _render_post_invariants(post: PostTaskRecord) -> None:

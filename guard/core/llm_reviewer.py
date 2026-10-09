@@ -206,7 +206,9 @@ class LLMReviewerEngine:
 
         # Check 1: Build check
         if build_check:
-            if build_check.passed:
+            if build_check.no_tests:
+                tech_notes.append(f"Compile Check: NO TESTS (`{build_check.command}` found no test to run; nothing was tested)")
+            elif build_check.passed:
                 tech_notes.append(f"Compile Check: PASSED (`{build_check.command}` in {build_check.duration_s:.1f}s)")
             else:
                 penalties.append(4.5)
@@ -436,7 +438,10 @@ class LLMReviewerEngine:
         known_rules: Optional[List[dict]],
     ) -> str:
         files_summary = ", ".join(f"{f.path} ({f.status})" for f in (diff_summary.files if diff_summary else []))
-        build_info = f"PASSED ({build_check.command} exit 0)" if (build_check and build_check.passed) else ("FAILED" if build_check else "NOT RUN")
+        if build_check and build_check.no_tests:
+            build_info = f"NO TESTS ({build_check.command} found no test to run; nothing was tested)"
+        else:
+            build_info = f"PASSED ({build_check.command} exit 0)" if (build_check and build_check.passed) else ("FAILED" if build_check else "NOT RUN")
         script = _resolved_script(build_check.output) if build_check else None
         if script:
             # `pnpm run build` alone does not tell the reviewer whether a typecheck ran

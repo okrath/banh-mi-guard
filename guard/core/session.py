@@ -97,6 +97,9 @@ class BuildCheckResult(BaseModel):
     output: str = ""
     duration_s: float
     related: List[str] = Field(default_factory=list)  # the test files of a related-only run; [] = the full suite
+    # pytest/unittest found no test (exit 5): not a failure, and nothing was tested either
+    no_tests: bool = False
+    configured: bool = False  # the command was set with `guard config build`, not detected
 
 
 class PostTaskRecord(BaseModel):
