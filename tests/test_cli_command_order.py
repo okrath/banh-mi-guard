@@ -86,10 +86,11 @@ def test_help_command_order():
     assert visible_commands == EXPECTED_HELP_COMMAND_ORDER
 
 
+# Click expands argv only when os.name is "nt"; faking it elsewhere breaks pathlib for the whole run
+@pytest.mark.skipif(os.name != "nt", reason="Click expands argv only on Windows")
 def test_cli_does_not_expand_glob_arguments_on_windows(monkeypatch):
     """On Windows Click must not expand globs in argv, so --scope patterns reach guard unchanged."""
     expanded = []
-    monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(click_utils, "_expand_args", lambda args: expanded.append(list(args)) or args)
     monkeypatch.setattr(guard.cli, "needs_refresh", lambda: False)
     monkeypatch.setattr(guard.cli, "maybe_trigger_background_update_check", lambda: None)
