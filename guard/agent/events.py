@@ -131,6 +131,14 @@ def _repo(cwd: str) -> Optional[Path]:
 SHELL_DIALECTS = {"bash": "bash", "powershell": "powershell"}
 
 
+def _shell_quote(word: str, tool: str) -> str:
+    """`word` quoted for the tool's shell, only when it needs it (PowerShell doubles a single quote)."""
+    quoted = shlex.quote(word)
+    if quoted == word or SHELL_DIALECTS.get(tool) != "powershell":
+        return quoted
+    return "'" + word.replace("'", "''") + "'"
+
+
 def _same_repo(a: Path, b: Path) -> bool:
     return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
 
@@ -140,8 +148,12 @@ def _commit_repo(ev: AgentEvent, tool: str, cwd_repo: Path) -> Path:
     The repository a commit command clearly runs in (`git -C <wt> commit`, `Set-Location <wt>; git commit`),
     or the cwd repository whenever that is not certain: the git pre-commit hook backstops the rest.
     """
+    return _repo_of(_strict_commit_target(ev, tool), cwd_repo)
+
+
+def _repo_of(target: Optional[str], cwd_repo: Path) -> Path:
+    """The repository of a strict commit target, or the cwd repository when there is none."""
     from guard.core.repo_setup import repo_for_path
-    target = _strict_commit_target(ev, tool)
     return (repo_for_path(target) if target else None) or cwd_repo
 
 
@@ -152,13 +164,14 @@ def _strict_commit_target(ev: AgentEvent, tool: str) -> Optional[str]:
     return strict_target(ev.command, str(Path(ev.cwd or ".").resolve()), shell=SHELL_DIALECTS.get(tool))
 
 
-def _command_repos(ev: AgentEvent, tool: str, cwd_repo: Path) -> List[Path]:
+def _command_repos(ev: AgentEvent, tool: str, cwd_repo: Path, commit_repo: Optional[Path] = None) -> List[Path]:
     """
     The cwd repository, then every other repository the command names a directory of (`cd <wt> && ...`).
     Only measured and claimed, never trusted to allow anything: naming one too many costs time only.
+    `commit_repo` is the commit's repository when the caller has already read it.
     """
     from guard.core.repo_setup import repo_for_path
-    out = [cwd_repo, _commit_repo(ev, tool, cwd_repo)]
+    out = [cwd_repo, commit_repo or _commit_repo(ev, tool, cwd_repo)]
     cwd = Path(ev.cwd or ".").resolve()
     for tok in _tokenize(ev.command or "")[:64]:
         word = tok.strip("\"'")
@@ -547,7 +560,8 @@ def decide(ev: AgentEvent) -> Decision:
 
     if ev.event == "before-commit" or (ev.event == "before-edit" and ev.command is not None
                                        and is_git_commit(ev.command, repo)):
-        target = _commit_repo(ev, tool, repo)
+        strict = _strict_commit_target(ev, tool)  # read once: the repository and the message below both need it
+        target = _repo_of(strict, repo)
         _touch(repo, ev, [target])
         t_session, t_other = load(target)
         if t_other:
@@ -555,15 +569,16 @@ def decide(ev: AgentEvent) -> Decision:
                 f"Guard: {_held_reason(t_session)}; its approval is not yours to commit. Use `git worktree add` "
                 "for parallel work, or wait until it is committed.")), target, repo)
         decision = _commit_decision(target, t_session)  # a harness hook dedicated to commits: always gated
-        named = [r for r in _command_repos(ev, tool, repo) if not _same_repo(r, target)]
-        if decision.action == "block" and _same_repo(target, repo) and named and not _strict_commit_target(ev, tool):
+        named = [r for r in _command_repos(ev, tool, repo, target) if not _same_repo(r, target)]
+        if decision.action == "block" and _same_repo(target, repo) and named and not strict:
             # The target could not be read for certain, so the cwd repository was checked: its verdict
             # would send the agent to approve the wrong repository. Forward slashes: bash never reads a
             # backslash path as certain, so the suggested command would be refused again
-            other = named[0].as_posix()
+            names = ", ".join(r.as_posix() for r in named)
+            commands = " or ".join(f"`git -C {_shell_quote(r.as_posix(), tool)} commit -F <message file>`" for r in named)
             return Decision(action="block", reason=(
-                f"Guard: cannot tell which repository this commit runs in; it names {other}. Commit there "
-                f"with one plain command, nothing chained after it: `git -C {other} commit -F <message file>`."))
+                f"Guard: cannot tell which repository this commit runs in; it names {names}. Commit in the one "
+                f"you mean with one plain command, nothing chained after it: {commands}."))
         return _in_repo(decision, target, repo)
 
     if ev.event == "before-edit":
