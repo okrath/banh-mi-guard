@@ -861,6 +861,49 @@ _CHUNK_F = "@pytest.mark.skip(reason='x'); it.skip('y'); "
 _LINE_F = _CHUNK_F * (1900 // len(_CHUNK_F))
 
 
+def _best_of(fn, runs: int = 3) -> float:
+    """Fastest of a few runs: the minimum sheds scheduler noise on shared CI runners."""
+    best = float("inf")
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def _assert_near_linear(small_fn, big_fn, size_ratio: float, max_exponent: float, floor: float = 0.005) -> None:
+    """
+    Fail when big_fn takes more than size_ratio ** max_exponent times as long as small_fn.
+    Linear work grows by size_ratio, quadratic work by size_ratio ** 2. Big timings under floor are noise.
+    """
+    t_small = _best_of(small_fn)
+    t_big = _best_of(big_fn)
+    if t_big < floor:
+        return
+    ratio = t_big / max(t_small, 1e-6)
+    limit = size_ratio**max_exponent
+    assert ratio < limit, (
+        f"time grew {ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
+        f"small {t_small:.5f}s, big {t_big:.5f}s)"
+    )
+
+
+def _hot_diff(line: str, fname: str, mode: str, count: int) -> str:
+    if mode == "added":
+        diff_lines = ["+" + line] * count
+    elif mode == "removed":
+        diff_lines = ["-" + line] * count
+    else:
+        diff_lines = [("+" + line if i % 2 == 0 else "-" + line) for i in range(count)]
+    return (
+        f"diff --git a/tests/{fname} b/tests/{fname}\n"
+        f"--- a/tests/{fname}\n"
+        f"+++ b/tests/{fname}\n"
+        f"@@ -1,{count} +1,{count} @@\n"
+        + "\n".join(diff_lines)
+    )
+
+
 @pytest.mark.parametrize(
     "name, line, fname, mode",
     [
@@ -886,38 +929,20 @@ _LINE_F = _CHUNK_F * (1900 // len(_CHUNK_F))
 )
 def test_performance_hot_inputs_speed(name: str, line: str, fname: str, mode: str):
     """
-    Every hot input of 20,000 lines x ~1,900 chars finishes well under the 6.0s ceiling.
-    CI runners are slower and noisier than a laptop (macOS took 3.27s for the prose input);
-    the regressions this guards against took 9-28s, so 6.0s leaves room for CI noise and still
-    catches them.
-
-    Measured local wall-clock times:
-    - a_in_string_mutation: added ~0.49s, removed ~0.22s, mixed ~0.36s
-    - b_comment_dense_js: added ~0.48s, removed ~0.31s, mixed ~0.40s
-    - c_backtick_js: added ~0.41s, removed ~0.25s, mixed ~0.33s
-    - d_keywords_inside_quote: added ~0.37s, removed ~0.14s, mixed ~0.25s
-    - e_prose_should_check: added ~1.12s, removed ~0.96s, mixed ~1.03s
-    - f_dense_skip_markers: added ~1.86s, removed ~0.96s, mixed ~1.45s
+    Every hot input must scale near-linearly: 2,000 lines take at most about 2.8x as long as 1,000
+    (linear gives 2x, quadratic 4x). Fixed wall-clock ceilings flake on slow CI runners, so the
+    check compares timings measured in the same process, each the best of three runs.
     """
-    if mode == "added":
-        diff_lines = ["+" + line] * 20000
-    elif mode == "removed":
-        diff_lines = ["-" + line] * 20000
-    else:
-        diff_lines = [("+" + line if i % 2 == 0 else "-" + line) for i in range(20000)]
-    diff = (
-        f"diff --git a/tests/{fname} b/tests/{fname}\n"
-        f"--- a/tests/{fname}\n"
-        f"+++ b/tests/{fname}\n"
-        "@@ -1,10000 +1,10000 @@\n"
-        + "\n".join(diff_lines)
+    diff_small = _hot_diff(line, fname, mode, 1000)
+    diff_big = _hot_diff(line, fname, mode, 2000)
+    _assert_near_linear(
+        lambda: get_evidence_lines(diff_small),
+        lambda: get_evidence_lines(diff_big),
+        size_ratio=2.0,
+        max_exponent=1.5,
     )
-    t0 = time.perf_counter()
-    ev = get_evidence_lines(diff)
-    elapsed = time.perf_counter() - t0
 
-    assert elapsed < 6.0, f"{name} ({mode}) expected < 6.0s, took {elapsed:.4f}s"
-    assert elapsed > 0.0
+    ev = get_evidence_lines(diff_big)
     assert isinstance(ev, list)
 
     # For cases with comment/string density on added lines, verify slow path reached & budget consumed

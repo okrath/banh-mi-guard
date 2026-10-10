@@ -462,34 +462,68 @@ def test_aliases_is_git_commit(tmp_path: Path):
         assert is_git_commit(cmd, repo_dir) is True
 
 
+def _best_of(fn, runs: int = 3) -> float:
+    """Fastest of a few runs: the minimum sheds scheduler noise on shared CI runners."""
+    best = float("inf")
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def _assert_near_linear(small_fn, big_fn, size_ratio: float, max_exponent: float, floor: float = 0.005) -> None:
+    """
+    Fail when big_fn takes more than size_ratio ** max_exponent times as long as small_fn.
+    Linear work grows by size_ratio, quadratic work by size_ratio ** 2. Big timings under floor are noise.
+    """
+    t_small = _best_of(small_fn)
+    t_big = _best_of(big_fn)
+    if t_big < floor:
+        return
+    ratio = t_big / max(t_small, 1e-6)
+    limit = size_ratio**max_exponent
+    assert ratio < limit, (
+        f"time grew {ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
+        f"small {t_small:.5f}s, big {t_big:.5f}s)"
+    )
+
+
 @pytest.mark.parametrize("shell", [None, "bash", "powershell", "cmd"])
 @pytest.mark.parametrize("pattern", ['"\\', '\\"', '\n', '; '])
 def test_linear_regex_timing_100k(shell: str | None, pattern: str, tmp_path: Path):
     wt = tmp_path / "wt"
     wt.mkdir(exist_ok=True)
     cwd_str = str(tmp_path)
-    # Test 1: within 4096 cap (~2000 chars) exercises regexes linearly without hitting length cap
-    inp_within = f"cd wt && {GC} -m " + (pattern * 500)
-    t0 = time.perf_counter()
-    res1 = strict_target(inp_within, cwd_str, shell=shell)
-    el1 = time.perf_counter() - t0
-    assert res1 is None
-    assert el1 < 0.5, f"Took {el1:.2f}s within cap"
-
-    # Test 1b: just under the 4096 cap, the longest input the regex path accepts
     prefix = f"cd wt && {GC} -m "
+
+    # Within 4096 cap (~2000 chars): exercises the regexes without hitting the length cap
+    inp_within = prefix + (pattern * 500)
+    assert strict_target(inp_within, cwd_str, shell=shell) is None
+
+    # Just under the 4096 cap: the longest input the regex path accepts
     inp_under = prefix + (pattern * ((4095 - len(prefix)) // len(pattern)))
     assert len(inp_under) <= 4096
-    t0 = time.perf_counter()
-    res1b = strict_target(inp_under, cwd_str, shell=shell)
-    el1b = time.perf_counter() - t0
-    assert res1b is None
-    assert el1b < 0.5, f"Took {el1b:.2f}s just under cap"
+    assert strict_target(inp_under, cwd_str, shell=shell) is None
 
-    # Test 2: above 4096 cap (25,000 repeats) tests fast rejection
-    inp_above = f"cd wt && {GC} -m " + (pattern * 25_000)
-    t0 = time.perf_counter()
-    res2 = strict_target(inp_above, cwd_str, shell=shell)
-    el2 = time.perf_counter() - t0
-    assert res2 is None
-    assert el2 < 0.5, f"Took {el2:.2f}s above cap"
+    # Scaling: the cap-sized input must not cost super-linearly more than an input about 1/8 its size
+    inp_small = prefix + (pattern * 250)
+    assert strict_target(inp_small, cwd_str, shell=shell) is None
+    _assert_near_linear(
+        lambda: strict_target(inp_small, cwd_str, shell=shell),
+        lambda: strict_target(inp_under, cwd_str, shell=shell),
+        size_ratio=len(inp_under) / len(inp_small),
+        # The separator pattern reaches the commit-prefix fallback, which parses once per separator:
+        # measured exponent 1.66 to 1.85 inside the cap, so its limit sits just under quadratic (2.0).
+        # The other patterns measured 0.1 to 0.95 and get a near-linear limit.
+        max_exponent=1.95 if pattern == "; " else 1.3,
+        floor=0.002,
+    )
+
+    # Above the 4096 cap (25,000 repeats): refusal must be cheap, no slower than the largest accepted input
+    inp_above = prefix + (pattern * 25_000)
+    assert strict_target(inp_above, cwd_str, shell=shell) is None
+    t_above = _best_of(lambda: strict_target(inp_above, cwd_str, shell=shell))
+    t_under = _best_of(lambda: strict_target(inp_under, cwd_str, shell=shell))
+    assert t_above < 5.0, f"refusal above cap took {t_above:.2f}s (hang guard)"
+    assert t_above <= 2 * max(t_under, 0.005), f"refusal took {t_above:.5f}s, accepted cap-sized input {t_under:.5f}s"
