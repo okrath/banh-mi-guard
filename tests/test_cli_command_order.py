@@ -2,11 +2,15 @@
 Pin top-level CLI command order to prevent silent reordering from import sorting.
 """
 
+import os
+import sys
 from typing import cast
 
+import pytest
 import typer
 import typer.core
 import typer.main
+from typer._click import utils as click_utils
 from typer.testing import CliRunner
 
 import guard.cli
@@ -80,3 +84,18 @@ def test_help_command_order():
         if not getattr(group.get_command(ctx, name), "hidden", False)
     ]
     assert visible_commands == EXPECTED_HELP_COMMAND_ORDER
+
+
+# Click expands argv only when os.name is "nt"; faking it elsewhere breaks pathlib for the whole run
+@pytest.mark.skipif(os.name != "nt", reason="Click expands argv only on Windows")
+def test_cli_does_not_expand_glob_arguments_on_windows(monkeypatch):
+    """On Windows Click must not expand globs in argv, so --scope patterns reach guard unchanged."""
+    expanded = []
+    monkeypatch.setattr(click_utils, "_expand_args", lambda args: expanded.append(list(args)) or args)
+    monkeypatch.setattr(guard.cli, "needs_refresh", lambda: False)
+    monkeypatch.setattr(guard.cli, "maybe_trigger_background_update_check", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["guard", "pre", "--help", "--scope", "tests/test_*.py"])
+    with pytest.raises(SystemExit) as exc:
+        guard.cli.main()
+    assert exc.value.code == 0
+    assert expanded == []
