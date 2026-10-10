@@ -1342,3 +1342,33 @@ def test_finalize_representatives_flags_unverified_location_and_records_provenan
     assert findings[0].description == "Stale cache [location not verified in the diff]"
     assert findings[1].description == "Null pointer in login [also found by: requirements]"
     assert provenance == {"v1": ["correctness", "requirements"], "u1": ["requirements"]}
+
+
+def test_ensemble_requirement_finding_advisory_only_when_diff_is_split():
+    """Requirement-only findings block in a single part and stay advisory when the diff has several parts."""
+    task = "Keep the service offline. Retries: max three"
+    answer = (
+        "SCORE: 6.0\nSUMMARY: ok\nFINDINGS:\n"
+        "- medium | requirement | src/app.py:7 | Keep the service offline | Calls the network\n"
+    )
+    part1 = "diff --git a/src/app.py b/src/app.py\n@@ -1,5 +1,5 @@\n+1\n"
+    part2 = "diff --git a/src/other.py b/src/other.py\n@@ -1,5 +1,5 @@\n+2\n"
+
+    def run(parts: List[str], partial: bool):
+        return run_ensemble(
+            lenses=[LENSES[0]],
+            call=lambda system, prompt: answer,
+            header="Header",
+            parts=parts,
+            parse=lambda t: parse_findings(t, task, partial=partial),
+            max_calls=10,
+            format_reminder=FORMAT_REMINDER,
+            system_prompt="",
+        )
+
+    single = run([part1], partial=False)
+    assert single is not None and any(f.blocking for f in single.findings)
+
+    split = run([part1, part2], partial=True)
+    assert split is not None and split.findings
+    assert not any(f.blocking for f in split.findings)

@@ -142,7 +142,7 @@ lists the rules that cover it; a cell with none relies on the LLM review (and on
 
 - **Blocks outright** (no LLM can approve): a failed build, a violated invariant, a CRITICAL rule, a file out of scope, a Git diff inspection or snapshot error (surfaced in `diff_summary.error`), with `--full` an OCR review that did not run or a high/critical OCR finding, and in `--focus dead-code` / `--focus simplicity` any finding of that pillar.
 - **Heuristic score:** starts at 10.0 and docks points for CRITICAL and HIGH rule violations, code hygiene (`DEAD-*`), simplicity (`LAZY-*`), out-of-scope files, invariant check failures, and Git diff inspection errors (which dock 5.0 points, dropping the score below 7.5 and forcing REVISE). Code hygiene and simplicity findings cost lightly compared to stability or security warnings. MEDIUM findings do not lower the score (they are advisory follow-ups). If the heuristic score falls below 7.5, the heuristic verdict is `REVISE`.
-- The configured LLM then reviews the report, the verified evidence and the diff (in parts when it is large) and gives the final `APPROVED` / `REVISE`. If it does not answer, the report says "Heuristic Gate (no LLM review)" and why.
+- The configured LLM then reviews the report, the verified evidence and the diff (in parts when it is large) and gives the final `APPROVED` / `REVISE`. In a split diff a finding that only quotes a task requirement is advisory, since the reviewer saw one part. If it does not answer, the report says "Heuristic Gate (no LLM review)" and why.
 
 ## Focus flag (`--focus`)
 
