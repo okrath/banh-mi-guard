@@ -737,3 +737,43 @@ def test_no_shared_keywords_for_same_file_defects() -> None:
                             f"Case '{case['id']}': defects '{d1['id']}' and '{d2['id']}' on file "
                             f"'{f}' share keyword(s): {shared}"
                         )
+
+
+def test_build_from_git_keeps_the_full_commit_diff(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=str(repo), check=True)
+
+    (repo / "core.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo / "other.py").write_text("OTHER = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-m", "chore: initial"], cwd=str(repo), check=True)
+
+    (repo / "core.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (repo / "other.py").write_text("OTHER = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-m", "feat: change both files"], cwd=str(repo), check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo), check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    labels_md = tmp_path / "labels.md"
+    labels_md.write_text(
+        "# Test Labels\n"
+        "| Case | Commit | Kind | Known defect (file, what) | Severity |\n"
+        "|---|---|---|---|---|\n"
+        f"| x01 | `{commit}` | correctness | core.py value is wrong | high |\n",
+        encoding="utf-8",
+    )
+
+    x01 = next(c for c in build_from_git(labels_md, repo) if c["id"] == "x01")
+    # The defect location is core.py, but the stored diff is the whole commit
+    assert x01["defects"][0]["file"] == "core.py"
+    assert "core.py" in x01["diff"] and "other.py" in x01["diff"]
+    full_diff = subprocess.run(
+        ["git", "show", "--format=", commit], cwd=str(repo), check=True, capture_output=True, text=True
+    ).stdout
+    assert x01["diff"] == full_diff
+    assert validate_case(x01, repo=repo) == []

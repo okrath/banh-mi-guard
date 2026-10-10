@@ -1258,3 +1258,85 @@ def test_compare_repeats_read_from_rows_when_summary_lacks_them():
 def test_estimate_ignores_runner_internal_keys():
     variant = {"reviewers": 3, "_budget_remaining": 99}
     assert estimate_case_worst_calls("diff --git a/x b/x", variant=variant) == 6
+
+
+def test_case_outcome_and_summarise_gate_eligible_recall():
+    case = {
+        "id": "g01",
+        "label": "defect",
+        "diff": "diff --git a/src/a.py b/src/a.py\n",
+        "defects": [
+            {"id": "d1", "file": "src/a.py", "kind": "correctness", "severity": "high", "keywords": ["kw1"]},
+            {"id": "d2", "file": "src/a.py", "kind": "correctness", "severity": "medium", "keywords": ["kw2"]},
+            {"id": "d3", "file": "src/a.py", "kind": "security", "severity": "critical", "keywords": ["kw3"]},
+            {"id": "d4", "file": "src/a.py", "kind": "maintainability", "severity": "high", "keywords": ["kw4"]},
+        ],
+    }
+    findings = [
+        {"id": "f1", "location": "src/a.py:1", "description": "kw1 bug", "blocking": True, "severity": "high"},
+        {"id": "f2", "location": "src/a.py:2", "description": "kw2 bug", "blocking": True, "severity": "medium"},
+        {"id": "f4", "location": "src/a.py:3", "description": "kw4 note", "blocking": False, "severity": "low"},
+    ]
+    out = case_outcome(case, verdict="REVISE", findings=findings)
+    # Eligible: d1 (high correctness) and d3 (critical security); d2 and d4 cannot block by severity or kind
+    assert out["gate_eligible_total"] == 2
+    assert out["gate_eligible_caught_blocking"] == 1
+    # d2 is caught by a blocking finding but is not gate-eligible, so it does not count
+    assert ("g01", "d2") in out["caught_blocking"]
+
+    summary = summarise([out])
+    assert summary["gate_eligible_total"] == 2
+    assert summary["gate_eligible_caught_blocking"] == 1
+    assert summary["recall_gate_eligible"] == 0.5
+    # Existing metrics are unchanged: 2 of 4 defects are caught blocking
+    assert summary["recall_blocking"] == 0.5
+    assert summary["defects_total"] == 4
+
+
+def test_summarise_gate_eligible_recall_without_eligible_defects_is_zero():
+    case = {
+        "id": "g02",
+        "label": "defect",
+        "defects": [{"id": "d1", "file": "a.py", "kind": "maintainability", "severity": "low", "keywords": ["x"]}],
+    }
+    summary = summarise([case_outcome(case, verdict="REVISE", findings=[])])
+    assert summary["gate_eligible_total"] == 0
+    assert summary["recall_gate_eligible"] == 0.0
+
+
+def test_gate_eligible_recall_in_report_and_compare():
+    summary = {
+        "recall_blocking": 0.5,
+        "recall_any": 0.5,
+        "recall_gate_eligible": 0.25,
+        "gate_eligible_caught_blocking": 1,
+        "gate_eligible_total": 4,
+        "defects_total": 4,
+        "per_case_rows": [],
+    }
+    base = {"calls": 10, "recall_blocking": 0.25, "recall_gate_eligible": 0.0}
+    comp = compare(base, summary)
+    assert comp["recall_gate_eligible"] == {"baseline": 0.0, "variant": 0.25}
+
+    md = to_markdown(summary, compare=comp)
+    assert "| Recall (gate-eligible) | 25.0% (1 / 4) |" in md
+    assert "| Recall (gate-eligible) baseline -> variant | 0.0% -> 25.0% | |" in md
+
+    # A result file written before this metric existed shows n/a instead of a fake 0%
+    old = compare({"calls": 10, "recall_blocking": 0.25}, {"calls": 10, "recall_blocking": 0.5})
+    assert old["recall_gate_eligible"] == {"baseline": None, "variant": None}
+    assert "n/a -> n/a" in to_markdown({"per_case_rows": []}, compare=old)
+
+
+def test_gate_eligible_predicate_and_percent_format():
+    from bench.metrics import GATE_SEVERITIES, _fmt_gate_recall, _gate_eligible
+
+    assert GATE_SEVERITIES == ("critical", "high")
+    assert _gate_eligible({"severity": "critical", "kind": "security"}) is True
+    assert _gate_eligible({"severity": "high", "kind": "correctness"}) is True
+    assert _gate_eligible({"severity": "medium", "kind": "correctness"}) is False
+    assert _gate_eligible({"severity": "high", "kind": "maintainability"}) is False
+    assert _gate_eligible({"severity": "high", "kind": "requirement"}) is False
+    assert _gate_eligible({}) is False
+    assert _fmt_gate_recall(None) == "n/a"
+    assert _fmt_gate_recall(0.25) == "25.0%"

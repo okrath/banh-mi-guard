@@ -8,7 +8,7 @@ A benchmark run feeds each stored case to the real `LLMReviewerEngine.review` wi
 
 ## The corpus
 
-- `bench/cases/*.json` are the stored cases: a task prompt, a diff, a label (`defect`, `clean` or `unlabelled`) and, for a defect case, the labelled defects with the file and the keywords that identify each one.
+- `bench/cases/*.json` are the stored cases: a task prompt, a diff, a label (`defect`, `clean` or `unlabelled`) and, for a defect case, the labelled defects with the file, the kind, the severity and the keywords that identify each one. The diff is the full commit, the same change the task prompt describes, so the review never sees a requirement whose files were cut out of the diff.
 - `bench/labels.md` explains where the labels come from. `bench/fixtures/` holds diffs that are not in Git history.
 - A finding counts as catching a defect when its location matches the defect's file and its text contains one of the defect's keywords (`match_defects` in `bench/metrics.py`).
 
@@ -44,6 +44,7 @@ python -m bench compare BASELINE.json VARIANT.json [--opt-in-by-design] [--out P
 `report` prints a summary and one row per case:
 
 - **Recall (blocking)** is the share of labelled defects caught by a finding that blocks; **Recall (any)** also counts advisory findings. A defect that is only advisory did not stop a bad change.
+- **Recall (gate-eligible)** is the share of the gate-eligible defects caught by a blocking finding. A defect is gate-eligible when its severity is critical or high and its kind is correctness or security, which are the only findings the gate blocks on (apart from a requirement quoted from the task). Defects of other severities or kinds cannot block by design, so Recall (blocking) can never reach 100% on a corpus that labels them; read this row for whether the gate stops the defects it is allowed to stop. The count in brackets is caught over eligible.
 - **False Blocks** counts clean cases that were rejected. A rejection of a clean change is a cost, not a safe default.
 - **Calls**, **Characters Sent** and **Total Time** are the cost of the run.
 - **Stability** is the share of repeats of a case that ended in the same outcome. With one repeat it is always 100%, which says nothing.

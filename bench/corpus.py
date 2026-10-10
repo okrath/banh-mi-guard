@@ -346,7 +346,6 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
         case_id = m.group(1) if m else first_row["case_id"]
 
         defects_list: list[dict[str, Any]] = []
-        named_files: list[str] = []
 
         for r in rows:
             d_id = r["case_id"]
@@ -366,9 +365,6 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
                 d_file = "guard/agent/bash.py"
             else:
                 d_file = "unknown"
-
-            if visible and d_file != "unknown" and d_file not in named_files:
-                named_files.append(d_file)
 
             summary = d_text
             keywords = DEFECT_KEYWORDS.get(d_id) or _extract_fallback_keywords(d_text, d_file)
@@ -446,37 +442,19 @@ def build_from_git(labels_md: Path | str, repo: Path | str) -> list[dict[str, An
                 raise RuntimeError(f"git diff-tree failed for commit '{commit}': {files_res.stderr}")
             all_changed_files = [f.strip() for f in (files_res.stdout or "").splitlines() if f.strip()]
 
-            # Restrict diff to named files if specified
-            if named_files:
-                diff_cmd = ["git", "show", "--format=", commit, "--"] + named_files
-                diff_res = subprocess.run(
-                    diff_cmd,
-                    cwd=str(repo_path),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                if diff_res.returncode != 0:
-                    raise RuntimeError(f"git show restricted failed for '{commit}': {diff_res.stderr}")
-                diff_text = diff_res.stdout or ""
-            else:
-                diff_cmd = ["git", "show", "--format=", commit]
-                diff_res = subprocess.run(
-                    diff_cmd,
-                    cwd=str(repo_path),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                if diff_res.returncode != 0:
-                    raise RuntimeError(f"git show failed for commit '{commit}': {diff_res.stderr}")
-                diff_text = diff_res.stdout or ""
+            diff_res = subprocess.run(
+                ["git", "show", "--format=", commit],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if diff_res.returncode != 0:
+                raise RuntimeError(f"git show failed for commit '{commit}': {diff_res.stderr}")
+            diff_text = diff_res.stdout or ""
 
             title = subject
-            if len(diff_text) > 120000 and named_files:
-                title = f"{subject} (restricted to {', '.join(named_files)})"
 
             prompt_body = f"\n\n{body}" if body else ""
             prompt = f"{subject}{prompt_body}\n\nFiles changed: {', '.join(all_changed_files)}"

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Set
 
+from guard.core.findings import BLOCKING_KINDS
 from guard.core.unified_diff import walk_diff
 
 # For backwards compatibility with callers importing ItemList
@@ -153,6 +154,15 @@ def match_defects(
     }
 
 
+# Severities the gate can block on; BLOCKING_KINDS are the kinds it blocks for (findings.classify).
+GATE_SEVERITIES = ("critical", "high")
+
+
+def _gate_eligible(defect: dict) -> bool:
+    """A labelled defect the gate is able to block: critical or high, correctness or security."""
+    return defect.get("severity") in GATE_SEVERITIES and defect.get("kind") in BLOCKING_KINDS
+
+
 def case_outcome(
     case: dict | Any,
     verdict: Any,
@@ -213,6 +223,12 @@ def case_outcome(
                 "missed": [(case_id, d_id) for d_id in matched["missed"]],
                 "extra_blocking": matched["extra_blocking"],
                 "defects_total": len(defects),
+                "gate_eligible_total": sum(1 for d in defects if _gate_eligible(d)),
+                "gate_eligible_caught_blocking": sum(
+                    1
+                    for d in defects
+                    if _gate_eligible(d) and str(d.get("id", "")) in matched["caught_blocking"]
+                ),
                 "false_block": False,
             }
         )
@@ -249,6 +265,8 @@ def summarise(outcomes: list[dict]) -> dict:
     defects_total = 0
     caught_blocking = 0
     caught_any = 0
+    gate_eligible_total = 0
+    gate_eligible_caught_blocking = 0
     clean_total = 0
     false_blocks = 0
     no_llm_count = 0
@@ -356,6 +374,8 @@ def summarise(outcomes: list[dict]) -> dict:
                 defects_total += r.get("defects_total", 0)
                 caught_blocking += len(r.get("caught_blocking", []))
                 caught_any += len(r.get("caught", []))
+                gate_eligible_total += r.get("gate_eligible_total", 0)
+                gate_eligible_caught_blocking += r.get("gate_eligible_caught_blocking", 0)
             elif label == "clean":
                 clean_total += 1
                 if r.get("false_block"):
@@ -409,11 +429,15 @@ def summarise(outcomes: list[dict]) -> dict:
 
     recall_blocking = (caught_blocking / defects_total) if defects_total > 0 else 0.0
     recall_any = (caught_any / defects_total) if defects_total > 0 else 0.0
+    recall_gate_eligible = (gate_eligible_caught_blocking / gate_eligible_total) if gate_eligible_total > 0 else 0.0
     overall_stability = sum(case_stabilities) / len(case_stabilities) if case_stabilities else 1.0
 
     return {
         "recall_blocking": round(recall_blocking, 4),
         "recall_any": round(recall_any, 4),
+        "recall_gate_eligible": round(recall_gate_eligible, 4),
+        "gate_eligible_total": gate_eligible_total,
+        "gate_eligible_caught_blocking": gate_eligible_caught_blocking,
         "defects_total": defects_total,
         "caught_blocking": caught_blocking,
         "caught_any": caught_any,
@@ -604,6 +628,8 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
 
     b_recall = float(baseline.get("recall_blocking", baseline.get("recall_any", 0.0)))
     v_recall = float(variant.get("recall_blocking", variant.get("recall_any", 0.0)))
+    b_gate = baseline.get("recall_gate_eligible")
+    v_gate = variant.get("recall_gate_eligible")
     extra_calls = variant_calls - baseline_calls
 
     if extra_calls > 0:
@@ -648,8 +674,16 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     }
     if opt_in_by_design or extra_calls > 0:
         result["recall_gained_per_extra_call"] = recall_gained_per_extra_call
+    result["recall_gate_eligible"] = {
+        "baseline": None if b_gate is None else float(b_gate),
+        "variant": None if v_gate is None else float(v_gate),
+    }
 
     return result
+
+
+def _fmt_gate_recall(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.1%}"
 
 
 def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
@@ -661,6 +695,8 @@ def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
         "| Metric | Value |",
         "| --- | --- |",
         f"| Recall (blocking) | {summary.get('recall_blocking', 0.0):.1%} |",
+        f"| Recall (gate-eligible) | {_fmt_gate_recall(summary.get('recall_gate_eligible'))} "
+        f"({summary.get('gate_eligible_caught_blocking', 0)} / {summary.get('gate_eligible_total', 0)}) |",
         f"| Recall (any) | {summary.get('recall_any', 0.0):.1%} |",
         f"| Defects Total | {summary.get('defects_total', 0)} |",
         f"| Caught (blocking) | {summary.get('caught_blocking', 0)} |",
@@ -692,6 +728,12 @@ def to_markdown(summary: dict, compare: Optional[dict] = None) -> str:
         ])
         if "recommendation" in compare:
             lines.append(f"| Recommendation | **{compare['recommendation']}** | |")
+        if "recall_gate_eligible" in compare:
+            gate = compare["recall_gate_eligible"]
+            lines.append(
+                f"| Recall (gate-eligible) baseline -> variant | "
+                f"{_fmt_gate_recall(gate.get('baseline'))} -> {_fmt_gate_recall(gate.get('variant'))} | |"
+            )
         if "recall_gained_per_extra_call" in compare:
             lines.append(f"| Recall Gain / Extra Call | {compare['recall_gained_per_extra_call']:.6f} | |")
 
