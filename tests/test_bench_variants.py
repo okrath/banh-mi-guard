@@ -14,7 +14,7 @@ from guard.core.review_options import ReviewOptions
 
 
 def test_expected_variant_names() -> None:
-    assert list(VARIANTS) == ["baseline", "tests", "threat", "validate", "panel3", "panel5", "all"]
+    assert list(VARIANTS) == ["baseline", "tests", "threat", "validate", "promote", "promote_validate", "panel3", "panel5", "all"]
 
 
 @pytest.mark.parametrize("name", list(VARIANTS))

@@ -1340,3 +1340,13 @@ def test_gate_eligible_predicate_and_percent_format():
     assert _gate_eligible({}) is False
     assert _fmt_gate_recall(None) == "n/a"
     assert _fmt_gate_recall(0.25) == "25.0%"
+
+
+def test_compare_is_inconclusive_when_a_run_has_cases_without_an_llm_answer():
+    """A variant that lost its LLM midway is judged on the few cases left: never adopt it."""
+    base = {"caught_blocking": [("c01", "c01")], "false_blocks": 0, "calls": 10, "no_llm_count": 0}
+    var = {"caught_blocking": [("c01", "c01"), ("c02", "c02")], "false_blocks": 0, "calls": 12, "no_llm_count": 3}
+    res = compare(base, var)
+    assert res["adopt"] is False
+    assert res["inconclusive"] is True
+    assert "without an LLM answer" in res["recommendation"]

@@ -637,7 +637,19 @@ def compare(baseline: dict, variant: dict, *, opt_in_by_design: bool = False) ->
     else:
         recall_gained_per_extra_call = 0.0
 
-    if inconclusive:
+    # Cases with no LLM answer are left out of the checks above, so a run that lost its LLM midway would
+    # otherwise be judged on the few cases that still ran
+    b_no_llm = _to_int(baseline.get("no_llm_count", 0))
+    v_no_llm = _to_int(variant.get("no_llm_count", 0))
+    if b_no_llm or v_no_llm:
+        inconclusive = True
+    if inconclusive and (b_no_llm or v_no_llm) and b_repeats == v_repeats:
+        adopt = False
+        recommendation = (
+            f"inconclusive: cases without an LLM answer (baseline {b_no_llm}, variant {v_no_llm}); "
+            "rerun once the LLM answers every case"
+        )
+    elif inconclusive:
         adopt = False
         recommendation = f"inconclusive: repeats differ or unknown (baseline {b_repeats}, variant {v_repeats}); rerun with the same --repeats"
     elif opt_in_by_design:

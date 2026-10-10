@@ -945,3 +945,19 @@ def test_requirement_only_finding_still_revises_single_part(monkeypatch: pytest.
     )
     assert verdict.verdict == ReviewVerdict.REVISE
     assert verdict.findings[0].blocking
+
+
+@pytest.mark.parametrize("line, promote, blocks", [
+    ("- medium | correctness | a.py:3 | - | input: cd x 2>&1 && commit -> the commit runs in the wrong repo", True, True),
+    ("- medium | security | a.py:3 | - | input: a forged session.json -> git commit passes", True, True),
+    ("- medium | correctness | a.py:3 | - | input: cd x 2>&1 && commit -> the commit runs in the wrong repo", False, False),
+    ("- medium | correctness | a.py:3 | - | might misbehave on odd paths", True, False),
+    ("- low | correctness | a.py:3 | - | input: x -> y", True, False),
+    ("- medium | maintainability | a.py:3 | - | input: x -> y", True, False),
+])
+def test_promote_blocks_only_medium_correctness_or_security_with_a_concrete_input(line, promote, blocks):
+    """With promote, guard blocks a medium correctness/security finding that names a failing input; nothing else changes."""
+    findings = parse_findings(f"FINDINGS:\n{line}\n", "task", promote=promote)
+    assert findings is not None and len(findings) == 1
+    assert findings[0].blocking is blocks
+    assert findings[0].severity == line.split("|")[0].strip("- ").strip()

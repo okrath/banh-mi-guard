@@ -42,6 +42,7 @@ def test_default_review_options() -> None:
     assert opts.test_checklist is False
     assert opts.threat_frame == "off"
     assert opts.validate_findings is False
+    assert opts.promote_concrete is False
     assert opts.reviewers == 1
     assert opts.max_llm_calls == 12
     assert opts.stage_timeout_s == 900
@@ -50,7 +51,7 @@ def test_default_review_options() -> None:
     assert loaded == opts
 
     sources = effective_sources()
-    assert len(sources) == 9
+    assert len(sources) == 10
     for field, source in sources.items():
         assert source == "default", f"Field {field} should be 'default', got {source}"
 
@@ -456,7 +457,7 @@ def test_unknown_keys_ignored_in_loading() -> None:
     sources = effective_sources(global_cfg={"review": {"extra": 1}}, cli={"cli_unknown": 2})
     assert "extra" not in sources
     assert "cli_unknown" not in sources
-    assert len(sources) == 9
+    assert len(sources) == 10
 
 
 def test_ignored_keys_reporting() -> None:

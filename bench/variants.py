@@ -29,6 +29,7 @@ _BASE: dict[str, Any] = {
     "test_checklist": False,
     "threat_frame": "off",
     "validate_findings": False,
+    "promote_concrete": False,
     "reviewers": 1,
 }
 
@@ -37,6 +38,8 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "tests": {**_BASE, "test_checklist": True},
     "threat": {**_BASE, "threat_frame": "auto"},
     "validate": {**_BASE, "validate_findings": True, "max_llm_calls": _STAGE_CAP},
+    "promote": {**_BASE, "promote_concrete": True},
+    "promote_validate": {**_BASE, "promote_concrete": True, "validate_findings": True, "max_llm_calls": _STAGE_CAP},
     "panel3": {**_BASE, "reviewers": 3, "max_llm_calls": _STAGE_CAP},
     "panel5": {**_BASE, "reviewers": 5, "max_llm_calls": _STAGE_CAP},
     "all": {
