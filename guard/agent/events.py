@@ -316,6 +316,16 @@ def _from_another_session(ev: AgentEvent, session) -> bool:
     return bool(ev.agent_session and owner and owner["session"] != session_key(ev))
 
 
+def _unclear_commit(repos: List[Path], tool: str) -> Decision:
+    """The refusal for a commit whose repository is not certain; forward slashes, since bash never reads a
+    backslash path as certain and the suggested command would be refused again."""
+    names = ", ".join(r.as_posix() for r in repos)
+    commands = " or ".join(f"`git -C {_shell_quote(r.as_posix(), tool)} commit -F <message file>`" for r in repos)
+    return Decision(action="block", reason=(
+        f"Guard: cannot tell which repository this commit runs in; it names {names}. Commit in the one "
+        f"you mean with one plain command, nothing chained after it: {commands}."))
+
+
 def _held_reason(session) -> str:
     owner, pre = _owner(session), session.pre
     task = " ".join(pre.prompt.split())[:80]
@@ -560,25 +570,23 @@ def decide(ev: AgentEvent) -> Decision:
 
     if ev.event == "before-commit" or (ev.event == "before-edit" and ev.command is not None
                                        and is_git_commit(ev.command, repo)):
-        strict = _strict_commit_target(ev, tool)  # read once: the repository and the message below both need it
+        strict = _strict_commit_target(ev, tool)  # read once: the repository and the messages below both need it
         target = _repo_of(strict, repo)
         _touch(repo, ev, [target])
         t_session, t_other = load(target)
+        named = [r for r in _command_repos(ev, tool, repo, target) if not _same_repo(r, target)]
+        unclear = not strict and bool(ev.command)  # a command names no certain repository: the cwd is only a guess
         if t_other:
+            if unclear:
+                return _in_repo(_unclear_commit(named or [repo], tool), target, repo)
             return _in_repo(Decision(action="block", reason=(
                 f"Guard: {_held_reason(t_session)}; its approval is not yours to commit. Use `git worktree add` "
                 "for parallel work, or wait until it is committed.")), target, repo)
         decision = _commit_decision(target, t_session)  # a harness hook dedicated to commits: always gated
-        named = [r for r in _command_repos(ev, tool, repo, target) if not _same_repo(r, target)]
-        if decision.action == "block" and _same_repo(target, repo) and named and not strict:
+        if decision.action == "block" and _same_repo(target, repo) and named and unclear:
             # The target could not be read for certain, so the cwd repository was checked: its verdict
-            # would send the agent to approve the wrong repository. Forward slashes: bash never reads a
-            # backslash path as certain, so the suggested command would be refused again
-            names = ", ".join(r.as_posix() for r in named)
-            commands = " or ".join(f"`git -C {_shell_quote(r.as_posix(), tool)} commit -F <message file>`" for r in named)
-            return Decision(action="block", reason=(
-                f"Guard: cannot tell which repository this commit runs in; it names {names}. Commit in the one "
-                f"you mean with one plain command, nothing chained after it: {commands}."))
+            # would send the agent to approve the wrong repository.
+            return _unclear_commit(named, tool)
         return _in_repo(decision, target, repo)
 
     if ev.event == "before-edit":

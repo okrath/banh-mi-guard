@@ -2,6 +2,8 @@
 Unit tests for LLM Reviewer Engine (Final Safety Gate).
 """
 
+import threading
+
 import pytest
 
 from guard.core.invariant_eval import DomainType, InvariantCheck, InvariantResult
@@ -341,3 +343,142 @@ def test_review_prompt_contains_checklist(focus):
     assert "Blocking calls" in full_text
     assert "dead-code" in full_text
     assert "over-engineering" in full_text
+
+
+def _helper_engine():
+    engine = LLMReviewerEngine(config=None)
+    engine._task_text = "Refactor the review stage"  # set by _evaluate_with_llm before the panel runs
+    return engine
+
+
+def _panel_text(finding_line=None):
+    body = f"- {finding_line}\n" if finding_line else "None\n"
+    return f"SCORE: 9.0\nSUMMARY: ok\nFINDINGS:\n{body}"
+
+
+def test_security_sensitive_diff_activates_threat_frame_in_header():
+    from guard.core.llm_reviewer import THREAT_FRAME_INSTRUCTIONS
+    from guard.core.review_options import ReviewOptions
+
+    raw = "diff --git a/src/auth/login.py b/src/auth/login.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+    _, header, threat_active = _helper_engine()._build_review_context(
+        "Change login", "backend", "model", "all", ReviewOptions(threat_frame="auto"),
+        DiffSummary(raw_diff=raw), None, [], None, None, None, None, None,
+    )
+    assert threat_active is True
+    assert "Security-sensitive surface detected" in header
+    assert THREAT_FRAME_INSTRUCTIONS in header
+
+
+def test_reviewer_panel_below_budget_runs_no_reviewer_and_says_so():
+    from guard.core.review_options import ReviewOptions
+
+    calls = []
+    # Worst case is 2 reviewers * 2 calls * 1 part = 4, but only 3 calls remain
+    verdict, note = _helper_engine()._run_reviewer_panel(
+        ReviewOptions(reviewers=2, max_llm_calls=3), ["part"], "header", "system", "all", False,
+        lambda s, p: calls.append(p) or "", 0,
+    )
+    assert verdict is None
+    assert note == "Reviewer panel unavailable (budget exceeded); one reviewer ran."
+    assert calls == []
+
+
+def test_reviewer_panel_with_no_usable_lens_falls_back_with_a_note():
+    from guard.core.review_options import ReviewOptions
+
+    verdict, note = _helper_engine()._run_reviewer_panel(
+        ReviewOptions(reviewers=2), ["part"], "header", "system", "all", False,
+        lambda s, p: "unparseable answer without a findings section", 0,
+    )
+    assert verdict is None
+    assert note == "Reviewer panel unavailable (insufficient usable lenses); one reviewer ran."
+
+
+def test_reviewer_panel_blocking_finding_gives_revise_verdict():
+    from guard.core.review_options import ReviewOptions
+
+    line = "high | correctness | src/app.py:7 | - | Off-by-one in the loop bound"
+    part = "diff --git a/src/app.py b/src/app.py\n@@ -0,0 +1,10 @@\n" + "+line\n" * 10
+    verdict, note = _helper_engine()._run_reviewer_panel(
+        ReviewOptions(reviewers=2), [part], "header", "system", "all", False,
+        lambda s, p: _panel_text(line), 0,
+    )
+    assert note is None
+    assert verdict.verdict == ReviewVerdict.REVISE and verdict.score == 6.0
+    assert verdict.reviewer_model == "Panel (2 lenses)" and verdict.review_mode == "llm_deep"
+    assert any("src/app.py:7" in step for step in verdict.remediation_steps)
+
+
+@pytest.mark.parametrize("still_blocking, expected", [(False, ReviewVerdict.APPROVED), (True, ReviewVerdict.REVISE)])
+def test_validation_verdict_follows_the_findings_that_still_block(still_blocking, expected):
+    from guard.core.findings import Finding
+    from guard.core.llm_reviewer import LLMReviewVerdict
+
+    original = Finding(id="f1", severity="high", kind="correctness", location="a.py:1",
+                       description="Bug", blocking=True)
+    merged = LLMReviewVerdict(verdict=ReviewVerdict.REVISE, score=6.0, summary="s",
+                              remediation_steps=["stale step"])
+    LLMReviewerEngine._apply_validation_verdict(merged, [original.model_copy(update={"blocking": still_blocking})])
+    assert merged.verdict == expected
+    if still_blocking:
+        assert merged.remediation_steps == ["[f1] a.py:1: Bug"]
+    else:
+        assert merged.score == 8.0 and merged.remediation_steps == []
+
+
+def test_finding_rejected_by_validation_is_demoted_and_logged(monkeypatch):
+    from guard.core.findings import Finding
+    from guard.core.llm_reviewer import LLMReviewVerdict
+    from guard.core.review_options import ReviewOptions
+
+    finding = Finding(id="f1", severity="high", kind="correctness", location="a.py:1",
+                      description="Bug", blocking=True)
+    merged = LLMReviewVerdict(verdict=ReviewVerdict.REVISE, score=6.0, summary="s", findings=[finding])
+    demoted = finding.model_copy(update={"blocking": False})
+    validation = type("V", (), {"finding_id": "f1", "verdict": "refuted", "evidence_verified": True,
+                                "reason": "r"})()
+    monkeypatch.setattr("guard.core.llm_reviewer.validate_findings", lambda **kw: ([demoted], [validation]))
+    records, note = _helper_engine()._validate_blocking_findings(
+        merged, "diff", "task", ReviewOptions(validate_findings=True), True, 1,
+        lambda s, p: "", threading.Lock(), threading.Event(),
+    )
+    assert note is None
+    assert records == [{"finding_id": "f1", "verdict": "refuted", "evidence_verified": True, "reason": "r"}]
+    assert merged.verdict == ReviewVerdict.APPROVED and merged.findings == [demoted]
+
+
+def test_validation_skipped_over_budget_leaves_findings_untouched(monkeypatch):
+    from guard.core.findings import Finding
+    from guard.core.llm_reviewer import LLMReviewVerdict
+    from guard.core.review_options import ReviewOptions
+
+    finding = Finding(id="f1", severity="high", kind="correctness", location="a.py:1",
+                      description="Bug", blocking=True)
+    merged = LLMReviewVerdict(verdict=ReviewVerdict.REVISE, score=6.0, summary="s", findings=[finding])
+    called = []
+    monkeypatch.setattr("guard.core.llm_reviewer.validate_findings", lambda **kw: called.append(kw))
+    records, note = _helper_engine()._validate_blocking_findings(
+        merged, "diff", "task", ReviewOptions(validate_findings=True, max_llm_calls=3), True, 3,
+        lambda s, p: "", threading.Lock(), threading.Event(),
+    )
+    assert records == [] and note == "Finding validation skipped (budget exceeded)."
+    assert called == [] and merged.findings == [finding]
+
+
+def test_coverage_notes_are_empty_when_off_and_partition_gaps_then_notes_when_on():
+    from guard.core.diff_partition import DiffPartition
+    from guard.core.llm_reviewer import LLMReviewVerdict
+    from guard.core.review_coverage import build_coverage_notes
+    from guard.core.review_options import ReviewOptions
+
+    partition = DiffPartition(parts=["a"], skipped_files=["big.bin"], omitted_deleted=[], cut_parts=0,
+                              files_per_part=[["a"]])
+    merged = LLMReviewVerdict(verdict=ReviewVerdict.APPROVED, score=8.5, summary="s")
+
+    LLMReviewerEngine._set_coverage_notes(merged, ReviewOptions(coverage_notes=False), partition, [], ["x"])
+    assert merged.coverage_notes == []
+
+    LLMReviewerEngine._set_coverage_notes(merged, ReviewOptions(coverage_notes=True), partition, [], ["panel note"])
+    gaps = build_coverage_notes(partition, [])
+    assert gaps and merged.coverage_notes == gaps + ["panel note"]

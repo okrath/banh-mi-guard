@@ -53,6 +53,15 @@ RESOLVE_CASES = [
     ("git -C wt commit -m 'sửa lỗi'", None, "wt"),
     ("git -C wt commit -m \"fix; a & b #12\"", None, "wt"),
     ("git -C wt commit -m \"feat!: x\"", None, "wt"),
+    # Parts after the commit segment are not read: only the segments up to it must parse
+    ("cd wt && git add a && git commit -q -m \"x\" && git push -q 2>&1 | grep -v \"^remote:\"; git log --oneline -1", "bash", "wt"),
+    ("cd wt && git commit -m x && gh pr create --body \"$(git log -1)\"", "bash", "wt"),
+    ("git -C wt commit -m x; echo $HOME > out.txt", "bash", "wt"),
+    ("Set-Location wt; git commit -m x; Write-Output $x", "powershell", "wt"),
+    ("cd wt && git commit -m x; git log --oneline -1", "bash", "wt"),
+    ("cd wt && git commit -m x && git push -q 2>&1 | grep -v \"^remote:\"", "bash", "wt"),
+    ("cd wt && git commit -m x && npm ci", "bash", "wt"),
+    ("cd wt && git commit -m x; echo python", "bash", "wt"),
 ]
 
 
@@ -284,7 +293,59 @@ NONE_CASES = [
     ("git commit \xe9", None),
     ("cd wt && git commit " + ("x" * 4100), None),
     ("git commit " + ("x" * 4096), None),
+
+    # Unknown text before or inside the commit segment, or a commit after the first one
+    ("cd \"$(pwd)/wt\" && git commit -m x && git push", "bash"),
+    ("cd `pwd`/wt && git commit -m x && git push", "bash"),
+    ("cd {wt} && git commit -m \"a `b`\" && git push", "bash"),
+    ("cd {wt} && git commit -m \"$(date)\"; git push", "bash"),
+    ("cd {wt} | git commit -m x && git push", "bash"),
+    ("cd {wt} && git commit -m x && cd .. && git commit -m y | cat", "bash"),
+    ("cd {wt} && git commit -m x; cd ..; git commit -m y | cat", "bash"),
+    ("cd {wt} && git commit -m x; git -C .. commit -m y; echo $HOME", "bash"),
+
+    # A second commit hidden in the text after the first one, quoted or not
+    ("cd {wt} && git commit -m x; cd {wtx} && git commit -m y", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && eval \"git commit -m y\"", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && bash -c \"git commit -m y\"", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && $(echo git) commit -m y", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git -c a=b commit -m y", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git ci -m y", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git -C {wtx} log", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git merge z", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git cherry-pick abc", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git rebase main", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git pull", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx} && git commit --amend --no-edit", "bash"),
+    ("cd {wt} && git commit -m x; python -c \"print(1)\"", "bash"),
+    ("cd {wt} && git commit -m x; source ./run.sh", "bash"),
+    ("cd {wt} && git commit -m x & cd {wtx} && git push", "bash"),
+    ("cd {wt} && git commit -m x; cd {wtx}\n/bin/bash -l", "bash"),
+    ("cd {wt} && git commit -m x; sudo -u root bash -l", "bash"),
+    ("cd {wt} && git commit -m x; env A=1 python -V", "bash"),
+    ("cd {wt} && git commit -m x; sh -l", "bash"),
+    ("cd {wt} && git commit -m x; then bash x.sh", "bash"),
+    ("cd {wt} && git commit -m x; (sh -l)", "bash"),
+    ("cd {wt} && git commit -m x; \"bash\" -l", "bash"),
+    ("cd {wt} && git commit -m x; setsid bash -l", "bash"),
+    ("cd {wt} && git commit -m x; su -c \"sh -l\"", "bash"),
+    ("cd {wt} && git commit -m x; g=git; $g merge z", "bash"),
 ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive-letter paths are only read as drives on Windows")
+@pytest.mark.parametrize("cmd_tmpl", [
+    "cd {msys} && git commit -m x",
+    "git -C {msys} commit -m x",
+    "cd {msys} && git commit -m x && gh pr create --body \"$(git log -1)\"",
+])
+def test_msys_drive_path_resolves_on_windows(cmd_tmpl: str, tmp_path: Path):
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    posix = wt.resolve().as_posix()  # C:/Users/...
+    msys = "/" + posix[0].lower() + posix[2:]  # /c/Users/...
+    assert strict_target(cmd_tmpl.format(msys=msys), str(tmp_path), shell="bash") == os.path.normcase(str(wt.resolve()))
+    assert strict_target(f"cd {msys} && git commit -m x", str(tmp_path)) is None  # MSYS paths are a bash form only
 
 
 @pytest.mark.parametrize("cmd_tmpl,shell", NONE_CASES)

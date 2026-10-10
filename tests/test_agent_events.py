@@ -575,6 +575,18 @@ def test_another_session_cannot_commit_and_gets_no_pre_hint(tmp_path):
     assert state["sessions"]["claude-code:sess-B"]["user_prompt"] == "B: what is next?" and "user_prompt" not in state
 
 
+@pytest.mark.parametrize("command", ['cd "$(pwd)" && git ' + 'commit -m x', 'cd `pwd` && git ' + 'commit -m x && git push | cat'])
+def test_an_unclear_commit_is_not_blamed_on_another_session(tmp_path, command):
+    repo = make_repo(tmp_path)
+    owned_pre(repo)
+    blamed = ev(repo, "before-edit", "sess-B", tool="Bash", command=command, call_id="b")
+    assert blamed.action == "block" and "cannot tell which repository" in blamed.reason
+    assert "held by another" not in blamed.reason
+    # a certain target held by the owner keeps the held verdict
+    certain = ev(repo, "before-edit", "sess-B", tool="Bash", command="git " + "commit -m x", call_id="c")
+    assert certain.action == "block" and "not yours to commit" in certain.reason
+
+
 def test_the_post_report_names_the_owner(tmp_path, fake_ocr_review):
     repo = make_repo(tmp_path)
     owned_pre(repo)

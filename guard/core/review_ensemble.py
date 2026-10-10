@@ -265,101 +265,58 @@ def _build_part_prompt(header: str, part: str, part_index: int, total_parts: int
     return f"{part_indicator}{diff_block}"
 
 
-def run_ensemble(
-    lenses: Sequence[Lens],
-    call: Callable[[str, str], str],
-    header: str,
+_LensOutcome = Tuple[Lens, Optional[List[List[Finding]]], List[List[Finding]]]
+
+
+def _review_lens_parts(
+    lens_obj: Lens,
     parts: Sequence[str],
-    parse: Callable[[str], Optional[List[Finding]]],
-    *,
-    max_calls: int,
-    format_reminder: str,
+    header: str,
     system_prompt: str,
-    stage_timeout_s: float = 900.0,
-) -> Optional[EnsembleResult]:
-    """
-    Run an opt-in panel of independent review lenses over diff parts on daemon threads.
+    format_reminder: str,
+    parse: Callable[[str], Optional[List[Finding]]],
+    make_call: Callable[[str, str], str],
+    cancelled: threading.Event,
+) -> List[List[Finding]]:
+    """Review each part with one lens, retrying a bad format once; stops at the first failed part."""
+    combined_system = _combine_system_prompt(system_prompt, lens_obj.instruction)
+    completed_findings: List[List[Finding]] = []
 
-    Returns the union of evidence-checked findings, or None if the worst-case
-    call budget exceeds max_calls or too few lenses produce a parseable answer.
-    """
-    if not lenses or not parts:
-        return None
-
-    # Pre-check: worst case is 2 calls per (lens, part) with format retry
-    worst_case_calls = 2 * len(lenses) * len(parts)
-    if worst_case_calls > max_calls:
-        return None
-
-    counter_lock = threading.Lock()
-    cancelled = threading.Event()
-    semaphore = threading.Semaphore(3)
-    calls_made = 0
-    chars_sent = 0
-
-    def make_call(system: str, prompt: str) -> str:
-        nonlocal calls_made, chars_sent
+    for i, part in enumerate(parts, start=1):
         if cancelled.is_set():
-            raise RuntimeError("ensemble stage cancelled")
-        with counter_lock:
+            break
+
+        prompt_text = _build_part_prompt(header, part, i, len(parts))
+        parsed_findings: Optional[List[Finding]] = None
+
+        for attempt in range(2):
             if cancelled.is_set():
-                raise RuntimeError("ensemble stage cancelled")
-            calls_made += 1
-            chars_sent += len(system) + len(prompt)
-        return call(system, prompt)
+                break
+            used_prompt = prompt_text if attempt == 0 else prompt_text + format_reminder
+            try:
+                response = make_call(combined_system, used_prompt)
+            except Exception:
+                break
 
-    result_queue: queue.Queue[
-        Tuple[Lens, Optional[List[List[Finding]]], List[List[Finding]]]
-    ] = queue.Queue()
+            parsed = parse(response)
+            if parsed is not None:
+                parsed_findings = parsed
+                break
 
-    def lens_worker(lens_obj: Lens) -> None:
-        try:
-            with semaphore:
-                if cancelled.is_set():
-                    result_queue.put((lens_obj, None, []))
-                    return
+        if parsed_findings is None:
+            break
 
-                combined_system = _combine_system_prompt(system_prompt, lens_obj.instruction)
-                completed_findings: List[List[Finding]] = []
+        completed_findings.append(parsed_findings)
 
-                for i, part in enumerate(parts, start=1):
-                    if cancelled.is_set():
-                        break
+    return completed_findings
 
-                    prompt_text = _build_part_prompt(header, part, i, len(parts))
-                    parsed_findings: Optional[List[Finding]] = None
 
-                    for attempt in range(2):
-                        if cancelled.is_set():
-                            break
-                        used_prompt = prompt_text if attempt == 0 else prompt_text + format_reminder
-                        try:
-                            response = make_call(combined_system, used_prompt)
-                        except Exception:
-                            break
-
-                        parsed = parse(response)
-                        if parsed is not None:
-                            parsed_findings = parsed
-                            break
-
-                    if parsed_findings is None:
-                        break
-
-                    completed_findings.append(parsed_findings)
-
-                if len(completed_findings) == len(parts):
-                    result_queue.put((lens_obj, completed_findings, []))
-                else:
-                    result_queue.put((lens_obj, None, completed_findings))
-        except Exception:
-            result_queue.put((lens_obj, None, []))
-
-    for lens in lenses:
-        worker_thread = threading.Thread(target=lens_worker, args=(lens,), daemon=True)
-        worker_thread.start()
-
-    deadline = time.monotonic() + stage_timeout_s
+def _collect_lens_results(
+    lenses: Sequence[Lens],
+    result_queue: queue.Queue[_LensOutcome],
+    deadline: float,
+) -> Tuple[Dict[str, List[List[Finding]]], Dict[str, List[List[Finding]]], set[str], set[str]]:
+    """Drain lens outcomes until the deadline; lenses that never answered count as failed."""
     lens_results: Dict[str, List[List[Finding]]] = {}
     partial_results: Dict[str, List[List[Finding]]] = {}
     failed_keys: set[str] = set()
@@ -386,22 +343,15 @@ def run_ensemble(
         if lens.key not in completed_lens_keys:
             failed_keys.add(lens.key)
 
-    if len(completed_lens_keys) < len(lenses):
-        cancelled.set()
+    return lens_results, partial_results, failed_keys, completed_lens_keys
 
-    with counter_lock:
-        final_calls = calls_made
-        final_chars = chars_sent
 
-    usable = len(lens_results)
-
-    # Fail closed: must produce a parseable answer for EVERY part from ceil(len(lenses)/2) lenses
-    quorum = math.ceil(len(lenses) / 2)
-    if usable < quorum:
-        cancelled.set()
-        return None
-
-    # Merge candidates in lens order, then part order (never completion order)
+def _collect_candidates(
+    lenses: Sequence[Lens],
+    lens_results: Dict[str, List[List[Finding]]],
+    partial_results: Dict[str, List[List[Finding]]],
+) -> List[Tuple[Finding, Lens, int, int]]:
+    """Gather candidates in lens order, then part order, tagging findings from partial lenses."""
     raw_candidates: List[Tuple[Finding, Lens, int, int]] = []
     candidate_idx = 0
     for lens in lenses:
@@ -419,8 +369,13 @@ def run_ensemble(
                     f_copy.description = f"{f_copy.description} [from a lens that failed on a later part]"
                     raw_candidates.append((f_copy, lens, part_idx, candidate_idx))
                     candidate_idx += 1
+    return raw_candidates
 
-    # Pairwise deduplication against kept representative (non-transitive)
+
+def _dedupe_candidates(
+    raw_candidates: List[Tuple[Finding, Lens, int, int]],
+) -> List[Tuple[Finding, Lens, List[Tuple[Lens, int]], int]]:
+    """Cluster candidates pairwise against kept representatives, in priority order (non-transitive)."""
     sorted_candidates = sorted(
         raw_candidates,
         key=lambda item: _candidate_rank(item[0], item[1], item[3]),
@@ -437,7 +392,14 @@ def run_ensemble(
                 break
         if not matched:
             representatives.append((cand_f.model_copy(), cand_lens, [(cand_lens, cand_part)], cand_order))
+    return representatives
 
+
+def _finalize_representatives(
+    representatives: List[Tuple[Finding, Lens, List[Tuple[Lens, int]], int]],
+    parts: Sequence[str],
+) -> Tuple[List[Finding], Dict[str, List[str]]]:
+    """Check locations against the diff and record provenance; return findings in output order."""
     # Location check and provenance applied AFTER dedupe
     diff_info = _parse_diff(parts)
     deduped_findings_with_order: List[Tuple[Finding, int]] = []
@@ -476,6 +438,90 @@ def run_ensemble(
     final_findings = [
         f for f, _ in sorted(deduped_findings_with_order, key=_output_sort_key)
     ]
+    return final_findings, provenance
+
+
+def run_ensemble(
+    lenses: Sequence[Lens],
+    call: Callable[[str, str], str],
+    header: str,
+    parts: Sequence[str],
+    parse: Callable[[str], Optional[List[Finding]]],
+    *,
+    max_calls: int,
+    format_reminder: str,
+    system_prompt: str,
+    stage_timeout_s: float = 900.0,
+) -> Optional[EnsembleResult]:
+    """
+    Run an opt-in panel of independent review lenses over diff parts on daemon threads.
+
+    Returns the union of evidence-checked findings, or None if the worst-case
+    call budget exceeds max_calls or too few lenses produce a parseable answer.
+    """
+    if not lenses or not parts:
+        return None
+
+    # Pre-check: worst case is 2 calls per (lens, part) with format retry
+    worst_case_calls = 2 * len(lenses) * len(parts)
+    if worst_case_calls > max_calls:
+        return None
+
+    counter_lock = threading.Lock()
+    cancelled = threading.Event()
+    semaphore = threading.Semaphore(3)
+    calls_made = 0
+    chars_sent = 0
+
+    def make_call(system: str, prompt: str) -> str:
+        nonlocal calls_made, chars_sent
+        with counter_lock:
+            if cancelled.is_set():
+                raise RuntimeError("ensemble stage cancelled")
+            calls_made += 1
+            chars_sent += len(system) + len(prompt)
+        return call(system, prompt)
+
+    result_queue: queue.Queue[_LensOutcome] = queue.Queue()
+
+    def lens_worker(lens_obj: Lens) -> None:
+        try:
+            with semaphore:
+                completed_findings = _review_lens_parts(
+                    lens_obj, parts, header, system_prompt, format_reminder, parse, make_call, cancelled
+                )
+                if len(completed_findings) == len(parts):
+                    result_queue.put((lens_obj, completed_findings, []))
+                else:
+                    result_queue.put((lens_obj, None, completed_findings))
+        except Exception:
+            result_queue.put((lens_obj, None, []))
+
+    for lens in lenses:
+        threading.Thread(target=lens_worker, args=(lens,), daemon=True).start()
+
+    deadline = time.monotonic() + stage_timeout_s
+    lens_results, partial_results, failed_keys, completed_lens_keys = _collect_lens_results(
+        lenses, result_queue, deadline
+    )
+
+    if len(completed_lens_keys) < len(lenses):
+        cancelled.set()
+
+    with counter_lock:
+        final_calls, final_chars = calls_made, chars_sent
+
+    usable = len(lens_results)
+
+    # Fail closed: must produce a parseable answer for EVERY part from ceil(len(lenses)/2) lenses
+    quorum = math.ceil(len(lenses) / 2)
+    if usable < quorum:
+        cancelled.set()
+        return None
+
+    raw_candidates = _collect_candidates(lenses, lens_results, partial_results)
+    representatives = _dedupe_candidates(raw_candidates)
+    final_findings, provenance = _finalize_representatives(representatives, parts)
 
     return EnsembleResult(
         findings=final_findings,

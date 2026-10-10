@@ -4,8 +4,10 @@ Tests for the review ensemble and review lenses.
 
 from __future__ import annotations
 
+import queue
 import subprocess
 import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -14,9 +16,14 @@ from guard.core.review_ensemble import (
     EnsembleResult,
     _can_merge,
     _candidate_rank,
+    _collect_candidates,
+    _collect_lens_results,
     _combine_system_prompt,
+    _dedupe_candidates,
+    _finalize_representatives,
     _is_location_verified,
     _parse_diff,
+    _review_lens_parts,
     run_ensemble,
 )
 from guard.core.review_lenses import (
@@ -1167,3 +1174,171 @@ def test_ensemble_partial_lens_findings_preserved_when_quorum_met():
     f = result.findings[0]
     assert "Missing auth check on endpoint A" in f.description
     assert "[from a lens that failed on a later part]" in f.description
+
+
+def _finding(fid: str, location: str, description: str, severity: str = "high") -> Finding:
+    return Finding(id=fid, severity=severity, kind="correctness", location=location, description=description)
+
+
+def test_review_lens_parts_retries_bad_format_then_succeeds():
+    """A part whose first answer is unparseable is asked again with the format reminder appended."""
+    prompts: List[str] = []
+    systems: List[str] = []
+    responses = iter(
+        [
+            "Looks fine to me.",
+            "SCORE: 7.0\nSUMMARY: ok\nFINDINGS:\n"
+            "- high | correctness | src/auth.py:12 | - | Null pointer in login\n",
+        ]
+    )
+
+    def make_call(system: str, prompt: str) -> str:
+        systems.append(system)
+        prompts.append(prompt)
+        return next(responses)
+
+    completed = _review_lens_parts(
+        LENSES[1], [SAMPLE_DIFF], "Header", "BASE", FORMAT_REMINDER, _make_parse(), make_call, threading.Event()
+    )
+
+    assert [[f.location for f in part] for part in completed] == [["src/auth.py:12"]]
+    assert len(prompts) == 2
+    assert not prompts[0].endswith(FORMAT_REMINDER)
+    assert prompts[1].endswith(FORMAT_REMINDER)
+    assert REQUIREMENTS_INSTRUCTION in systems[0]
+
+
+def test_review_lens_parts_failed_part_stops_the_lens():
+    """A part that fails both attempts ends the lens; later parts are never sent to the model."""
+    prompts: List[str] = []
+    parts = [
+        "diff --git a/a.py b/a.py\n@@ -1,5 +1,5 @@\n+1\n",
+        "diff --git a/b.py b/b.py\n@@ -1,5 +1,5 @@\n+2\n",
+        "diff --git a/c.py b/c.py\n@@ -1,5 +1,5 @@\n+3\n",
+    ]
+
+    def make_call(system: str, prompt: str) -> str:
+        prompts.append(prompt)
+        if "b.py" in prompt:
+            return "no usable format"
+        return "SCORE: 8.0\nSUMMARY: ok\nFINDINGS:\nNone\n"
+
+    completed = _review_lens_parts(
+        LENSES[0], parts, "Header", "", FORMAT_REMINDER, _make_parse(), make_call, threading.Event()
+    )
+
+    assert completed == [[]]
+    assert len(prompts) == 3  # part 1 once, part 2 twice (retry), part 3 never
+    assert not any("c.py" in prompt for prompt in prompts)
+
+
+def test_review_lens_parts_cancelled_stage_makes_no_calls():
+    """A lens started after the stage was cancelled returns nothing and calls the model zero times."""
+    cancelled = threading.Event()
+    cancelled.set()
+    calls: List[str] = []
+
+    def make_call(system: str, prompt: str) -> str:
+        calls.append(prompt)
+        return ""
+
+    completed = _review_lens_parts(
+        LENSES[0], [SAMPLE_DIFF], "Header", "", FORMAT_REMINDER, _make_parse(), make_call, cancelled
+    )
+
+    assert completed == []
+    assert calls == []
+
+
+def test_collect_lens_results_expired_deadline_marks_every_lens_failed():
+    """Past the stage deadline no outcome is read, so every lens counts as failed."""
+    lenses = LENSES[:3]
+    result_queue: queue.Queue = queue.Queue()
+    result_queue.put((lenses[0], [[]], []))
+
+    lens_results, partial_results, failed_keys, completed_keys = _collect_lens_results(
+        lenses, result_queue, time.monotonic() - 1.0
+    )
+
+    assert lens_results == {}
+    assert partial_results == {}
+    assert failed_keys == {lens.key for lens in lenses}
+    assert completed_keys == set()
+
+
+def test_collect_lens_results_splits_complete_partial_and_silent_lenses():
+    """Complete lenses fill lens_results, partial lenses keep their parts, silent lenses are failed."""
+    lenses = LENSES[:3]
+    result_queue: queue.Queue = queue.Queue()
+    result_queue.put((lenses[0], [[_finding("a1", "src/auth.py:12", "Null pointer")]], []))
+    result_queue.put((lenses[1], None, [[_finding("b1", "src/auth.py:13", "Leaks token")]]))
+
+    lens_results, partial_results, failed_keys, completed_keys = _collect_lens_results(
+        lenses, result_queue, time.monotonic() + 0.1
+    )
+
+    assert set(lens_results) == {"correctness"}
+    assert set(partial_results) == {"requirements"}
+    assert failed_keys == {"requirements", "contracts"}
+    assert completed_keys == {"correctness", "requirements"}
+
+
+def test_collect_candidates_orders_by_lens_then_part_and_tags_partial_lens():
+    """Candidates follow lens order then part order, and partial-lens findings get the failure note."""
+    lenses = [LENSES[0], LENSES[1], LENSES[2]]
+    a1 = _finding("a1", "src/auth.py:12", "Null pointer")
+    a2 = _finding("a2", "src/auth.py:14", "Unchecked role")
+    b1 = _finding("b1", "src/auth.py:13", "Leaks token")
+    c1 = _finding("c1", "src/auth.py:15", "Contract drift")
+
+    raw = _collect_candidates(
+        lenses,
+        lens_results={"contracts": [[c1]], "correctness": [[a1], [a2]]},
+        partial_results={"requirements": [[b1]]},
+    )
+
+    assert [(f.id, lens.key, part, idx) for f, lens, part, idx in raw] == [
+        ("a1", "correctness", 0, 0),
+        ("a2", "correctness", 1, 1),
+        ("b1", "requirements", 0, 2),
+        ("c1", "contracts", 0, 3),
+    ]
+    assert raw[2][0].description == "Leaks token [from a lens that failed on a later part]"
+    assert b1.description == "Leaks token"
+
+
+def test_dedupe_candidates_merges_same_defect_across_lenses_and_keeps_distinct_ones():
+    """The same defect reported by two lenses becomes one representative listing both lenses."""
+    same_a = _finding("s1", "src/auth.py:12", "Null pointer in login")
+    same_b = _finding("s2", "src/auth.py:12", "Null pointer in login")
+    other = _finding("o1", "src/auth.py:60", "Missing rate limit audit log")
+    raw = [
+        (same_a, LENSES[0], 0, 0),
+        (other, LENSES[1], 0, 1),
+        (same_b, LENSES[1], 0, 2),
+    ]
+
+    representatives = _dedupe_candidates(raw)
+
+    assert [rep[0].id for rep in representatives] == ["s1", "o1"]
+    _, winner, members, _ = representatives[0]
+    assert winner.key == "correctness"
+    assert sorted(lens.key for lens, _ in members) == ["correctness", "requirements"]
+    assert representatives[1][2] == [(LENSES[1], 0)]
+
+
+def test_finalize_representatives_flags_unverified_location_and_records_provenance():
+    """Findings outside the diff are flagged, provenance lists lenses in priority order, output is severity-sorted."""
+    verified = _finding("v1", "src/auth.py:12", "Null pointer in login", severity="medium")
+    unverified = _finding("u1", "src/auth.py:999", "Stale cache", severity="high")
+    representatives = [
+        (verified, LENSES[0], [(LENSES[1], 0), (LENSES[0], 0)], 0),
+        (unverified, LENSES[1], [(LENSES[1], 0)], 1),
+    ]
+
+    findings, provenance = _finalize_representatives(representatives, [SAMPLE_DIFF])
+
+    assert [f.id for f in findings] == ["u1", "v1"]
+    assert findings[0].description == "Stale cache [location not verified in the diff]"
+    assert findings[1].description == "Null pointer in login [also found by: requirements]"
+    assert provenance == {"v1": ["correctness", "requirements"], "u1": ["requirements"]}
