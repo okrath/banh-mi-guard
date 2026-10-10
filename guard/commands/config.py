@@ -119,7 +119,7 @@ def config_review_cmd(
     """
     Show the effective review options and where each comes from, or set one (machine-wide, ~/.guard/config.json).
     Setting is for the user, in an interactive terminal. Options: coverage_notes, part_manifest, test_evidence,
-    test_checklist, validate_findings (true/false), threat_frame (off/auto), reviewers (1-5), max_llm_calls, stage_timeout_s.
+    test_checklist, validate_findings, promote_concrete (true/false), threat_frame (off/auto), reviewers (1-5), max_llm_calls, stage_timeout_s.
     A repository's .guard/config.json, when it exists, is read instead of the machine-wide file.
     """
     from guard.core.review_options import ReviewOptions, effective_sources, load_review_options

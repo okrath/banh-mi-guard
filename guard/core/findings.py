@@ -38,20 +38,27 @@ class Finding(BaseModel):
 
 SPLIT_REQUIREMENT_NOTE = "(requirement not verified: the reviewer saw one part of a split diff)"
 
+# `input: <a concrete input or state> -> <the wrong result>`, the form asked of a finding with promote_concrete
+CONCRETE_INPUT_RE = re.compile(r"\s*input:\s*\S.*?->\s*\S", re.IGNORECASE | re.DOTALL)
 
-def classify(finding: "Finding", task_text: str, partial: bool = False) -> "Finding":
+
+def classify(finding: "Finding", task_text: str, partial: bool = False, promote: bool = False) -> "Finding":
     """
     The verdict rule, applied by guard and not by the model: a finding blocks when it is
     critical/high and about correctness or security, or when the requirement it quotes is really in
     the task. Everything else is advisory. `partial` marks a review of one part of a split diff: the
     reviewer cannot see whether another part meets the requirement, so a requirement-only finding is
-    kept as an advisory follow-up instead of blocking.
+    kept as an advisory follow-up instead of blocking. With `promote`, a medium correctness or security
+    finding that names a concrete failing input also blocks: the model found the defect, guard rates it.
     """
     # Word for word (case and punctuation aside), at least two whole words: never a fragment of a word
     quote = " ".join(re.findall(r"\w+", finding.requirement.lower()))
     task = " ".join(re.findall(r"\w+", task_text.lower()))
     if finding.severity in ("critical", "high") and finding.kind in BLOCKING_KINDS:
         finding.blocking, finding.why_blocking = True, f"{finding.severity} {finding.kind}"
+    elif (promote and finding.severity == "medium" and finding.kind in BLOCKING_KINDS
+          and CONCRETE_INPUT_RE.match(finding.description)):
+        finding.blocking, finding.why_blocking = True, f"{finding.kind} with a concrete failing input"
     elif len(quote.split()) >= 2 and f" {quote} " in f" {task} ":
         if partial:
             finding.description = f"{finding.description} {SPLIT_REQUIREMENT_NOTE}"
@@ -71,11 +78,11 @@ def _is_finding_line(line: str) -> bool:
     return len(parts) >= 5 and parts[0] in SEVERITIES and parts[1] in KINDS
 
 
-def parse_findings(text: str, task_text: str, partial: bool = False) -> Optional[List[Finding]]:
+def parse_findings(text: str, task_text: str, partial: bool = False, promote: bool = False) -> Optional[List[Finding]]:
     """
     `FINDINGS:` lines -> classified findings. None when the section is missing or any line is malformed
     (too few fields, an unknown severity or kind): a finding guard cannot read is never dropped or
-    demoted into an approval. `partial` is passed to classify for a review of one part of a split diff.
+    demoted into an approval. `partial` and `promote` are passed to classify.
     """
     findings_matches = list(re.finditer(r"(?m)^(?:\*{1,2}|#{1,6}[ \t]*)?FINDINGS(?:\s*:[ \t]*(?:\*{1,2})?|\*{1,2}[ \t]*:)", text))
     if len(findings_matches) != 1:
@@ -100,7 +107,7 @@ def parse_findings(text: str, task_text: str, partial: bool = False) -> Optional
         out.append(classify(Finding(
             id=finding_id(kind, location, description), severity=severity, kind=kind,
             location=location, requirement=requirement, description=description,
-        ), task_text, partial))
+        ), task_text, partial, promote))
     return out
 
 

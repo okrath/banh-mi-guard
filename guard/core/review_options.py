@@ -18,6 +18,7 @@ _BOOLEAN_FIELDS = {
     "test_evidence",
     "test_checklist",
     "validate_findings",
+    "promote_concrete",
 }
 
 _ALLOWED_THREAT_FRAMES = ("off", "auto")
@@ -29,6 +30,7 @@ _KNOWN_FIELDS = (
     "test_checklist",
     "threat_frame",
     "validate_findings",
+    "promote_concrete",
     "reviewers",
     "max_llm_calls",
     "stage_timeout_s",
@@ -127,6 +129,7 @@ class ReviewOptions(BaseModel):
     test_checklist: bool = False
     threat_frame: Literal["off", "auto"] = "off"
     validate_findings: bool = False
+    promote_concrete: bool = False  # a correctness/security finding with a concrete failing input blocks
     reviewers: int = Field(default=1, ge=1, le=5)
     max_llm_calls: int = Field(default=12, ge=1)
     stage_timeout_s: int = Field(default=900, ge=30)

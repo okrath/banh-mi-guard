@@ -55,6 +55,13 @@ from guard.core.threat_frame import (
     security_surface,
 )
 
+# Asked with promote_concrete: guard blocks a medium correctness/security finding written this way
+CONCRETE_INPUT_INSTRUCTION = (
+    "When you can name it, start a correctness or security finding's description with "
+    "`input: <a concrete input or state that normal use can reach> -> <the wrong result>`. "
+    "Leave it out for a risk you cannot show with such an input; a finding written this way blocks."
+)
+
 FORMAT_REMINDER = (
     "\nYour previous answer could not be parsed. Answer again, starting with exactly these lines:\n"
     "SCORE: <0.0-10.0>\nSUMMARY: <one paragraph>\n"
@@ -539,6 +546,7 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                 )
                 verdict = self._parse_llm_response(
                     raw_response, model_name=model_name, focus=focus, partial=len(batches) > 1,
+                    promote=opts.promote_concrete,
                 )
                 if verdict is not None:
                     self._last_unreviewed.extend(getattr(verdict, "_unreviewed_topics", []))
@@ -573,6 +581,8 @@ Verified evidence (computed by guard over the whole repository, valid for every 
         system_prompt = self._build_system_prompt(model_name, focus_instruction)
         if opts.test_checklist:
             system_prompt = f"{system_prompt}\n\n{TEST_QUALITY_CHECKLIST}"
+        if opts.promote_concrete:
+            system_prompt = f"{system_prompt}\n\n{CONCRETE_INPUT_INSTRUCTION}"
 
         header = self._build_review_header(
             prompt=prompt, domain_str=domain_str, focus=focus, diff_summary=diff_summary,
@@ -606,7 +616,9 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                 call=counted_call,
                 header=header,
                 parts=batches,
-                parse=lambda t: parse_findings(t, self._task_text, partial=len(batches) > 1),
+                parse=lambda t: parse_findings(
+                    t, self._task_text, partial=len(batches) > 1, promote=opts.promote_concrete,
+                ),
                 max_calls=remaining_budget,
                 format_reminder=FORMAT_REMINDER,
                 system_prompt=system_prompt,
@@ -845,10 +857,11 @@ Verified evidence (computed by guard over the whole repository, valid for every 
 
     def _parse_llm_response(
         self, text: str, model_name: str = "LLM", focus: str = "all", partial: bool = False,
+        promote: bool = False,
     ) -> Optional[LLMReviewVerdict]:
         try:
             score_match = re.search(r"SCORE:\s*([\d\.]+)", text)
-            findings = parse_findings(text, getattr(self, "_task_text", ""), partial=partial)
+            findings = parse_findings(text, getattr(self, "_task_text", ""), partial=partial, promote=promote)
             if findings is None:
                 # No readable FINDINGS list is no LLM review: asked again once (format reminder), then
                 # reported as not run. Only structured findings approve or block
