@@ -20,7 +20,7 @@ import concurrent.futures
 import re
 import threading
 from enum import Enum
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -51,7 +51,6 @@ from guard.core.session import BuildCheckResult, DomainContract, LockedInvariant
 from guard.core.test_evidence import test_evidence_lines
 from guard.core.threat_frame import (
     THREAT_FRAME_INSTRUCTIONS,
-    SurfaceReport,
     parse_threat_sections,
     security_surface,
 )
@@ -548,6 +547,174 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             verdicts.append(verdict)
         return verdicts
 
+    def _build_review_context(
+        self, prompt: str, domain_str: str, model_name: str, focus: str, opts: ReviewOptions,
+        diff_summary: Optional[DiffSummary], build_check: Optional[BuildCheckResult],
+        violations: List[RuleViolation], invariant_result: Optional[InvariantResult],
+        contracts: Optional[List[DomainContract]], evidence: Optional[List[str]],
+        ledger: Optional[List[dict]], known_rules: Optional[List[dict]],
+    ) -> Tuple[str, str, bool]:
+        """Build the system prompt and review header; the flag says whether the threat frame is active."""
+        raw_diff = diff_summary.raw_diff if diff_summary else ""
+        evidence_list = list(evidence or [])
+        if opts.test_evidence:
+            evidence_list.extend(test_evidence_lines(raw_diff))
+
+        threat_active = False
+        if opts.threat_frame == "auto":
+            surface = security_surface(raw_diff)
+            if surface.sensitive:
+                threat_active = True
+                evidence_list.append(f"Security-sensitive surface detected: {', '.join(surface.reasons)}")
+
+        focus_instruction = self._build_focus_instruction(focus)
+        system_prompt = self._build_system_prompt(model_name, focus_instruction)
+        if opts.test_checklist:
+            system_prompt = f"{system_prompt}\n\n{TEST_QUALITY_CHECKLIST}"
+
+        header = self._build_review_header(
+            prompt=prompt, domain_str=domain_str, focus=focus, diff_summary=diff_summary,
+            build_check=build_check, violations=violations, invariant_result=invariant_result,
+            contracts=contracts, evidence=evidence_list, ledger=ledger, known_rules=known_rules,
+        )
+        if threat_active:
+            header = f"{header}\n{THREAT_FRAME_INSTRUCTIONS}\n"
+        return system_prompt, header, threat_active
+
+    def _run_reviewer_panel(
+        self, opts: ReviewOptions, batches: List[str], header: str, system_prompt: str,
+        focus: str, threat_active: bool, counted_call: Callable[[str, str], str], calls_so_far: int,
+    ) -> Tuple[Optional[LLMReviewVerdict], Optional[str]]:
+        """Run the reviewer panel; returns (verdict or None, note explaining why no panel verdict exists)."""
+        worst_case_panel = 2 * opts.reviewers * len(batches)
+        remaining_budget = opts.max_llm_calls - calls_so_far
+        if worst_case_panel > remaining_budget:
+            return None, "Reviewer panel unavailable (budget exceeded); one reviewer ran."
+
+        extra_dict = {}
+        if opts.test_checklist:
+            extra_dict["tests"] = TEST_QUALITY_CHECKLIST
+        if threat_active:
+            extra_dict["adversary"] = THREAT_FRAME_INSTRUCTIONS
+        panel_note: Optional[str] = None
+        try:
+            panel_lenses = build_lenses(extra=extra_dict)[:opts.reviewers]
+            ensemble_res = run_ensemble(
+                lenses=panel_lenses,
+                call=counted_call,
+                header=header,
+                parts=batches,
+                parse=lambda t: parse_findings(t, self._task_text),
+                max_calls=remaining_budget,
+                format_reminder=FORMAT_REMINDER,
+                system_prompt=system_prompt,
+                stage_timeout_s=float(opts.stage_timeout_s),
+            )
+        except Exception as e:
+            ensemble_res = None
+            panel_note = f"Reviewer panel unavailable ({type(e).__name__}); one reviewer ran."
+        if ensemble_res is None:
+            return None, panel_note or "Reviewer panel unavailable (insufficient usable lenses); one reviewer ran."
+
+        panel_findings = ensemble_res.findings
+        is_rejected = any(f.blocking for f in panel_findings)
+        panel_score = 6.0 if is_rejected else 8.5
+        remed = [f"[{f.id}] {f.location}: {f.description}" for f in panel_findings if f.blocking]
+        merged_verdict = LLMReviewVerdict(
+            verdict=ReviewVerdict.REVISE if is_rejected else ReviewVerdict.APPROVED,
+            score=panel_score,
+            summary=f"Reviewer panel ({ensemble_res.usable} lenses) evaluated {len(batches)} diff parts.",
+            reviewer_model=f"Panel ({len(panel_lenses)} lenses)",
+            focus_area=focus,
+            technical_audit=[f"[{f.id}] {f.location}: {f.description}" for f in panel_findings],
+            ergonomics_ux=[],
+            remediation_steps=remed,
+            findings=panel_findings,
+            proposed_invariants=[],
+            review_mode="llm_deep",
+        )
+        return merged_verdict, None
+
+    @staticmethod
+    def _apply_validation_verdict(merged_verdict: LLMReviewVerdict, updated_findings: List[Finding]) -> None:
+        """Set the verdict from the findings that still block after validation."""
+        if not any(f.blocking for f in updated_findings):
+            merged_verdict.verdict = ReviewVerdict.APPROVED
+            merged_verdict.score = max(merged_verdict.score, 8.0)
+            merged_verdict.remediation_steps = []
+        else:
+            merged_verdict.verdict = ReviewVerdict.REVISE
+            merged_verdict.remediation_steps = [
+                f"[{f.id}] {f.location}: {f.description}"
+                for f in updated_findings if f.blocking
+            ]
+
+    def _validate_blocking_findings(
+        self, merged_verdict: LLMReviewVerdict, raw_diff: str, prompt: str, opts: ReviewOptions,
+        multi_part: bool, calls_count: int, counted_call: Callable[[str, str], str],
+        counter_lock: threading.Lock, validation_cancelled: threading.Event,
+    ) -> Tuple[List[dict], Optional[str]]:
+        """Re-check blocking findings (opt-in); updates merged_verdict in place and returns (records, note)."""
+        validation_records: List[dict] = []
+        if not (
+            opts.validate_findings
+            and any(f.blocking for f in merged_verdict.findings)
+            and multi_part
+        ):
+            return validation_records, None
+
+        remaining_for_val = opts.max_llm_calls - calls_count
+        blocking_count = sum(1 for f in merged_verdict.findings if f.blocking)
+        worst_case_val = min(5, blocking_count)
+        if worst_case_val > remaining_for_val:
+            return validation_records, "Finding validation skipped (budget exceeded)."
+
+        def do_validate():
+            return validate_findings(
+                findings=merged_verdict.findings,
+                full_diff=raw_diff,
+                task_text=prompt,
+                call=counted_call,
+                max_validations=min(5, remaining_for_val),
+            )
+
+        validation_note: Optional[str] = None
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(do_validate)
+            try:
+                updated_findings, val_objs = future.result(timeout=float(opts.stage_timeout_s))
+                merged_verdict.findings = updated_findings
+                for vr in val_objs:
+                    validation_records.append({
+                        "finding_id": vr.finding_id,
+                        "verdict": vr.verdict,
+                        "evidence_verified": vr.evidence_verified,
+                        "reason": vr.reason,
+                    })
+                self._apply_validation_verdict(merged_verdict, updated_findings)
+            except concurrent.futures.TimeoutError:
+                with counter_lock:
+                    validation_cancelled.set()  # late calls from the abandoned thread are refused
+                validation_note = f"Finding validation timed out after {opts.stage_timeout_s}s."
+            except Exception as e:
+                # Fail safe: the findings stay as the reviewers left them, and the crash is visible
+                validation_note = f"Finding validation failed ({type(e).__name__}); findings unchanged."
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return validation_records, validation_note
+
+    @staticmethod
+    def _set_coverage_notes(
+        merged_verdict: LLMReviewVerdict, opts: ReviewOptions, partition: DiffPartition,
+        unreviewed_topics: List[str], notes: List[str],
+    ) -> None:
+        """Attach coverage notes (partition gaps first, then the given notes) when the option is on."""
+        if opts.coverage_notes:
+            merged_verdict.coverage_notes = build_coverage_notes(partition, unreviewed_topics) + notes
+        else:
+            merged_verdict.coverage_notes = []
+
     def _evaluate_with_llm(
         self,
         prompt: str,
@@ -573,47 +740,14 @@ Verified evidence (computed by guard over the whole repository, valid for every 
 
         # 1. Partition diff
         raw_diff = diff_summary.raw_diff if diff_summary else ""
-        partition = partition_diff(
-            raw_diff,
-            batch_chars=REVIEW_BATCH_CHARS,
-            max_batches=REVIEW_MAX_BATCHES,
-        )
+        partition = partition_diff(raw_diff, batch_chars=REVIEW_BATCH_CHARS, max_batches=REVIEW_MAX_BATCHES)
         batches = partition.parts
 
-        # 2. Header and evidence additions
-        evidence_list = list(evidence or [])
-        if opts.test_evidence:
-            evidence_list.extend(test_evidence_lines(raw_diff))
-
-        surface: Optional[SurfaceReport] = None
-        threat_active = False
-        if opts.threat_frame == "auto":
-            surface = security_surface(raw_diff)
-            if surface.sensitive:
-                threat_active = True
-                evidence_list.append(f"Security-sensitive surface detected: {', '.join(surface.reasons)}")
-
-        focus_instruction = self._build_focus_instruction(focus)
-        system_prompt = self._build_system_prompt(model_name, focus_instruction)
-        if opts.test_checklist:
-            system_prompt = f"{system_prompt}\n\n{TEST_QUALITY_CHECKLIST}"
-
-        header = self._build_review_header(
-            prompt=prompt,
-            domain_str=domain_str,
-            focus=focus,
-            diff_summary=diff_summary,
-            build_check=build_check,
-            violations=violations,
-            invariant_result=invariant_result,
-            contracts=contracts,
-            evidence=evidence_list,
-            ledger=ledger,
-            known_rules=known_rules,
+        # 2. System prompt and header
+        system_prompt, header, threat_active = self._build_review_context(
+            prompt, domain_str, model_name, focus, opts, diff_summary, build_check, violations,
+            invariant_result, contracts, evidence, ledger, known_rules,
         )
-        if threat_active:
-            header = f"{header}\n{THREAT_FRAME_INSTRUCTIONS}\n"
-
         review_cfg = self.config.llm.model_copy(update={"timeout": None})
 
         # 3. Thread-safe call counter setup
@@ -642,69 +776,17 @@ Verified evidence (computed by guard over the whole repository, valid for every 
 
         # 4. Stage 1: Ensemble or Single Reviewer
         panel_note: Optional[str] = None
-        validation_note: Optional[str] = None
         unreviewed_topics: List[str] = []
         merged_verdict: Optional[LLMReviewVerdict] = None
-
         if opts.reviewers > 1:
-            worst_case_panel = 2 * opts.reviewers * len(batches)
-            remaining_budget = opts.max_llm_calls - calls_count
-            if worst_case_panel > remaining_budget:
-                panel_note = "Reviewer panel unavailable (budget exceeded); one reviewer ran."
-            else:
-                extra_dict = {}
-                if opts.test_checklist:
-                    extra_dict["tests"] = TEST_QUALITY_CHECKLIST
-                if threat_active:
-                    extra_dict["adversary"] = THREAT_FRAME_INSTRUCTIONS
-                try:
-                    panel_lenses = build_lenses(extra=extra_dict)[:opts.reviewers]
-                    ensemble_res = run_ensemble(
-                        lenses=panel_lenses,
-                        call=counted_call,
-                        header=header,
-                        parts=batches,
-                        parse=lambda t: parse_findings(t, self._task_text),
-                        max_calls=remaining_budget,
-                        format_reminder=FORMAT_REMINDER,
-                        system_prompt=system_prompt,
-                        stage_timeout_s=float(opts.stage_timeout_s),
-                    )
-                except Exception as e:
-                    ensemble_res = None
-                    panel_note = f"Reviewer panel unavailable ({type(e).__name__}); one reviewer ran."
-                if ensemble_res is None:
-                    if not panel_note:
-                        panel_note = "Reviewer panel unavailable (insufficient usable lenses); one reviewer ran."
-                else:
-                    panel_findings = ensemble_res.findings
-                    is_rejected = any(f.blocking for f in panel_findings)
-                    panel_score = 6.0 if is_rejected else 8.5
-                    remed = [f"[{f.id}] {f.location}: {f.description}" for f in panel_findings if f.blocking]
-                    merged_verdict = LLMReviewVerdict(
-                        verdict=ReviewVerdict.REVISE if is_rejected else ReviewVerdict.APPROVED,
-                        score=panel_score,
-                        summary=f"Reviewer panel ({ensemble_res.usable} lenses) evaluated {len(batches)} diff parts.",
-                        reviewer_model=f"Panel ({len(panel_lenses)} lenses)",
-                        focus_area=focus,
-                        technical_audit=[f"[{f.id}] {f.location}: {f.description}" for f in panel_findings],
-                        ergonomics_ux=[],
-                        remediation_steps=remed,
-                        findings=panel_findings,
-                        proposed_invariants=[],
-                        review_mode="llm_deep",
-                    )
+            merged_verdict, panel_note = self._run_reviewer_panel(
+                opts, batches, header, system_prompt, focus, threat_active, counted_call, calls_count,
+            )
 
         if merged_verdict is None:
             verdicts = self._review_diff_batches(
-                review_cfg=review_cfg,
-                batches=batches,
-                header=header,
-                system_prompt=system_prompt,
-                model_name=model_name,
-                focus=focus,
-                options=opts,
-                counted_call=counted_call,
+                review_cfg=review_cfg, batches=batches, header=header, system_prompt=system_prompt,
+                model_name=model_name, focus=focus, options=opts, counted_call=counted_call,
                 partition=partition,
             )
             if verdicts is None:
@@ -715,60 +797,10 @@ Verified evidence (computed by guard over the whole repository, valid for every 
             merged_verdict = self._merge_verdicts(verdicts)
 
         # 5. Stage 2: Finding Validation (opt-in)
-        validation_records: List[dict] = []
-        if (
-            opts.validate_findings
-            and any(f.blocking for f in merged_verdict.findings)
-            and (len(batches) > 1 or partition.cut_parts > 0)
-        ):
-            remaining_for_val = opts.max_llm_calls - calls_count
-            blocking_count = sum(1 for f in merged_verdict.findings if f.blocking)
-            worst_case_val = min(5, blocking_count)
-            if worst_case_val > remaining_for_val:
-                validation_note = "Finding validation skipped (budget exceeded)."
-            else:
-                def do_validate():
-                    return validate_findings(
-                        findings=merged_verdict.findings,
-                        full_diff=raw_diff,
-                        task_text=prompt,
-                        call=counted_call,
-                        max_validations=min(5, remaining_for_val),
-                    )
-
-                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                try:
-                    future = pool.submit(do_validate)
-                    try:
-                        updated_findings, val_objs = future.result(timeout=float(opts.stage_timeout_s))
-                        merged_verdict.findings = updated_findings
-                        for vr in val_objs:
-                            validation_records.append({
-                                "finding_id": vr.finding_id,
-                                "verdict": vr.verdict,
-                                "evidence_verified": vr.evidence_verified,
-                                "reason": vr.reason,
-                            })
-                        still_blocking = any(f.blocking for f in updated_findings)
-                        if not still_blocking:
-                            merged_verdict.verdict = ReviewVerdict.APPROVED
-                            merged_verdict.score = max(merged_verdict.score, 8.0)
-                            merged_verdict.remediation_steps = []
-                        else:
-                            merged_verdict.verdict = ReviewVerdict.REVISE
-                            merged_verdict.remediation_steps = [
-                                f"[{f.id}] {f.location}: {f.description}"
-                                for f in updated_findings if f.blocking
-                            ]
-                    except concurrent.futures.TimeoutError:
-                        with counter_lock:
-                            validation_cancelled.set()  # late calls from the abandoned thread are refused
-                        validation_note = f"Finding validation timed out after {opts.stage_timeout_s}s."
-                    except Exception as e:
-                        # Fail safe: the findings stay as the reviewers left them, and the crash is visible
-                        validation_note = f"Finding validation failed ({type(e).__name__}); findings unchanged."
-                finally:
-                    pool.shutdown(wait=False, cancel_futures=True)
+        validation_records, validation_note = self._validate_blocking_findings(
+            merged_verdict, raw_diff, prompt, opts, len(batches) > 1 or partition.cut_parts > 0,
+            calls_count, counted_call, counter_lock, validation_cancelled,
+        )
 
         # 6. Final verdict fields
         merged_verdict.validation_log = validation_records
@@ -776,16 +808,10 @@ Verified evidence (computed by guard over the whole repository, valid for every 
         merged_verdict.llm_chars = chars_count
         self._last_llm_calls = calls_count
         self._last_llm_chars = chars_count
-        if opts.coverage_notes:
-            notes = build_coverage_notes(partition, unreviewed_topics)
-            if panel_note:
-                notes.append(panel_note)
-            if validation_note:
-                notes.append(validation_note)
-            merged_verdict.coverage_notes = notes
-        else:
-            merged_verdict.coverage_notes = []
-
+        self._set_coverage_notes(
+            merged_verdict, opts, partition, unreviewed_topics,
+            [note for note in (panel_note, validation_note) if note],
+        )
         return merged_verdict
 
     @staticmethod
