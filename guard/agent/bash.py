@@ -311,42 +311,64 @@ _GIT_ALLOWED_SUBCOMMANDS = frozenset({
 })
 
 
-def strict_target(
-    command: str,
-    cwd: str,
-    shell: Optional[str] = None,
-    env: Optional[Mapping[str, str]] = None,
-) -> Optional[str]:
-    """Return the absolute, normalised directory the command clearly runs git in, or None."""
+def _plain_input(command: str, cwd: str, env: Optional[Mapping[str, str]]) -> bool:
+    """Whether the command, working directory and environment are simple enough to analyse."""
     if not cwd or not os.path.isabs(cwd):
-        return None
-    is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
+        return False
     if os.name == "nt" and not _TARGET_UNC_OR_DRIVE.match(cwd):
-        return None
+        return False
     if not command or not command.strip() or len(command) > 4096:
-        return None
+        return False
     if "\0" in command or "\r" in command or "\n" in command:
-        return None
+        return False
     if any("\u2018" <= ch <= "\u201f" for ch in command):
-        return None
+        return False
     if env is not None and any(k.upper() in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") for k in env):
-        return None
+        return False
+    return True
 
-    if shell:
-        sh = shell.lower()
-        if sh in ("powershell", "pwsh"):
-            sh = "powershell"
-        elif sh in ("bash", "sh"):
-            sh = "bash"
-        elif sh != "cmd":
+
+def _dialect(shell: Optional[str]) -> tuple[bool, Optional[str]]:
+    """(accepted, dialect): dialect is powershell, bash or cmd, or None when no shell is named."""
+    if not shell:
+        return True, None
+    sh = shell.lower()
+    sh = {"pwsh": "powershell", "sh": "bash"}.get(sh, sh)
+    return sh in ("powershell", "bash", "cmd"), sh
+
+
+def _read_quoted(command: str, i: int, sh: Optional[str]) -> Optional[tuple[str, int]]:
+    """(content, index after the closing quote) of the quoted word starting at i, or None when rejected."""
+    ch, n = command[i], len(command)
+    if ch == "'" and sh == "cmd":
+        return None  # single quotes do not quote in cmd
+    if i > 0 and command[i - 1] not in (" ", "\t", ";") and not command[i - 2:i] == "&&":
+        return None
+    end = command.find(ch, i + 1)
+    if end == -1:
+        return None
+    after_i = end + 1
+    if after_i < n and command[after_i] not in (" ", "\t", ";") and not command[after_i:after_i + 2] == "&&":
+        return None
+    content = command[i + 1:end]
+    if content == "":
+        return None  # empty quoted tokens ('' or "") rejected in every shell
+    if ch == "'":
+        if sh is None and any(c in content for c in ("&", "|", "<", ">", "^", "%")):
             return None
     else:
-        sh = None
+        if any(c in content for c in ('"', "$", "`", "\\")):
+            return None
+        if sh == "cmd" and any(c in content for c in ("%", "^", "!")):
+            return None
+        if sh is None and any(c in content for c in ("%", "^")):
+            return None
+    return content, after_i
 
+
+def _split_segments(command: str, sh: Optional[str]) -> Optional[list[tuple[list[tuple[str, bool]], str]]]:
+    """The command as (text, was quoted) token segments with their following separator, or None."""
     seps = (";",) if sh == "powershell" else (("&&",) if sh == "cmd" else ("&&", ";"))
-
-    # Tokenize into segments: list of (tokens, sep_after)
-    # Each token is (text, is_quoted)
     segments: list[tuple[list[tuple[str, bool]], str]] = []
     tokens: list[tuple[str, bool]] = []
     i, n = 0, len(command)
@@ -359,7 +381,6 @@ def strict_target(
         if ord(ch) > 127:
             return None
 
-        # Check segment separator
         sep = next((s for s in seps if command[i:i + len(s)] == s), None)
         if sep:
             if not tokens:
@@ -372,36 +393,14 @@ def strict_target(
         if ch in "|&;(){}><`$%^!*?#":
             return None
 
-        # Quoted token
         if ch in ("'", '"'):
-            if ch == "'" and sh == "cmd":
-                return None  # single quotes do not quote in cmd
-            if i > 0 and command[i - 1] not in (" ", "\t", ";") and not command[i - 2:i] == "&&":
+            quoted = _read_quoted(command, i, sh)
+            if quoted is None:
                 return None
-            end = command.find(ch, i + 1)
-            if end == -1:
-                return None
-            after_i = end + 1
-            if after_i < n and command[after_i] not in (" ", "\t", ";") and not command[after_i:after_i + 2] == "&&":
-                return None
-            content = command[i + 1:end]
-            if content == "":
-                return None  # empty quoted tokens ('' or "") rejected in every shell
-            if ch == "'":
-                if sh is None and any(c in content for c in ("&", "|", "<", ">", "^", "%")):
-                    return None
-            if ch == '"':
-                if any(c in content for c in ('"', "$", "`", "\\")):
-                    return None
-                if sh == "cmd" and any(c in content for c in ("%", "^", "!")):
-                    return None
-                if sh is None and any(c in content for c in ("%", "^")):
-                    return None
+            content, i = quoted
             tokens.append((content, True))
-            i = after_i
             continue
 
-        # Bare token
         tok_start = i
         while i < n and command[i] not in (" ", "\t") and not any(command[i:i + len(s)] == s for s in seps):
             i += 1
@@ -414,61 +413,148 @@ def strict_target(
 
     if tokens:
         segments.append((tokens, ""))
-    segments = [(t, s) for t, s in segments if t]
-    if not segments:
+    return segments or None
+
+
+def _resolve_dir(val: str, is_q: bool, base: str, sh: Optional[str], is_win: bool,
+                 env: Optional[Mapping[str, str]], is_cd: bool = False, has_d: bool = False,
+                 is_lit: bool = False) -> Optional[str]:
+    """The normalised absolute directory a path argument names, or None when it is not clearly one."""
+    # Reject UNC and device paths before any filesystem calls
+    if val.startswith(("\\\\", "//")):
+        return None
+    if not val.isascii() or val.startswith(("-", "~")):
+        return None
+    if any(c in val for c in ("$", "%", "*", "?")):
+        return None
+    if sh == "powershell" and not is_lit and any(c in val for c in "[]"):
+        return None
+    if not is_q and ("," in val or "@" in val):
+        return None
+    if is_cd and sh == "cmd" and not is_q and "=" in val:
+        return None
+    if "\\" in val and (sh not in ("powershell", "cmd") or not is_win):
         return None
 
-    def resolve_path(val: str, is_q: bool, base: str, is_cd: bool = False, has_d: bool = False, is_lit: bool = False) -> Optional[str]:
-        # Reject UNC and device paths before any filesystem calls
-        if val.startswith(("\\\\", "//")):
-            return None
-        if not val.isascii() or val.startswith(("-", "~")):
-            return None
-        if any(c in val for c in ("$", "%", "*", "?")):
-            return None
-        if sh == "powershell" and not is_lit and any(c in val for c in "[]"):
-            return None
-        if not is_q and ("," in val or "@" in val):
-            return None
-        if is_cd and sh == "cmd" and not is_q and "=" in val:
-            return None
-        if "\\" in val and (sh not in ("powershell", "cmd") or not is_win):
+    # Trailing dot or space in ANY component (except . or ..)
+    p_clean = val.replace("\\", "/").rstrip("/")
+    for comp in p_clean.split("/"):
+        if comp not in (".", "..") and comp.endswith((" ", ".")):
             return None
 
-        # Trailing dot or space in ANY component (except . or ..)
-        p_clean = val.replace("\\", "/").rstrip("/")
-        for comp in p_clean.split("/"):
-            if comp not in (".", "..") and comp.endswith((" ", ".")):
+    if re.match(r"^[a-zA-Z]:(?![\\/])", val) or re.match(r"^[a-zA-Z]{2,}:", val):
+        return None
+    if is_win and sh in ("bash", None) and val.startswith("/"):
+        return None
+
+    # Drive check for cmd and unknown shell
+    m_d = re.match(r"^([a-zA-Z]):", val)
+    if m_d:
+        if sh is None:
+            m_c = re.match(r"^([a-zA-Z]):", base)
+            if not m_c or m_d.group(1).upper() != m_c.group(1).upper():
+                return None
+        elif is_cd and sh == "cmd" and not has_d:
+            m_c = re.match(r"^([a-zA-Z]):", base)
+            if (m_c and m_d.group(1).upper() != m_c.group(1).upper()) or not m_c:
                 return None
 
-        if re.match(r"^[a-zA-Z]:(?![\\/])", val) or re.match(r"^[a-zA-Z]{2,}:", val):
+    is_posix_abs = val.startswith("/")
+    is_win_abs = bool(_TARGET_UNC_OR_DRIVE.match(val))
+    is_abs = is_win_abs if is_win else is_posix_abs
+    if is_cd and not is_abs and sh in ("bash", None):
+        eff_env = os.environ if env is None else env
+        if eff_env.get("CDPATH"):
             return None
-        if is_win and sh in ("bash", None) and val.startswith("/"):
+
+    target = val if is_abs else os.path.join(base, val)
+    abs_p = os.path.abspath(target)
+    return os.path.normcase(abs_p) if os.path.isdir(abs_p) else None
+
+
+def _cd_target(seg: list[tuple[str, bool]], cmd_name: str, sh: Optional[str], cwd: str, is_win: bool,
+               env: Optional[Mapping[str, str]]) -> tuple[bool, Optional[str]]:
+    """(whether the segment is a location command, the directory it changes to or None if unclear)."""
+    if sh == "powershell":
+        if cmd_name not in ("cd", "chdir", "set-location", "sl", "push-location", "pushd"):
+            return False, None
+        flag = seg[1][0].lower() if len(seg) == 3 and not seg[1][1] else ""
+        has_flag = flag in ("-path", "-literalpath")
+        if len(seg) != 2 and not has_flag:
+            return True, None
+        val, is_q = seg[2] if has_flag else seg[1]
+        return True, _resolve_dir(val, is_q, cwd, sh, is_win, env, is_cd=True, is_lit=(flag == "-literalpath"))
+    if sh == "cmd":
+        if cmd_name not in ("cd", "chdir"):
+            return False, None
+        has_d = len(seg) == 3 and not seg[1][1] and seg[1][0].lower() == "/d"
+        if len(seg) != 2 and not has_d:
+            return True, None
+        val, is_q = seg[2] if has_d else seg[1]
+        return True, _resolve_dir(val, is_q, cwd, sh, is_win, env, is_cd=True, has_d=has_d)
+    if cmd_name != "cd":
+        return False, None
+    if len(seg) != 2:
+        return True, None
+    val, is_q = seg[1]
+    return True, _resolve_dir(val, is_q, cwd, sh, is_win, env, is_cd=True)
+
+
+def _git_target(seg: list[tuple[str, bool]], loc_dir: Optional[str], cwd: str, sh: Optional[str],
+                is_win: bool, env: Optional[Mapping[str, str]]) -> Optional[str]:
+    """The directory a git segment runs in, or None when it is not a plain allowed git call."""
+    idx = 1
+    git_c_dir: Optional[str] = None
+    if idx < len(seg) and not seg[idx][1] and seg[idx][0] == "-C":
+        idx += 1
+        if idx >= len(seg):
+            return None
+        val, is_q = seg[idx]
+        git_c_dir = _resolve_dir(val, is_q, loc_dir if loc_dir else cwd, sh, is_win, env)
+        if not git_c_dir:
+            return None
+        idx += 1
+
+    if idx >= len(seg):
+        return None
+    sub_tok, sub_is_q = seg[idx]
+    if sub_is_q or sub_tok not in _GIT_ALLOWED_SUBCOMMANDS:
+        return None
+    idx += 1
+
+    for arg_val, arg_is_q in seg[idx:]:
+        if not arg_is_q and "\\" in arg_val:
+            return None
+        if sh == "powershell" and not arg_is_q and ("," in arg_val or "@" in arg_val):  # PowerShell splat/array arguments
+            return None
+        if (
+            arg_val == "-C"
+            or arg_val in ("-x", "-o")
+            or arg_val.startswith(("--git-dir", "--work-tree", "--exec", "--extcmd", "--output", "--ext-diff", "--textconv"))
+        ):
             return None
 
-        # Drive check for cmd and unknown shell
-        m_d = re.match(r"^([a-zA-Z]):", val)
-        if m_d:
-            if sh is None:
-                m_c = re.match(r"^([a-zA-Z]):", base)
-                if not m_c or m_d.group(1).upper() != m_c.group(1).upper():
-                    return None
-            elif is_cd and sh == "cmd" and not has_d:
-                m_c = re.match(r"^([a-zA-Z]):", base)
-                if (m_c and m_d.group(1).upper() != m_c.group(1).upper()) or not m_c:
-                    return None
+    if git_c_dir:
+        return git_c_dir
+    return loc_dir if loc_dir else os.path.normcase(os.path.abspath(cwd))
 
-        is_posix_abs = val.startswith("/")
-        is_win_abs = bool(_TARGET_UNC_OR_DRIVE.match(val))
-        is_abs = is_win_abs if is_win else is_posix_abs
-        if is_cd and not is_abs and sh in ("bash", None):
-            eff_env = os.environ if env is None else env
-            if eff_env.get("CDPATH"):
-                return None
 
-        target = val if is_abs else os.path.join(base, val)
-        abs_p = os.path.abspath(target)
-        return os.path.normcase(abs_p) if os.path.isdir(abs_p) else None
+def strict_target(
+    command: str,
+    cwd: str,
+    shell: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Return the absolute, normalised directory the command clearly runs git in, or None."""
+    if not _plain_input(command, cwd, env):
+        return None
+    is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
+    accepted, sh = _dialect(shell)
+    if not accepted:
+        return None
+    segments = _split_segments(command, sh)
+    if not segments:
+        return None
 
     loc_dir: Optional[str] = None
     git_targets: list[str] = []
@@ -477,89 +563,21 @@ def strict_target(
         word, word_is_q = seg[0]
         if word_is_q or not word.isascii():
             return None
+        cmd_name = word if sh in ("bash", None) else word.lower()
 
-        is_case_sensitive = sh in ("bash", None)
-        cmd_name = word if is_case_sensitive else word.lower()
-
-        # LOCATION segment
-        is_loc = False
-        if sh == "powershell":
-            if cmd_name in ("cd", "chdir", "set-location", "sl", "push-location", "pushd"):
-                is_loc = True
-                flag = seg[1][0].lower() if len(seg) == 3 and not seg[1][1] else ""
-                has_flag = flag in ("-path", "-literalpath")
-                if len(seg) != 2 and not has_flag:
-                    return None
-                val, is_q = seg[2] if has_flag else seg[1]
-                p = resolve_path(val, is_q, cwd, is_cd=True, is_lit=(flag == "-literalpath"))
-                if not p:
-                    return None
-                loc_dir = p
-        elif sh == "cmd":
-            if cmd_name in ("cd", "chdir"):
-                is_loc = True
-                has_d = len(seg) == 3 and not seg[1][1] and seg[1][0].lower() == "/d"
-                if len(seg) != 2 and not has_d:
-                    return None
-                val, is_q = seg[2] if has_d else seg[1]
-                p = resolve_path(val, is_q, cwd, is_cd=True, has_d=has_d)
-                if not p:
-                    return None
-                loc_dir = p
-        elif sh in ("bash", None):
-            if cmd_name == "cd":
-                is_loc = True
-                if len(seg) != 2:
-                    return None
-                val, is_q = seg[1]
-                p = resolve_path(val, is_q, cwd, is_cd=True)
-                if not p:
-                    return None
-                loc_dir = p
-
+        is_loc, p = _cd_target(seg, cmd_name, sh, cwd, is_win, env)
         if is_loc:
-            if seg_idx != 0 or (sh is None and sep_after == ";"):
+            if not p or seg_idx != 0 or (sh is None and sep_after == ";"):
                 return None
+            loc_dir = p
             continue
 
-        # GIT segment
-        if cmd_name == "git":
-            idx = 1
-            git_c_dir: Optional[str] = None
-            if idx < len(seg) and not seg[idx][1] and seg[idx][0] == "-C":
-                idx += 1
-                if idx >= len(seg):
-                    return None
-                val, is_q = seg[idx]
-                p = resolve_path(val, is_q, loc_dir if loc_dir else cwd)
-                if not p:
-                    return None
-                git_c_dir = p
-                idx += 1
-
-            if idx >= len(seg):
-                return None
-            sub_tok, sub_is_q = seg[idx]
-            if sub_is_q or sub_tok not in _GIT_ALLOWED_SUBCOMMANDS:
-                return None
-            idx += 1
-
-            for arg_val, arg_is_q in seg[idx:]:
-                if not arg_is_q and "\\" in arg_val:
-                    return None
-                if sh == "powershell" and not arg_is_q and ("," in arg_val or "@" in arg_val):  # PowerShell splat/array arguments
-                    return None
-                if (
-                    arg_val == "-C"
-                    or arg_val in ("-x", "-o")
-                    or arg_val.startswith(("--git-dir", "--work-tree", "--exec", "--extcmd", "--output", "--ext-diff", "--textconv"))
-                ):
-                    return None
-
-            git_targets.append(git_c_dir if git_c_dir else (loc_dir if loc_dir else os.path.normcase(os.path.abspath(cwd))))
-            continue
-
-        return None
+        if cmd_name != "git":
+            return None
+        target = _git_target(seg, loc_dir, cwd, sh, is_win, env)
+        if target is None:
+            return None
+        git_targets.append(target)
 
     if not git_targets or not all(t == git_targets[0] for t in git_targets):
         return None
