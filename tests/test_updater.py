@@ -180,8 +180,9 @@ def test_perform_self_upgrade_pipx():
     mock_proc = MagicMock()
     mock_proc.returncode = 0
 
-    with patch("sys.prefix", "C:/Users/Admin/.local/pipx/venvs/banh-mi-guard"), \
-         patch("shutil.which", return_value="C:/pipx/pipx.exe"), \
+    with patch("sys.platform", "linux"), \
+         patch("sys.prefix", "/home/u/.local/pipx/venvs/banh-mi-guard"), \
+         patch("shutil.which", return_value="/usr/bin/pipx"), \
          patch("subprocess.run", return_value=mock_proc) as mock_run:
         success, msg = perform_self_upgrade()
         assert success is True
@@ -189,6 +190,26 @@ def test_perform_self_upgrade_pipx():
         called_cmd = mock_run.call_args[0][0]
         assert "install" in called_cmd
         assert "--force" in called_cmd
+
+
+def test_perform_self_upgrade_pipx_on_windows_reinstalls_with_the_venv_pip():
+    """On Windows the running venv's python.exe is locked, so pipx cannot recreate the venv: use its pip."""
+    from guard.core.updater import perform_self_upgrade
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    venv_python = "C:/Users/u/AppData/Local/pipx/pipx/venvs/banh-mi-guard/Scripts/python.exe"
+    with patch("sys.platform", "win32"), \
+         patch("sys.prefix", "C:/Users/u/AppData/Local/pipx/pipx/venvs/banh-mi-guard"), \
+         patch("sys.executable", venv_python), \
+         patch("shutil.which", return_value=None), \
+         patch("subprocess.run", return_value=mock_proc) as mock_run:
+        success, _ = perform_self_upgrade()
+        assert success is True
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd[:3] == [venv_python, "-m", "pip"]
+        assert "--force-reinstall" in called_cmd
 
 
 def test_perform_self_upgrade_pip_fallback(clean_pip_env):

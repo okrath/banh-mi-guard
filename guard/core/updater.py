@@ -214,6 +214,10 @@ def perform_ocr_upgrade(force: bool = False, quarantine_days: float = 3.0) -> Tu
 
 def _upgrade_via_pipx(repo_url: str) -> Optional[Tuple[bool, str]]:
     """Attempt upgrading via pipx if installed in a pipx environment."""
+    if sys.platform == "win32":
+        # `pipx install --force` recreates the venv, whose python.exe is running this very command and is
+        # locked on Windows; pipx then falls back to the old venv and skips an unchanged version
+        return None
     is_pipx = (
         "pipx" in sys.prefix.lower()
         or "pipx" in sys.executable.lower()
