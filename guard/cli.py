@@ -221,7 +221,8 @@ def main():
         console.print(f"[yellow]guard refresh skipped: {e}[/yellow]")
     maybe_trigger_background_update_check()
     try:
-        app()
+        # Click would expand globs, ~ and env vars in argv on Windows; --scope globs are matched by guard itself
+        app(windows_expand_args=False)
     finally:
         notice = get_cached_update_notice()
         if notice:
