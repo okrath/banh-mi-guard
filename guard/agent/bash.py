@@ -366,9 +366,13 @@ def _read_quoted(command: str, i: int, sh: Optional[str]) -> Optional[tuple[str,
     return content, after_i
 
 
+def _separators(sh: Optional[str]) -> tuple[str, ...]:
+    return (";",) if sh == "powershell" else (("&&",) if sh == "cmd" else ("&&", ";"))
+
+
 def _split_segments(command: str, sh: Optional[str]) -> Optional[list[tuple[list[tuple[str, bool]], str]]]:
     """The command as (text, was quoted) token segments with their following separator, or None."""
-    seps = (";",) if sh == "powershell" else (("&&",) if sh == "cmd" else ("&&", ";"))
+    seps = _separators(sh)
     segments: list[tuple[list[tuple[str, bool]], str]] = []
     tokens: list[tuple[str, bool]] = []
     i, n = 0, len(command)
@@ -423,6 +427,8 @@ def _resolve_dir(val: str, is_q: bool, base: str, sh: Optional[str], is_win: boo
     # Reject UNC and device paths before any filesystem calls
     if val.startswith(("\\\\", "//")):
         return None
+    if is_win and sh == "bash":  # MSYS drive path: /c/Users/x names C:/Users/x
+        val = re.sub(r"^/([a-zA-Z])/", r"\1:/", val)
     if not val.isascii() or val.startswith(("-", "~")):
         return None
     if any(c in val for c in ("$", "%", "*", "?")):
@@ -539,18 +545,10 @@ def _git_target(seg: list[tuple[str, bool]], loc_dir: Optional[str], cwd: str, s
     return loc_dir if loc_dir else os.path.normcase(os.path.abspath(cwd))
 
 
-def strict_target(
-    command: str,
-    cwd: str,
-    shell: Optional[str] = None,
-    env: Optional[Mapping[str, str]] = None,
-) -> Optional[str]:
-    """Return the absolute, normalised directory the command clearly runs git in, or None."""
+def _parsed_target(command: str, cwd: str, sh: Optional[str], is_win: bool,
+                   env: Optional[Mapping[str, str]]) -> Optional[str]:
+    """The directory every git call in the command runs in, when the whole command parses; else None."""
     if not _plain_input(command, cwd, env):
-        return None
-    is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
-    accepted, sh = _dialect(shell)
-    if not accepted:
         return None
     segments = _split_segments(command, sh)
     if not segments:
@@ -585,3 +583,59 @@ def strict_target(
         return None
 
     return git_targets[0]
+
+
+# Text after the commit that may make another commit, quoted or not: the word commit anywhere, eval or
+# source, a nested shell or interpreter at a command position, and a git call that names a config
+# option, directory, alias (ci) or a commit-creating subcommand
+_SHELL_WORDS = r"(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|cmd|python[\d.]*)(?:\.exe)?\b"
+_WRAPPERS = r"(?:env|sudo|doas|nohup|time|nice|exec|command|xargs|timeout|stdbuf|setsid|su|runuser|busybox|flock|strace|ionice|chroot|unshare|script)"
+_MAY_COMMIT_LATER = re.compile(
+    r"commit|\b(?:eval|source)\b"
+    # a shell at a command position: after a separator, a newline, $( , or a shell keyword or brace,
+    # optionally quoted and path-qualified
+    rf"|(?:^|[;&|(`\n]|\$\()\s*(?:(?:then|do|else|elif|if|while|until|!|\{{)\s+|\w+=\S*\s+)*[\"']?(?:[\w.:/\\-]*[/\\])?{_SHELL_WORDS}"
+    # a shell after a wrapper (sudo -u root bash, env A=1 python)
+    rf"|\b{_WRAPPERS}\b[^;&|\n]*{_SHELL_WORDS}"
+    r"|\bgit\b[^;&|]*(?:\s-[cC](?:\s|$)|--exec-path|--git-dir|--work-tree|\bci\b)"
+    r"|\b(?:merge|am|cherry-pick|rebase|revert|pull)\b",
+    re.IGNORECASE,
+)
+
+
+def _commit_prefix_target(command: str, cwd: str, sh: Optional[str], is_win: bool,
+                          env: Optional[Mapping[str, str]]) -> Optional[str]:
+    """
+    The directory of the commit in a command that does not parse as a whole: the shortest prefix that
+    ends at a separator, parses, and holds a commit, when nothing after it may make another commit.
+    Only the prefix is parsed; the rest is screened conservatively for any further commit.
+    """
+    sep_re = re.compile("|".join(re.escape(s) for s in _separators(sh)))
+    for end in [m.start() for m in sep_re.finditer(command)] + [len(command)]:
+        rest = command[end:]
+        target = _parsed_target(command[:end], cwd, sh, is_win, env)
+        if target and is_git_commit(command[:end], Path(cwd)) and not _MAY_COMMIT_LATER.search(rest) \
+                and not is_git_commit(rest, Path(cwd)):
+            # consecutive separators after the commit are a syntax error: the whole command is refused
+            return None if re.match(r"\s*(?:;|&&)\s*(?:;|&&)", rest) else target
+    return None
+
+
+def strict_target(
+    command: str,
+    cwd: str,
+    shell: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """
+    Return the absolute, normalised directory the command clearly runs git in, or None.
+    A commit is also resolved when a part after it does not parse (see _commit_prefix_target).
+    """
+    accepted, sh = _dialect(shell)
+    if not accepted:
+        return None
+    is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
+    target = _parsed_target(command, cwd, sh, is_win, env)
+    if target is None and is_git_commit(command):
+        target = _commit_prefix_target(command, cwd, sh, is_win, env)
+    return target
