@@ -537,7 +537,9 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                     system_prompt,
                     prompt_text if attempt == 0 else prompt_text + FORMAT_REMINDER,
                 )
-                verdict = self._parse_llm_response(raw_response, model_name=model_name, focus=focus)
+                verdict = self._parse_llm_response(
+                    raw_response, model_name=model_name, focus=focus, partial=len(batches) > 1,
+                )
                 if verdict is not None:
                     self._last_unreviewed.extend(getattr(verdict, "_unreviewed_topics", []))
                     break
@@ -604,7 +606,7 @@ Verified evidence (computed by guard over the whole repository, valid for every 
                 call=counted_call,
                 header=header,
                 parts=batches,
-                parse=lambda t: parse_findings(t, self._task_text),
+                parse=lambda t: parse_findings(t, self._task_text, partial=len(batches) > 1),
                 max_calls=remaining_budget,
                 format_reminder=FORMAT_REMINDER,
                 system_prompt=system_prompt,
@@ -841,10 +843,12 @@ Verified evidence (computed by guard over the whole repository, valid for every 
         raw = diff_summary.raw_diff if diff_summary else ""
         return partition_diff(raw, batch_chars=REVIEW_BATCH_CHARS, max_batches=REVIEW_MAX_BATCHES).parts
 
-    def _parse_llm_response(self, text: str, model_name: str = "LLM", focus: str = "all") -> Optional[LLMReviewVerdict]:
+    def _parse_llm_response(
+        self, text: str, model_name: str = "LLM", focus: str = "all", partial: bool = False,
+    ) -> Optional[LLMReviewVerdict]:
         try:
             score_match = re.search(r"SCORE:\s*([\d\.]+)", text)
-            findings = parse_findings(text, getattr(self, "_task_text", ""))
+            findings = parse_findings(text, getattr(self, "_task_text", ""), partial=partial)
             if findings is None:
                 # No readable FINDINGS list is no LLM review: asked again once (format reminder), then
                 # reported as not run. Only structured findings approve or block

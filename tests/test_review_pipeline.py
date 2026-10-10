@@ -872,3 +872,76 @@ def test_a_section_after_findings_without_finding_lines_still_ends_the_block():
     text = "FINDINGS:\n- high | security | b.py:2 | - | sql injection\n  Threatmodel:\n  - attacker controls b\n"
     parsed = parse_findings(text, "task")
     assert parsed is not None and [f.severity for f in parsed] == ["high"]
+
+
+# ---------------------------------------------------------------------------
+# 7. Requirement findings in a split diff
+# ---------------------------------------------------------------------------
+
+SPLIT_TASK = "Keep the service offline. Retries: max three"
+REQUIREMENT_LINE = "- medium | requirement | src/app.py:7 | Keep the service offline | Calls the network"
+
+
+def test_requirement_finding_blocks_in_single_part_and_is_advisory_in_split_diff():
+    text = f"SCORE: 6.0\nSUMMARY: x\nFINDINGS:\n{REQUIREMENT_LINE}\n"
+    single = parse_findings(text, SPLIT_TASK)
+    assert single is not None and single[0].blocking
+    assert single[0].why_blocking == "violates a stated requirement"
+
+    split = parse_findings(text, SPLIT_TASK, partial=True)
+    assert split is not None and not split[0].blocking
+    assert split[0].why_blocking == ""
+    assert "requirement not verified" in split[0].description
+    assert split[0].id == single[0].id
+
+
+def test_high_correctness_finding_still_blocks_in_split_diff():
+    text = "SCORE: 3.0\nSUMMARY: x\nFINDINGS:\n- high | correctness | src/app.py:7 | - | Crash on empty input\n"
+    split = parse_findings(text, SPLIT_TASK, partial=True)
+    assert split is not None and split[0].blocking
+    assert split[0].why_blocking == "high correctness"
+
+
+def _two_part_review(monkeypatch: pytest.MonkeyPatch, part_one_answer: str, prompt: str):
+    engine = LLMReviewerEngine(config=_make_config())
+    chunk1 = "diff --git a/src/app.py b/src/app.py\n@@ -5,3 +5,3 @@\n-old\n+new\n"
+    chunk2 = "diff --git a/src/other.py b/src/other.py\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+    monkeypatch.setattr("guard.core.llm_reviewer.REVIEW_BATCH_CHARS", len(chunk1) + 10)
+
+    def mock_call(cfg: object, prompt: str, system_prompt: str, **kwargs: object) -> str:
+        _ = cfg, system_prompt, kwargs
+        if "+new" in prompt:
+            return part_one_answer
+        return "SCORE: 9.0\nSUMMARY: part two ok\nFINDINGS:\nNone\n"
+
+    monkeypatch.setattr("guard.core.llm_reviewer.call_llm", mock_call)
+    return engine.review(
+        prompt=prompt, domain="backend", diff_summary=DiffSummary(raw_diff=chunk1 + chunk2),
+    )
+
+
+def test_requirement_only_finding_is_advisory_across_two_parts(monkeypatch: pytest.MonkeyPatch):
+    answer = f"SCORE: 6.0\nSUMMARY: part one\nFINDINGS:\n{REQUIREMENT_LINE}\n"
+    verdict = _two_part_review(monkeypatch, answer, SPLIT_TASK)
+    assert verdict.verdict == ReviewVerdict.APPROVED
+    assert len(verdict.findings) == 1 and not verdict.findings[0].blocking
+
+
+def test_high_correctness_finding_still_revises_across_two_parts(monkeypatch: pytest.MonkeyPatch):
+    answer = "SCORE: 3.0\nSUMMARY: part one\nFINDINGS:\n- high | correctness | src/app.py:7 | - | Crash on empty input\n"
+    verdict = _two_part_review(monkeypatch, answer, SPLIT_TASK)
+    assert verdict.verdict == ReviewVerdict.REVISE
+
+
+def test_requirement_only_finding_still_revises_single_part(monkeypatch: pytest.MonkeyPatch):
+    engine = LLMReviewerEngine(config=_make_config())
+    diff_text = "diff --git a/src/app.py b/src/app.py\n@@ -5,3 +5,3 @@\n-old\n+new\n"
+    monkeypatch.setattr(
+        "guard.core.llm_reviewer.call_llm",
+        lambda cfg, prompt, system_prompt, **kwargs: f"SCORE: 6.0\nSUMMARY: one\nFINDINGS:\n{REQUIREMENT_LINE}\n",
+    )
+    verdict = engine.review(
+        prompt=SPLIT_TASK, domain="backend", diff_summary=DiffSummary(raw_diff=diff_text),
+    )
+    assert verdict.verdict == ReviewVerdict.REVISE
+    assert verdict.findings[0].blocking
