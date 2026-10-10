@@ -1,7 +1,8 @@
 # Seed labels for the benchmark corpus
 
-Each row is a commit that is an ancestor of `origin/main` (checked). "Diff" means `git show <commit>`
-restricted to the files named. The task prompt for a case is the plan or task text that produced the
+Each row is a commit that is an ancestor of `origin/main` (checked). "Diff" means the full
+`git show --format= <commit>`: every file the commit changes, not only the files named in the row. The
+files named in a row are the defect location labels only; they never restrict the stored diff. The task prompt for a case is the plan or task text that produced the
 change; the worker writes a one-paragraph prompt per case from the commit message and the file list.
 Defects were confirmed by independent read-only review during the session, with file and line.
 
