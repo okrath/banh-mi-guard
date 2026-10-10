@@ -310,6 +310,8 @@ _GIT_ALLOWED_SUBCOMMANDS = frozenset({
     "rev-parse", "ls-files", "branch",
 })
 
+_MAX_COMMAND = 4096  # longer commands are never analysed: their target is unclear
+
 
 def _plain_input(command: str, cwd: str, env: Optional[Mapping[str, str]]) -> bool:
     """Whether the command, working directory and environment are simple enough to analyse."""
@@ -317,7 +319,7 @@ def _plain_input(command: str, cwd: str, env: Optional[Mapping[str, str]]) -> bo
         return False
     if os.name == "nt" and not _TARGET_UNC_OR_DRIVE.match(cwd):
         return False
-    if not command or not command.strip() or len(command) > 4096:
+    if not command or not command.strip() or len(command) > _MAX_COMMAND:
         return False
     if "\0" in command or "\r" in command or "\n" in command:
         return False
@@ -636,6 +638,7 @@ def strict_target(
         return None
     is_win = os.name == "nt" or bool(_TARGET_UNC_OR_DRIVE.match(cwd))
     target = _parsed_target(command, cwd, sh, is_win, env)
-    if target is None and is_git_commit(command):
+    # The fallback parses one prefix per separator: over the cap it would turn a fast refusal quadratic
+    if target is None and len(command) <= _MAX_COMMAND and is_git_commit(command):
         target = _commit_prefix_target(command, cwd, sh, is_win, env)
     return target
