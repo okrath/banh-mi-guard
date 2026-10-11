@@ -1,5 +1,5 @@
 """
-LLM Reviewer Engine — The Final Safety Gate.
+LLM Reviewer Engine — the final review.
 Uses the LLM configured by the user (OpenAI, Anthropic, DeepSeek, Ollama, etc.)
 to act as the Senior Architect & Code Reviewer:
 1. Reads the aggregated verification report (diff summary, build status, OCR rules, invariant checks)
@@ -97,7 +97,7 @@ class LLMReviewVerdict(BaseModel):
 
 class LLMReviewerEngine:
     """
-    Final Gatekeeper powered by the user-configured LLM (or local deterministic fallback).
+    Final reviewer powered by the user-configured LLM (or local deterministic fallback).
     """
 
     def __init__(self, config: Optional[GuardConfig] = None):
@@ -384,7 +384,7 @@ class LLMReviewerEngine:
     @staticmethod
     def _build_system_prompt(model_name: str, focus_instruction: str) -> str:
         return (
-            f"You are the Senior Lead Architect and Code Reviewer acting as the final safety gate (using model {model_name}).\n"
+            f"You are the Senior Lead Architect and Code Reviewer giving the final review (using model {model_name}).\n"
             f"Review Directive: {focus_instruction}\n"
             "Your task is to audit the post-task verification report and git diff produced by an AI coding agent.\n"
             "Only the facts in the report are verified: the build status is exactly as stated, and no behavioral test suite has run unless stated.\n"
