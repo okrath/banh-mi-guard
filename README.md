@@ -5,7 +5,7 @@
   <br>
   <strong>Dual-Gate Impact Analysis & Regression Guard for AI-Assisted Development</strong>
   <br>
-  <em>Enforcing the Sandwich Pattern with scope control, deterministic diff auditing, project invariants, and LLM gatekeeping.</em>
+  <em>Enforcing the Sandwich Pattern with scope control, deterministic diff auditing, project invariants, and an LLM review.</em>
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -62,7 +62,7 @@ To run deep repository inspection with Alibaba OCR, use `guard post --full`. For
 Every modification is verified before and after execution across three layers:
 1. **Deterministic Pre-Task Gate (0 tokens):** Locks declared scope boundaries, records baseline snapshots, and evaluates project invariants.
 2. **Deterministic Post-Task Verification (0 tokens):** Audits diff blast radius, runs compilation/tests, checks for deleted references (`DEAD-REF`), evaluates static rules (`SEC-001` to `SEC-008`), and detects code hygiene issues.
-3. **Generative LLM Gatekeeper:** Configured LLM (Claude, GPT, DeepSeek, Ollama, or local agent CLIs) evaluates batched diffs and verified evidence for a final `APPROVED` or `REVISE` verdict. Approved sessions receive a cryptographic HMAC signature required by Git commit hooks.
+3. **Generative LLM Review:** Configured LLM (Claude, GPT, DeepSeek, Ollama, or local agent CLIs) evaluates batched diffs and verified evidence for a final `APPROVED` or `REVISE` verdict. Most of its findings are advisory review comments; the hard blocking comes from the deterministic checks of pillars 1 and 2 (see [Scoring and the final verdict](docs/quality-pillars.md#scoring-and-the-final-verdict)). Approved sessions receive a cryptographic HMAC signature required by Git commit hooks.
 
 For architectural diagrams, taxonomy, and security specifications, see [Architecture Specification](docs/architecture.md).
 

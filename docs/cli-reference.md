@@ -107,7 +107,7 @@ guard post [options]
 
 A flag you do not pass keeps the value from `guard config review`. Four more review options have no flag and are set only there: `coverage_notes`, `part_manifest`, `test_evidence` and `stage_timeout_s`.
 
-*Output:* Inspects git diff, detects out-of-scope and deleted files, scans the built-in rules and code hygiene, runs the Alibaba OCR review (only with `--full`), executes the build command, runs invariant checks, and requests **Final Gate Approval from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
+*Output:* Inspects git diff, detects out-of-scope and deleted files, scans the built-in rules and code hygiene, runs the Alibaba OCR review (only with `--full`), executes the build command, runs invariant checks, and requests a **final review from your configured LLM** (`APPROVED` or `REVISE`) in `.guard/POST_TASK_REPORT.md`.
 
 ### Inspection Pipeline & Gate Decisions:
 Post audits against the base commit recorded at pre, runs the build command, invariant checks and the removed-symbol reference check, then asks the LLM.
