@@ -21,7 +21,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
 | **Simplicity Engine** | KISS/YAGNI & Dependency Bloat Scanner | <30ms (Diff) / <2s (Full) | **0 tokens ($0.00)** | Checks the necessity ladder: catches redundant packages (LAZY-001); premature abstractions and wheel reinventions are checked by the LLM review in every language. Net LOC is reported, never scored. |
 | **Project Invariants** | Regex checks from `guard.invariants.json` | <100ms | **0 tokens ($0.00)** | Project rules evaluated on the current files at pre (baseline) and post. Rules without checks are `UNVERIFIED`; removing or relaxing a rule raises `INV-WEAKENED`. |
 | **Removal Reference Check** | Whole-repository search | <1s | **0 tokens ($0.00)** | Removed string keys, exports and CSS classes that are still referenced raise `DEAD-REF`; the summary is passed to the LLM as verified evidence. |
-| **Your Configured LLM** | An API (Claude, GPT, DeepSeek, Ollama) or your own agent CLI (`claude`, `codex`, `omp`), which then also answers Alibaba OCR through a local endpoint, falling back to OCR's delegation mode (its rules and the diff in one prompt per rule group) when that does not run | No time limit (it ends when the LLM answers or fails) | User standard pricing, or your subscription | **Final Safety Gatekeeper**, consulted when no hard block applies. Large diffs are reviewed in parts (one REVISE rejects the whole diff); deleted files are sent as a one-line note. It may propose new invariants, which guard writes to the local `.guard/invariants.json` only after they pass on the current code. If the LLM does not answer, the report says "Heuristic Gate (no LLM review)" and why. |
+| **Your Configured LLM** | An API (Claude, GPT, DeepSeek, Ollama) or your own agent CLI (`claude`, `codex`, `omp`), which then also answers Alibaba OCR through a local endpoint, falling back to OCR's delegation mode (its rules and the diff in one prompt per rule group) when that does not run | No time limit (it ends when the LLM answers or fails) | User standard pricing, or your subscription | **Final reviewer**, consulted when no hard block applies. Its findings block only when they are critical or high correctness or security issues, or quote a task requirement, so most of them are advisory (see [Quality Pillars: Scoring](quality-pillars.md#scoring-and-the-final-verdict)). Large diffs are reviewed in parts (one REVISE rejects the whole diff); deleted files are sent as a one-line note. It may propose new invariants, which guard writes to the local `.guard/invariants.json` only after they pass on the current code. If the LLM does not answer, the report says "Heuristic Gate (no LLM review)" and why. |
 
 ---
 
@@ -53,7 +53,7 @@ The architecture separates deterministic checks (no tokens) from the generative 
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. FINAL SAFETY GATE: YOUR CONFIGURED LLM                   │
+│ 3. FINAL REVIEW: YOUR CONFIGURED LLM                        │
 │ (Claude / GPT / DeepSeek / Ollama / OpenAI-compatible)      │
 │ • Reviews the report, verified evidence & batched diff      │
 │ • Technical Audit (architecture, memory, nulls, scope)      │
