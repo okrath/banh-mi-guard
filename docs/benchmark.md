@@ -54,6 +54,7 @@ python -m bench compare BASELINE.json VARIANT.json [--opt-in-by-design] [--out P
 Treat a comparison with care:
 
 - Compare runs with the same number of repeats. The checks compare totals and unions over repeats, so when the two results were measured with different repeat counts `compare` reports "inconclusive: repeats differ" and never adopts.
+- A case without an LLM answer (the CLI failed or timed out) says nothing about the variant. When either run has such cases, `compare` reports "inconclusive" and never adopts; rerun once the LLM answers every case.
 - A single run of a non-deterministic model is noisy. A difference in one or two cases is not evidence; look at the stability of the baseline before reading a gain into it.
 - The corpus is small and comes from one project, and its labels were written by people and models of the same kind that are being measured. A result describes this corpus, not review quality in general.
 - A variant that reports no gain here is not proven useless, only unmeasured at this noise level.
