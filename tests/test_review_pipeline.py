@@ -24,6 +24,14 @@ from guard.core.review_options import ReviewOptions
 # ---------------------------------------------------------------------------
 
 
+# The one intended change since the pinned commit: the reviewer's role wording.
+_ROLE_RENAME = ("acting as the final safety gate", "giving the final review")
+
+
+def _pinned_system_prompt(old: str) -> str:
+    return old.replace(*_ROLE_RENAME)
+
+
 def _load_old_reviewer_from_pinned(monkeypatch: pytest.MonkeyPatch):
     """Load LLMReviewerEngine from the pinned commit 7f67d12."""
     check = subprocess.run(
@@ -129,7 +137,7 @@ def test_equality_with_pinned_commit_on_single_part_diff(monkeypatch: pytest.Mon
 
     assert len(old_prompts) == 1
     assert len(new_prompts) == 1
-    assert new_prompts[0]["system_prompt"] == old_prompts[0]["system_prompt"]
+    assert new_prompts[0]["system_prompt"] == _pinned_system_prompt(old_prompts[0]["system_prompt"])
     assert new_prompts[0]["prompt"] == old_prompts[0]["prompt"]
 
     assert new_verdict.verdict == old_verdict.verdict
@@ -183,7 +191,7 @@ def test_equality_with_pinned_commit_on_multipart_diff(monkeypatch: pytest.Monke
 
     assert len(old_prompts) == len(new_prompts) > 1
     for i in range(2):
-        assert new_prompts[i]["system_prompt"] == old_prompts[i]["system_prompt"]
+        assert new_prompts[i]["system_prompt"] == _pinned_system_prompt(old_prompts[i]["system_prompt"])
         assert new_prompts[i]["prompt"] == old_prompts[i]["prompt"]
 
     assert new_verdict.verdict == old_verdict.verdict

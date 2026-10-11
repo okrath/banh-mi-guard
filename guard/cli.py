@@ -8,7 +8,7 @@ Provides:
 - `guard run "<prompt>" -- <cmd>`: Sandwich pattern wrapper
 - `guard doctor`: System diagnostic check & supply-chain update quarantine audit
 - `guard update` [ocr | self]: Safe upgrades respecting 3-day quarantine policy
-- `guard review [--focus]`: Final Safety Gate Review by the configured LLM
+- `guard review [--focus]`: Final review by the configured LLM
 """
 
 from __future__ import annotations
