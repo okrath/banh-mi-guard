@@ -190,6 +190,8 @@ if __name__ != "__main__":
     import guard.commands.review  # noqa: E402,F401
     import guard.commands.agent  # noqa: E402,F401
     import guard.commands.maintenance  # noqa: E402,F401
+    import guard.commands.watch  # noqa: E402,F401
+    import guard.commands.worker_verify  # noqa: E402,F401
     # isort: on
 
 
