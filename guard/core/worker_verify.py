@@ -24,6 +24,19 @@ TAIL_CHARS = 400
 SMALL_IMAGE_BYTES = 8 * 1024
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 REPORT_SUFFIXES = tuple(f".{ext}" for ext in ("png", "jpg", "jpeg", "webm", "mp4", "json", "log", "txt", "md"))
+# Documentation quotes the weakening patterns themselves, and config data is not executable,
+# so the weakening scan skips these extensions - a deny-list, so unknown code files stay covered.
+SCAN_SKIP_SUFFIXES = (
+    ".md",
+    ".rst",
+    ".txt",
+    ".adoc",
+    ".html",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+)
 
 TEST_PATH_RE = re.compile(r"(^|/)test_.*\.py$|_test\.py$|(^|/)tests?/.*\.py$|\.(spec|test)\.[cm]?[jt]sx?$")
 ASSERTION_RE = re.compile(r"\b(assert|expect)\b")
@@ -43,7 +56,7 @@ _SKIP_FOCUS_SOURCE = "|".join(
         r"\b(describe|it|test)\.(skip|only|todo)\(",
         r"\bx(it|describe)\(",
         r"\.only\(",
-        r"pytest\.mark\.(skip|xfail)",
+        r"pytest\.mark\.(?:skip|xfail)\b",
         r"pytest\.skip\(",
         r"unittest\.skip",
         "@ski" + "p(If)?\\(",
@@ -224,13 +237,47 @@ def _scope_issues(
     return []
 
 
-def _diff_lines(worktree: Path, base: str) -> tuple[list[str], list[str]]:
-    """Added and removed lines of `base` vs the working tree, headers excluded."""
-    text = _git(worktree, "diff", base, "-U0")
-    lines = text.splitlines()
-    added = [line for line in lines if ADDED_LINE_RE.match(line)]
-    removed = [line for line in lines if REMOVED_LINE_RE.match(line)]
-    return added, removed
+def _diff_path(raw: str) -> str | None:
+    """The repo-relative path a `---`/`+++` diff header names; None for `/dev/null`."""
+    raw = raw.strip()
+    if raw.startswith('"'):  # Git quotes paths with unusual characters (core.quotePath)
+        raw = _unquote_git_path(raw)
+    if not raw or raw == "/dev/null":
+        return None
+    return raw[2:] if raw[:2] in ("a/", "b/") else raw
+
+
+def _diff_files(worktree: Path, base: str) -> list[tuple[str, list[str], list[str]]]:
+    """Added and removed lines of `base` vs the working tree, grouped per changed file.
+
+    A deleted file keeps its old path; a file with no content change has no lines and no entry.
+    """
+    files: list[tuple[str, list[str], list[str]]] = []
+    for chunk in re.split(r"^diff --git ", _git(worktree, "diff", base, "-U0"), flags=re.MULTILINE)[1:]:
+        added: list[str] = []
+        removed: list[str] = []
+        old_path = new_path = None
+        in_hunk = False
+        for line in chunk.splitlines():
+            if not in_hunk and line.startswith("--- "):
+                old_path = _diff_path(line[4:])
+            elif not in_hunk and line.startswith("+++ "):
+                new_path = _diff_path(line[4:])
+            elif line.startswith("@@"):
+                in_hunk = True
+            elif in_hunk and ADDED_LINE_RE.match(line):
+                added.append(line)
+            elif in_hunk and REMOVED_LINE_RE.match(line):
+                removed.append(line)
+        path = new_path or old_path
+        if path is not None:
+            files.append((path, added, removed))
+    return files
+
+
+def _scannable(path: str) -> bool:
+    """Whether the weakening scan reads this file: everything but docs and config data."""
+    return Path(path).suffix.lower() not in SCAN_SKIP_SUFFIXES
 
 
 def _weakening_issues(added: list[str]) -> list[VerifyIssue]:
@@ -453,7 +500,8 @@ def verify_worker(
     changed = _changed_paths(committed, entries)
 
     result.issues.extend(_scope_issues(committed, entries, role, own))
-    added, _removed = _diff_lines(worktree, base)
+    diffs = _diff_files(worktree, base)
+    added = [line for path, lines, _removed in diffs if _scannable(path) for line in lines]
     result.issues.extend(_weakening_issues(added))
     result.issues.extend(_ci_issues(changed, own))
     result.issues.extend(_deleted_test_issues(worktree, base))

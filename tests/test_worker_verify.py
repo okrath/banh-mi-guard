@@ -21,6 +21,7 @@ WEAKENING_SAMPLES = [
     ("describe" + ".skip('x', () => {})", "weakened-skip-focus"),
     ("it" + "." + "only('x', () => {})", "weakened-skip-focus"),
     ("py" + "test.mark.skip('later')", "weakened-skip-focus"),
+    ("py" + "test.mark.xfail(reason='known bug')", "weakened-skip-focus"),
     ("npm test ||" + " true", "weakened-swallowed-failure"),
     ("npm test --" + "passWith" + "NoTests", "weakened-swallowed-failure"),
     ("// eslint-" + "disable-next-line", "weakened-lint-type-silenced"),
@@ -28,6 +29,27 @@ WEAKENING_SAMPLES = [
     ("const value = input as" + " any", "weakened-any-escape"),
     ("const value:" + " any = 1", "weakened-any-escape"),
 ]
+
+# A platform-conditional skip is a legitimate test guard, not a weakened test.
+SKIPIF_TEST = "\n".join(
+    [
+        "@" + "py" + "test.mark.skipif(os.name == 'nt', reason='windows only')",
+        "def test_platform():",
+        "    assert True",
+        "",
+    ]
+)
+
+# What a docs page looks like when it quotes the weakening patterns back at the reader: the
+# quoted strings are documentation, not executable checks, so they must not fail the scan.
+DOCS_QUOTING_THE_PATTERNS = "\n".join(
+    [
+        "Do not add `describe" + ".skip(` or `py" + "test.mark.skip(` to a suite.",
+        "Do not pipe a test through `npm test ||" + " true`.",
+        "No `eslint-" + "disable` and no `@ts-" + "ignore` comments.",
+        "No `as" + " any`, no `:" + " any` and no `<" + "any>` escapes.",
+    ]
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -140,6 +162,33 @@ def test_weakening_patterns(repo: Path, sample: str, code: str) -> None:
     commit_all(repo, "work")
     result = verify_worker(repo, base=base, quick=True)
     assert codes(result) == [code]
+
+
+def test_pytest_mark_skipif_is_not_a_skip(repo: Path) -> None:
+    base = head(repo)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_platform.py").write_text(SKIPIF_TEST, encoding="utf-8")
+    commit_all(repo, "a platform test")
+    result = verify_worker(repo, base=base, quick=True)
+    assert codes(result) == []
+
+
+def test_docs_patterns_and_skipif_pass_but_a_real_skip_fails(repo: Path) -> None:
+    """The smoke reproduction: quoted patterns in docs and a platform skipif must not fail."""
+    base = head(repo)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "notes.md").write_text(DOCS_QUOTING_THE_PATTERNS, encoding="utf-8")
+    (repo / "config.yaml").write_text("script: npm test ||" + " true\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    test_file = repo / "tests" / "test_platform.py"
+    test_file.write_text(SKIPIF_TEST, encoding="utf-8")
+    commit_all(repo, "docs and a platform test")
+    assert codes(verify_worker(repo, base=base, quick=True)) == []
+
+    test_file.write_text(SKIPIF_TEST + "py" + "test.mark.skip('later')" + "\n", encoding="utf-8")
+    commit_all(repo, "an unconditional skip")
+    result = verify_worker(repo, base=base, quick=True)
+    assert codes(result) == ["weakened-skip-focus"]
 
 
 def test_deleted_test_file_fails(repo: Path) -> None:
