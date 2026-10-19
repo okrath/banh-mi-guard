@@ -328,7 +328,9 @@ def test_probe_worktree_counts_an_untracked_name_with_an_arrow(tmp_path):
     odd.write_text("new\n", encoding="utf-8")
     edited_at = first.activity_ts + 5
     os.utime(odd, (edited_at, edited_at))
-    assert git(repo, "status", "--porcelain") == "?? a -> b.txt"
+    quoted = git(repo, "status", "--porcelain")
+    assert quoted in ("?? a -> b.txt", '?? "a -> b.txt"')
+    assert wr._porcelain_paths(quoted) == ["a -> b.txt"]
 
     probe = wr.probe_worktree(repo)
     assert probe.dirty is True
@@ -383,6 +385,13 @@ def test_porcelain_paths_reads_renames_and_quoted_names():
 def test_porcelain_paths_splits_arrows_only_on_rename_and_copy_codes():
     porcelain = '?? a -> b.txt\nR  old.txt -> new.txt\nC  src.txt -> copy.txt\n M x -> y.txt\n'
     assert wr._porcelain_paths(porcelain) == ["a -> b.txt", "new.txt", "copy.txt", "x -> y.txt"]
+
+
+def test_porcelain_paths_parses_quoted_arrows_and_renames():
+    assert wr._porcelain_paths('?? "a -> b.txt"') == ["a -> b.txt"]
+    assert wr._porcelain_paths("R  old.txt -> new.txt") == ["new.txt"]
+    assert wr._porcelain_paths('R  "old name.txt" -> "new name.txt"') == ["new name.txt"]
+    assert wr._porcelain_paths('?? "caf\\303\\251"') == ["café"]
 
 
 def test_unquote_decodes_a_full_octal_escape():
