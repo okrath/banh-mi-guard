@@ -861,13 +861,22 @@ _CHUNK_F = "@pytest.mark.skip(reason='x'); it.skip('y'); "
 _LINE_F = _CHUNK_F * (1900 // len(_CHUNK_F))
 
 
-def _best_of(fn, runs: int = 3) -> float:
-    """Fastest of a few runs: the minimum sheds scheduler noise on shared CI runners."""
+def _best_of(fn, runs: int = 3, target: float = 0.05) -> float:
+    """Best per-call CPU time of a few runs: preemption and scheduler noise on shared runners do
+    not count, and each sample repeats the call until it lasts at least `target` seconds, so a
+    coarse OS clock tick is not the measurement."""
     best = float("inf")
     for _ in range(runs):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
+        repeats = 1
+        while True:
+            t0 = time.process_time()
+            for _ in range(repeats):
+                fn()
+            elapsed = time.process_time() - t0
+            if elapsed >= target or repeats >= 1024:
+                break
+            repeats *= 2
+        best = min(best, elapsed / repeats)
     return best
 
 
@@ -875,16 +884,26 @@ def _assert_near_linear(small_fn, big_fn, size_ratio: float, max_exponent: float
     """
     Fail when big_fn takes more than size_ratio ** max_exponent times as long as small_fn.
     Linear work grows by size_ratio, quadratic work by size_ratio ** 2. Big timings under floor are noise.
+    CPU time (measured by `_best_of`) is sampled up to three times and the best sample decides: one
+    scheduling hiccup on a shared CI runner must not fail a test whose real cost is stable, while a
+    genuine regression is over the limit in every sample.
     """
-    t_small = _best_of(small_fn)
-    t_big = _best_of(big_fn)
-    if t_big < floor:
-        return
-    ratio = t_big / max(t_small, 1e-6)
     limit = size_ratio**max_exponent
-    assert ratio < limit, (
-        f"time grew {ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
-        f"small {t_small:.5f}s, big {t_big:.5f}s)"
+    best_ratio = None
+    attempts = 0
+    for _ in range(3):
+        attempts += 1
+        t_small = _best_of(small_fn)
+        t_big = _best_of(big_fn)
+        if t_big < floor:
+            return
+        ratio = t_big / max(t_small, 1e-6)
+        best_ratio = ratio if best_ratio is None else min(best_ratio, ratio)
+        if best_ratio < limit:
+            return
+    assert best_ratio < limit, (
+        f"time grew {best_ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
+        f"best of {attempts} samples)"
     )
 
 
@@ -931,7 +950,9 @@ def test_performance_hot_inputs_speed(name: str, line: str, fname: str, mode: st
     """
     Every hot input must scale near-linearly: 2,000 lines take at most about 2.8x as long as 1,000
     (linear gives 2x, quadratic 4x). Fixed wall-clock ceilings flake on slow CI runners, so the
-    check compares timings measured in the same process, each the best of three runs.
+    check compares CPU time measured in the same process (each side the best of three amplified
+    samples; up to three ratio samples decide), and a genuine regression is over the limit in
+    every sample.
     """
     diff_small = _hot_diff(line, fname, mode, 1000)
     diff_big = _hot_diff(line, fname, mode, 2000)
