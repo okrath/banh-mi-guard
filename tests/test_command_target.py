@@ -462,13 +462,22 @@ def test_aliases_is_git_commit(tmp_path: Path):
         assert is_git_commit(cmd, repo_dir) is True
 
 
-def _best_of(fn, runs: int = 3) -> float:
-    """Fastest of a few runs: the minimum sheds scheduler noise on shared CI runners."""
+def _best_of(fn, runs: int = 3, target: float = 0.05) -> float:
+    """Best per-call CPU time of a few runs: preemption and scheduler noise on shared runners do
+    not count, and each sample repeats the call until it lasts at least `target` seconds, so a
+    coarse OS clock tick is not the measurement."""
     best = float("inf")
     for _ in range(runs):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
+        repeats = 1
+        while True:
+            t0 = time.process_time()
+            for _ in range(repeats):
+                fn()
+            elapsed = time.process_time() - t0
+            if elapsed >= target or repeats >= 1024:
+                break
+            repeats *= 2
+        best = min(best, elapsed / repeats)
     return best
 
 
@@ -476,16 +485,26 @@ def _assert_near_linear(small_fn, big_fn, size_ratio: float, max_exponent: float
     """
     Fail when big_fn takes more than size_ratio ** max_exponent times as long as small_fn.
     Linear work grows by size_ratio, quadratic work by size_ratio ** 2. Big timings under floor are noise.
+    CPU time (measured by `_best_of`) is sampled up to three times and the best sample decides: one
+    scheduling hiccup on a shared CI runner must not fail a test whose real cost is stable, while a
+    genuine regression is over the limit in every sample.
     """
-    t_small = _best_of(small_fn)
-    t_big = _best_of(big_fn)
-    if t_big < floor:
-        return
-    ratio = t_big / max(t_small, 1e-6)
     limit = size_ratio**max_exponent
-    assert ratio < limit, (
-        f"time grew {ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
-        f"small {t_small:.5f}s, big {t_big:.5f}s)"
+    best_ratio = None
+    attempts = 0
+    for _ in range(3):
+        attempts += 1
+        t_small = _best_of(small_fn)
+        t_big = _best_of(big_fn)
+        if t_big < floor:
+            return
+        ratio = t_big / max(t_small, 1e-6)
+        best_ratio = ratio if best_ratio is None else min(best_ratio, ratio)
+        if best_ratio < limit:
+            return
+    assert best_ratio < limit, (
+        f"time grew {best_ratio:.1f}x for a {size_ratio:.1f}x input (limit {limit:.1f}x; "
+        f"best of {attempts} samples)"
     )
 
 
