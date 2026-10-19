@@ -2,5 +2,5 @@
 Banh Mi Guard (guard)
 Dual-gate impact analysis & regression guard.
 """
-__version__ = "0.17.9"
+__version__ = "0.18.0"
 __app_name__ = "guard"
