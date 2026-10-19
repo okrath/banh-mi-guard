@@ -9,6 +9,7 @@ nudges through the orca CLI. `guard watch` builds its ticks and actions from her
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from typing import Any, Sequence
 SETTLED_STATES = frozenset({"succeeded", "failed", "abandoned", "stopped"})
 WORKTREE_ID_SEPARATOR = "::"
 OUTPUT_TAIL_CHARS = 400
+CALL_TIMEOUT_SECONDS = 60
 _C_UNESCAPES = {"\\": "\\", '"': '"', "a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
 
 
@@ -136,11 +138,13 @@ def _parse_worker(row: dict[str, Any]) -> OrcaWorker:
     liveness = _mapping(projection.get("liveness"))
     worker_state = str(row.get("workerState") or "")
     worktree_id = str(resource.get("worktreeId") or "")
-    worktree = Path(worktree_id.split(WORKTREE_ID_SEPARATOR, 1)[-1]) if worktree_id else None
+    _repo_id, separator, raw_path = worktree_id.partition(WORKTREE_ID_SEPARATOR)
+    worktree = Path(raw_path) if separator and raw_path else None
+    terminal = row.get("agentTerminalHandle")
     return OrcaWorker(
         name=worktree.name if worktree is not None else str(row.get("taskId") or ""),
         worktree=worktree,
-        terminal=row.get("agentTerminalHandle") or None,
+        terminal=str(terminal) if terminal is not None else None,
         worker_state=worker_state,
         stage_detail=str(stage.get("detail") or ""),
         activity=str(stage.get("activity") or ""),
@@ -154,7 +158,11 @@ def _observed_at(value: Any) -> float | None:
     """`projection.liveness.observedAt` is epoch milliseconds; callers work in epoch seconds."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) / 1000.0
+    try:
+        seconds = float(value) / 1000.0
+    except OverflowError:  # an integer too large for a float is not a usable timestamp
+        return None
+    return seconds if math.isfinite(seconds) else None
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -162,11 +170,16 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess[str] | None:
-    """House call style: argument list, no shell; None when the executable cannot be started."""
+    """
+    House call style: argument list, no shell, and a hard timeout so a hung child cannot block
+    `guard watch`. None only when the executable cannot be started (or the argv is unusable).
+    """
     try:
         return subprocess.run(list(cmd), capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", check=False)
-    except OSError:
+                              errors="replace", check=False, timeout=CALL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        raise WorkerRuntimeError(f"{cmd[0]} timed out after {CALL_TIMEOUT_SECONDS}s") from e
+    except (OSError, ValueError):
         return None
 
 
@@ -186,19 +199,26 @@ def _mtime(path: Path) -> float | None:
 
 
 def _porcelain_paths(porcelain: str) -> list[str]:
-    """Changed paths of `git status --porcelain`: `XY PATH`, or `XY OLD -> NEW` for a rename."""
+    """
+    Changed paths of `git status --porcelain`: `XY PATH`, and `XY OLD -> NEW` only when the
+    status marks a rename/copy, so a file literally named `a -> b.txt` keeps its whole name.
+    """
     paths = []
     for line in porcelain.splitlines():
         if len(line) < 4:
             continue
-        paths.append(_unquote(line[3:].rsplit(" -> ", 1)[-1]))
+        path = line[3:]
+        if line[0] in "RC":
+            path = path.rsplit(" -> ", 1)[-1]
+        paths.append(_unquote(path))
     return paths
 
 
 def _unquote(path: str) -> str:
     """
-    Undo Git's C-style quoting of a porcelain path (`core.quotePath` is on by default for
-    whitespace and non-ASCII names). Octal escapes are bytes, so they are decoded as UTF-8.
+    Undo Git's C-style quoting of a porcelain path. Only special characters (quotes, backslashes,
+    control and non-ASCII bytes) are quoted; plain spaces are not. Octal escapes are three digits
+    (Git's own output), are bytes, and are decoded as UTF-8; a short escape consumes what is there.
     """
     if len(path) < 2 or not path.startswith('"') or not path.endswith('"'):
         return path
@@ -212,8 +232,13 @@ def _unquote(path: str) -> str:
             continue
         next_char = path[i + 1]
         if next_char in "01234567":
-            raw.append(int(path[i + 1:i + 4], 8))
-            i += 4
+            digits = next_char
+            end = i + 2
+            while len(digits) < 3 and end < len(path) - 1 and path[end] in "01234567":
+                digits += path[end]
+                end += 1
+            raw.append(int(digits, 8))
+            i = end
         else:
             raw.extend(_C_UNESCAPES.get(next_char, next_char).encode("utf-8"))
             i += 2

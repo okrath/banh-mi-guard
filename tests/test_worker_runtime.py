@@ -87,7 +87,8 @@ def test_list_workers_parses_a_real_worker_row(monkeypatch):
 
     assert calls[0] == (
         ["orca.exe", "orchestration", "worker-list", "--run", "run_1", "--json"],
-        {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False},
+        {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False,
+         "timeout": 60},
     )
     assert len(workers) == 1
     worker = workers[0]
@@ -131,6 +132,16 @@ def test_list_workers_keeps_a_row_without_a_worktree_only_when_named(monkeypatch
     assert wr.list_workers("orca", "run_1", names=["task_other"]) == []
 
 
+@pytest.mark.parametrize("worktree_id", ["just-a-repo-id", "repo::"])
+def test_list_workers_drops_a_malformed_worktree_id(monkeypatch, worktree_id):
+    row = {"taskId": "task_named", "workerState": "ready", "resource": {"worktreeId": worktree_id}}
+    fake_run(monkeypatch, stdout=orca_payload(row))
+    assert wr.list_workers("orca", "run_1") == []
+    kept = wr.list_workers("orca", "run_1", names=["task_named"])
+    assert [w.name for w in kept] == ["task_named"]
+    assert kept[0].worktree is None
+
+
 def test_list_workers_tolerates_missing_optionals_and_unknown_fields(monkeypatch):
     row = {"workerState": "ready", "taskId": "task_x", "resource": {"worktreeId": "repo::C:/w/x"}, "future": {"a": 1}}
     fake_run(monkeypatch, stdout=orca_payload(row))
@@ -145,8 +156,31 @@ def test_list_workers_tolerates_missing_optionals_and_unknown_fields(monkeypatch
     assert worker.settled is False
 
 
+def test_list_workers_coerces_a_present_terminal_to_text(monkeypatch):
+    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, agentTerminalHandle=12345)))
+    assert wr.list_workers("orca", "run_1")[0].terminal == "12345"
+
+
+def test_list_workers_reads_a_null_terminal_as_missing(monkeypatch):
+    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, agentTerminalHandle=None)))
+    assert wr.list_workers("orca", "run_1")[0].terminal is None
+
+
 def test_list_workers_ignores_a_non_numeric_liveness_stamp(monkeypatch):
     row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": "yesterday"}})
+    fake_run(monkeypatch, stdout=orca_payload(row))
+    assert wr.list_workers("orca", "run_1")[0].observed_at is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_list_workers_ignores_a_non_finite_liveness_stamp(monkeypatch, value):
+    row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": value}})
+    fake_run(monkeypatch, stdout=orca_payload(row))
+    assert wr.list_workers("orca", "run_1")[0].observed_at is None
+
+
+def test_list_workers_ignores_an_unrepresentable_liveness_stamp(monkeypatch):
+    row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": 10 ** 400}})
     fake_run(monkeypatch, stdout=orca_payload(row))
     assert wr.list_workers("orca", "run_1")[0].observed_at is None
 
@@ -184,6 +218,18 @@ def test_list_workers_raises_when_orca_cannot_be_started(monkeypatch):
         wr.list_workers("orca", "run_1")
 
 
+def test_list_workers_raises_when_orca_times_out(monkeypatch):
+    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["orca"], 60))
+    with pytest.raises(wr.WorkerRuntimeError, match="timed out after 60s"):
+        wr.list_workers("orca", "run_1")
+
+
+def test_list_workers_raises_on_an_unusable_argument_list(monkeypatch):
+    fake_run(monkeypatch, exc=ValueError("embedded null byte"))
+    with pytest.raises(wr.WorkerRuntimeError, match="could not start"):
+        wr.list_workers("orca", "run_1")
+
+
 # --- send_nudge ---------------------------------------------------------------
 
 
@@ -193,7 +239,8 @@ def test_send_nudge_builds_the_exact_command(monkeypatch):
     argv, kwargs = calls[0]
     assert argv == ["orca.exe", "terminal", "send", "--terminal", "term_1", "--text", "keep going",
                     "--enter", "--json"]
-    assert kwargs == {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False}
+    assert kwargs == {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False,
+                      "timeout": 60}
 
 
 def test_send_nudge_raises_on_failure(monkeypatch):
@@ -205,6 +252,12 @@ def test_send_nudge_raises_on_failure(monkeypatch):
 def test_send_nudge_raises_when_orca_cannot_be_started(monkeypatch):
     fake_run(monkeypatch, exc=FileNotFoundError("no orca here"))
     with pytest.raises(wr.WorkerRuntimeError, match="could not start"):
+        wr.send_nudge("orca", "term_1", "hello")
+
+
+def test_send_nudge_raises_when_orca_times_out(monkeypatch):
+    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["orca"], 60))
+    with pytest.raises(wr.WorkerRuntimeError, match="timed out after 60s"):
         wr.send_nudge("orca", "term_1", "hello")
 
 
@@ -263,6 +316,51 @@ def test_probe_worktree_reads_changed_paths_with_spaces(tmp_path):
     assert probe.activity_ts == pytest.approx(edited_at, abs=0.01)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows file names cannot contain '>'")
+def test_probe_worktree_counts_an_untracked_name_with_an_arrow(tmp_path):
+    repo = make_repo(tmp_path / "arrows")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "init")
+    first = wr.probe_worktree(repo)
+
+    odd = repo / "a -> b.txt"
+    odd.write_text("new\n", encoding="utf-8")
+    edited_at = first.activity_ts + 5
+    os.utime(odd, (edited_at, edited_at))
+    assert git(repo, "status", "--porcelain") == "?? a -> b.txt"
+
+    probe = wr.probe_worktree(repo)
+    assert probe.dirty is True
+    assert probe.activity_ts == pytest.approx(edited_at, abs=0.01)
+
+
+def test_probe_worktree_reads_a_linked_worktree(tmp_path):
+    repo = make_repo(tmp_path / "main")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    git(repo, "commit", "-m", "init")
+
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", str(linked))
+    assert (linked / ".git").is_file()
+    index = Path(git(linked, "rev-parse", "--git-path", "index"))
+    assert (index if index.is_absolute() else linked / index).exists()
+
+    first = wr.probe_worktree(linked)
+    assert first.head == git(repo, "rev-parse", "HEAD")
+    assert first.dirty is False
+
+    (linked / "a.txt").write_text("two\n", encoding="utf-8")
+    edited_at = first.activity_ts + 5
+    os.utime(linked / "a.txt", (edited_at, edited_at))
+
+    second = wr.probe_worktree(linked)
+    assert second.dirty is True
+    assert second.activity_ts > first.activity_ts
+    assert second.activity_ts == pytest.approx(edited_at, abs=0.01)
+
+
 def test_probe_worktree_unborn_branch_has_no_head(tmp_path):
     repo = tmp_path / "fresh"
     repo.mkdir()
@@ -280,3 +378,17 @@ def test_probe_worktree_outside_a_repository_reads_nothing(tmp_path):
 def test_porcelain_paths_reads_renames_and_quoted_names():
     porcelain = 'R  a.txt -> b.txt\n?? "sub dir/x.txt"\n M plain.txt\n'
     assert wr._porcelain_paths(porcelain) == ["b.txt", "sub dir/x.txt", "plain.txt"]
+
+
+def test_porcelain_paths_splits_arrows_only_on_rename_and_copy_codes():
+    porcelain = '?? a -> b.txt\nR  old.txt -> new.txt\nC  src.txt -> copy.txt\n M x -> y.txt\n'
+    assert wr._porcelain_paths(porcelain) == ["a -> b.txt", "new.txt", "copy.txt", "x -> y.txt"]
+
+
+def test_unquote_decodes_a_full_octal_escape():
+    assert wr._unquote('"caf\\303\\251"') == "café"
+
+
+def test_unquote_tolerates_a_short_octal_escape():
+    assert wr._unquote('"caf\\5"') == "caf\x05"
+    assert wr._unquote('"\\1x"') == "\x01x"
