@@ -587,4 +587,163 @@ guard setup
 ```
 
 ---
+
+## 18. `guard watch`
+
+Supervises the workers of one Orca run, or a set of explicit Git worktrees, until each worker settles, commits or needs a human. It never reads terminal screens: liveness comes from the worker's **heartbeat** and progress from **Git activity** (new commits, the index and changed files). That is why it also works for agents such as opencode whose terminal shows no usable progress.
+
+```bash
+guard watch --run <run-id> [options]
+guard watch --worktree <path> [--worktree <path> ...] [options]
+```
+
+### Options:
+* `--run <id>`: The Orca orchestration run to supervise. Workers and worktrees are read from `orca orchestration worker-list --run <id> --json`.
+* `--workers <n1,n2>`: Watch only these workers (worktree directory names). Without it, every unsettled worker that has a worktree is watched; settled workers are skipped.
+* `--test-workers <n1,n2>`: Treat these workers as test workers. A test worker is done once it has settled with a clean worktree; it does not need a commit.
+* `--ownership <path>`: JSON file with per-worker `role` and `own` globs (see below). Roles default to `fix`.
+* `--base <sha>`: Git base for the delivery checks. Without it, each worker's first-seen HEAD is its start.
+* `--worktree <path>` (repeatable): Plain-Git mode: supervise these worktrees directly, without Orca. The worker name is the directory name, and when `--base` is omitted each worktree's first-seen HEAD is its start.
+* `--interval-sec <seconds>`: Seconds between passes (default: 90). Idle means two intervals without a new signal.
+* `--stall-min <minutes>`: No progress for this many minutes is stalled (default: 8).
+* `--budget-min <minutes>`: A `fix` worker with no commit after this many minutes is overdue (default: 45).
+* `--max-nudges <n>`: Nudges allowed per worker before it is marked needs-human (default: 5).
+* `--log <path>`: Log file. Default: `guard-watch-<run>.log` in the current directory; in plain-Git mode `guard-watch-<first-worktree-name>.log`. Every line starts `HH:MM:SS  <name>  <state>  <detail>`.
+* `--orca <path>`: The Orca executable. Default: `$ORCA_CLI_COMMAND`, otherwise `orca` on `PATH`.
+* `--once`: One pass only: print the summary, send no nudges and exit 0. Use it as a status snapshot or dry run.
+* `--json`: Print the summary as JSON instead of the table.
+
+### States:
+Each pass maps every worker to one state:
+
+* `working`: a heartbeat or Git activity inside the thresholds.
+* `idle`: no new signal for two checks (`--interval-sec` x 2).
+* `stalled`: no progress for `--stall-min` minutes.
+* `overdue`: a `fix` worker has not committed after `--budget-min` minutes.
+* `suspect`: the quick delivery check reports a FAIL (an out-of-scope path, a weakened or deleted test, a silenced check, or a CI workflow edit); the nudge lists the findings.
+* `done`: a `fix` worker committed and its worktree is clean, or a `test` worker settled with a clean worktree.
+* `needs-human`: a worker settled without a clean commit (no commit, or uncommitted changes), or reached `--max-nudges`.
+
+`done` and `needs-human` are terminal: the worker is not checked again.
+
+### Nudges:
+Idle, stalled, overdue and suspect workers get a short fixed text sent to their Orca agent terminal (`orca terminal send`). A pass sends at most one nudge per worker, in priority order suspect, overdue, stalled, idle. Done and needs-human are only logged. A worker without an Orca terminal handle is skipped with `nudge skipped: <reason>` in the log; plain-Git mode never sends nudges.
+
+### Ownership File:
+`--ownership` maps worker names (worktree directory names) to a role and the globs the worker may change. A worker's `own` globs are the same ones `guard worker-verify --own` takes.
+
+```json
+{
+  "fix-auth": { "role": "fix", "own": ["src/auth/**", "tests/test_auth.py"] },
+  "test-auth": { "role": "test", "own": ["tests/**"] }
+}
+```
+
+`**` matches any path and `*` matches within one path segment. An absent `own` list means no ownership restriction for that worker.
+
+### Output:
+Without `--json`, each pass prints a table with one row per worker: name, state, short HEAD, nudge count and a note. `--json` prints the summary as an array with one object per worker (the pass with `--once`, otherwise the final summary):
+
+```json
+[
+  {
+    "name": "fix-auth",
+    "head": "3f2c1ab...",
+    "head_moved": true,
+    "dirty": false,
+    "activity_ts": 1792380735.66,
+    "heartbeat_ts": 1792380735.66,
+    "settled": true,
+    "quick_fails": [],
+    "state": "done",
+    "actions": [{ "kind": "done", "reason": "done", "text": "" }]
+  }
+]
+```
+
+`activity_ts` and `heartbeat_ts` are epoch seconds (or `null` when unknown). `actions` lists what the pass decided: `kind` is `nudge`, `done` or `needs-human`; `reason` is one of `idle`, `stalled`, `overdue`, `suspect`, `done`, `settled-no-commit`, `settled-dirty` or `nudge-limit`. In plain-Git mode `heartbeat_ts` is always `null`.
+
+### Exit Codes:
+* `0`: the pass finished (`--once`) or every worker became terminal, including workers that need a human.
+* `2`: usage error (neither `--run` nor `--worktree`, or `--orca` cannot be resolved in Orca mode).
+
+### Limits:
+* Plain-Git mode only logs: it has no Orca runtime, so it cannot nudge.
+* A nudge needs an Orca terminal handle; without one the action is logged as skipped, never delivered another way.
+* It watches and nudges only: it does not commit, merge or change a worktree, and it does not combine separate runs.
+
+---
+
+## 19. `guard worker-verify`
+
+Audits one worker's delivery before you accept it. It compares the worktree against a base commit, scans the diff for work that made its own checks pass, checks the report and evidence, optionally reruns the acceptance commands, and prints WARN/FAIL lines. It never commits, merges or edits the worktree. Think of it as the acceptance checklist a coordinator runs before merging: it cannot prove the work is good, but it catches a delivery that stepped outside its ownership or made its checks pass by weakening them.
+
+```bash
+guard worker-verify --worktree <path> --base <sha> [options]
+```
+
+### Options:
+* `--worktree <path>` (required): The worker's worktree to audit.
+* `--base <sha>` (required): The base commit, usually the branch point.
+* `--own <glob>` (repeatable): A path the worker may change. Repeat the flag, or pass a comma-separated list. `**` matches any path and `*` matches within one path segment. With no `--own`, every path is owned and the scope check reports nothing.
+* `--role fix|test`: The worker's role (default: `fix`). A `test` worker may add untracked files but must not edit tracked files.
+* `--report <path>`: The worker's report. Checks that it exists, that it is newer than `--since`, that paths it names exist, and warns about unchecked "all tests pass" claims.
+* `--evidence <dir>`: A directory of screenshots or recordings. Warns when it is empty, older than `--since`, has images under 8 KB, or contains duplicate images.
+* `--since <iso|epoch>`: Freshness cutoff, ISO 8601 or epoch seconds. Without it, the report and evidence are checked for existence and content but not age.
+* `--check <cmd>` (repeatable): An acceptance command to rerun in the worktree. A non-zero exit fails the audit and shows the exit code and the tail of the output.
+* `--quick`: Skip the report, evidence and acceptance-rerun checks; the static scans still run.
+* `--json`: Print the result as JSON (see below); the exit code is still 0/1.
+
+### Checks:
+* **Scope / ownership**: every changed path, committed since `--base` or still in the working tree, must match `--own`; a test worker must not have tracked edits.
+* **Weakened or skipped tests**: added skip, only or todo markers; swallowed failures such as `|| true`, `--passWithNoTests`, `process.exit(0)` or `pytest.exit(0)`; a test script dropped from `package.json`.
+* **Silenced lint and type errors**: `eslint-disable`, `@ts-ignore`, `@ts-nocheck`, `@ts-expect-error` and `# type: ignore`.
+* **`any` escapes**: added `as any`, `: any` or `<any>`.
+* **Deleted tests**: test files removed between `--base` and HEAD.
+* **Fewer assertions** (WARN): a changed test file removes more `assert`/`expect` lines than it adds.
+* **CI workflow edits**: changed paths under `.github/workflows/` that are not owned.
+* **Report and evidence freshness**: missing report, a report older than `--since`, paths named in the report that do not exist, and an unchecked "all tests/checks/steps pass" claim (WARN); empty, old, tiny or duplicate evidence (WARN).
+* **Acceptance rerun**: each `--check` command runs in the worktree; a non-zero exit is a FAIL.
+
+### Output:
+```text
+WARN  [fewer-assertions] tests/test_pricing.py: removed assertions outnumber added ones
+FAIL  [scope-outside-ownership] changed path not owned: src/core/db.py
+RESULT: FAIL (1)
+```
+
+WARN lines come first, then FAIL lines, then one result line: `RESULT: PASS`, `RESULT: PASS with N warning(s)` or `RESULT: FAIL (N)` (N = failures). With `--json`:
+
+```json
+{
+  "passed": true,
+  "issues": [
+    { "severity": "WARN", "code": "fewer-assertions", "message": "..." }
+  ],
+  "checks": [
+    { "command": "python -m pytest tests -q", "exit_code": 0, "output_tail": "..." }
+  ]
+}
+```
+
+`passed` is true when there is no FAIL. `output_tail` is the last part of a rerun's combined output.
+
+### Exit Codes:
+* `0`: no FAIL (warnings allowed).
+* `1`: at least one FAIL.
+* `2`: usage error or an unexpected error (for example an invalid `--role` or `--since`).
+
+### Example:
+```bash
+# Audit a fix worker: only its owned paths may change, and its own tests must still pass
+guard worker-verify --worktree ../worker-fix --base main \
+  --own "src/**" --own "tests/test_feature.py" \
+  --report reports/worker-report.md --since 2026-10-19T10:00:00 \
+  --check "python -m pytest tests/test_feature.py -q"
+
+# Audit a test worker: untracked files are fine, tracked edits are not
+guard worker-verify --worktree ../worker-tests --base main --role test --own "tests/**" --quick
+```
+
+---
 *Created and maintained by [@okrath](https://github.com/okrath) &mdash; Source code available at [github.com/okrath/banh-mi-guard](https://github.com/okrath/banh-mi-guard).*
