@@ -271,6 +271,41 @@ def test_worker_verify_report_relative_to_the_worktree(tmp_path):
     assert "WARN  [report-unchecked-claim]" in result.output
 
 
+def test_worker_verify_accepts_an_iso_8601_since(tmp_path):
+    repo = committed_repo(tmp_path / "iso-since")
+    base = git(repo, "rev-parse", "HEAD")
+
+    result = CliRunner().invoke(
+        app, ["worker-verify", "--worktree", str(repo), "--base", base, "--own", "a.py",
+              "--since", "2020-01-01T00:00:00"]
+    )
+
+    assert result.exit_code == 0
+    assert "RESULT: PASS" in result.output
+
+
+def test_worker_verify_evidence_path_is_relative_to_the_worktree(tmp_path):
+    repo = committed_repo(tmp_path / "evidence")
+    base = git(repo, "rev-parse", "HEAD")
+    evidence = repo / "evidence-artifacts"
+    evidence.mkdir()
+    (evidence / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 9000)
+
+    result = CliRunner().invoke(
+        app, ["worker-verify", "--worktree", str(repo), "--base", base, "--evidence", "evidence-artifacts"]
+    )
+
+    assert result.exit_code == 0
+    assert "evidence-empty" not in result.output
+
+    missing = CliRunner().invoke(
+        app, ["worker-verify", "--worktree", str(repo), "--base", base, "--evidence", "no-such-dir"]
+    )
+
+    assert missing.exit_code == 0
+    assert "WARN  [evidence-empty]" in missing.output
+
+
 # --- guard watch: usage -------------------------------------------------------
 
 
@@ -299,6 +334,59 @@ def test_watch_rejects_a_broken_ownership_file(tmp_path):
     assert result.exit_code == 2
 
 
+def test_watch_rejects_an_unresolvable_base_in_plain_git_mode(tmp_path):
+    repo = committed_repo(tmp_path / "plain-bad-base")
+    head = git(repo, "rev-parse", "HEAD")
+
+    result = CliRunner().invoke(
+        app, ["watch", "--worktree", str(repo), "--base", "deadbeef", "--once", "--log", str(tmp_path / "b.log")]
+    )
+
+    assert result.exit_code == 2
+    assert "does not resolve" in result.output
+
+    good = CliRunner().invoke(
+        app, ["watch", "--worktree", str(repo), "--base", head, "--once", "--json",
+              "--log", str(tmp_path / "g.log")]
+    )
+
+    assert good.exit_code == 0  # a resolvable base keeps the plain-git pass working
+    assert json.loads(good.output)[0]["head"] == head
+
+
+def test_watch_rejects_an_unresolvable_base_in_orca_mode(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "orca-bad-base")
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", worktree=repo)])
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--base", "deadbeef",
+              "--once", "--log", str(tmp_path / "b.log")]
+    )
+
+    assert result.exit_code == 2
+    assert "does not resolve" in result.output
+
+
+def test_watch_accepts_a_resolvable_base_in_orca_mode(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "orca-good-base")
+    head = git(repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=head))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--base", head,
+              "--once", "--json", "--log", str(tmp_path / "good.log")]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload[0]["head"] == head
+    assert payload[0]["state"] == "working"
+
+
 def test_help_lists_both_new_commands():
     output = CliRunner().invoke(app, ["--help"]).output
 
@@ -315,7 +403,7 @@ def test_watch_once_json_reports_the_pass_and_writes_the_log(tmp_path, monkeypat
         worker_row("fix-a", terminal="term_1", observed_at=now),
         worker_row("test-b", terminal=None, settled=True, observed_at=now),
     ]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: list(rows))
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=True))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
     log = tmp_path / "watch.log"
@@ -350,7 +438,7 @@ def test_watch_once_json_reports_the_pass_and_writes_the_log(tmp_path, monkeypat
 
 def test_watch_once_never_sends_a_nudge(tmp_path, monkeypatch):
     sent = []
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: [worker_row("fix-a", terminal="term_1")])
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a", terminal="term_1")])
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=False))
     monkeypatch.setattr(
         watch_mod, "verify_worker",
@@ -376,7 +464,7 @@ def test_watch_once_never_sends_a_nudge(tmp_path, monkeypatch):
 
 def test_watch_run_without_workers_skips_settled_rows(tmp_path, monkeypatch):
     rows = [worker_row("fix-a"), worker_row("old-c", settled=True)]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: list(rows))
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
 
@@ -389,7 +477,7 @@ def test_watch_run_without_workers_skips_settled_rows(tmp_path, monkeypatch):
 
 
 def test_watch_logs_and_skips_a_row_without_a_worktree(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: [worker_row("ghost", worktree=None)])
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("ghost", worktree=None)])
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
     log = tmp_path / "ghost.log"
 
@@ -402,9 +490,70 @@ def test_watch_logs_and_skips_a_row_without_a_worktree(tmp_path, monkeypatch):
     assert "no worktree" in log.read_text(encoding="utf-8")
 
 
+def test_watch_passes_the_requested_names_to_the_worker_list(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_list(orca, run, names=None):
+        seen.append(names)
+        return [worker_row("fix-a"), worker_row("test-b", worktree=None)]
+
+    monkeypatch.setattr(watch_mod, "list_workers", fake_list)
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    log = tmp_path / "names.log"
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--test-workers", "test-b",
+              "--once", "--json", "--log", str(log)]
+    )
+
+    assert result.exit_code == 0
+    assert seen == [["fix-a", "test-b"]]
+    assert "test-b  skipped  no worktree" in log.read_text(encoding="utf-8")
+
+
+def test_watch_keeps_the_worker_list_unfiltered_when_only_test_workers_are_named(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_list(orca, run, names=None):
+        seen.append(names)
+        return [worker_row("fix-a")]
+
+    monkeypatch.setattr(watch_mod, "list_workers", fake_list)
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--test-workers", "test-b",
+              "--once", "--json", "--log", str(tmp_path / "unfiltered.log")]
+    )
+
+    assert result.exit_code == 0
+    assert seen == [None]  # no --workers: every unsettled row stays watched
+    assert [row["name"] for row in json.loads(result.output)] == ["fix-a"]
+
+
+def test_watch_logs_a_worktree_less_row_named_on_the_command_line(tmp_path, monkeypatch):
+    def fake_list(orca, run, names=None):
+        row = worker_row("ghost", worktree=None)
+        return [row] if names and "ghost" in names else []
+
+    monkeypatch.setattr(watch_mod, "list_workers", fake_list)
+    log = tmp_path / "ghost-named.log"
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "ghost", "--once", "--json",
+              "--log", str(log)]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == []
+    assert "ghost  skipped  no worktree" in log.read_text(encoding="utf-8")
+
+
 def test_watch_survives_a_failing_probe_and_quick_scan(tmp_path, monkeypatch):
     rows = [worker_row("bad-probe"), worker_row("bad-scan"), worker_row("good")]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: list(rows))
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
 
     def probe(worktree: Path):
         if worktree.name == "bad-probe":
@@ -430,6 +579,23 @@ def test_watch_survives_a_failing_probe_and_quick_scan(tmp_path, monkeypatch):
     assert "probe failed: git vanished" in log.read_text(encoding="utf-8")
 
 
+def test_watch_json_stays_parseable_when_the_log_cannot_be_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a")])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    log_dir = tmp_path / "log-is-a-directory"
+    log_dir.mkdir()
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--once", "--json", "--log", str(log_dir)]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)[0]["name"] == "fix-a"  # the warning never lands on stdout
+    assert "cannot write" in result.stderr
+    assert "cannot write" not in result.stdout
+
+
 def test_watch_reads_roles_and_own_from_the_ownership_file(tmp_path, monkeypatch):
     ownership = tmp_path / "ownership.json"
     ownership.write_text(
@@ -443,7 +609,7 @@ def test_watch_reads_roles_and_own_from_the_ownership_file(tmp_path, monkeypatch
         return engine.VerifyResult()
 
     rows = [worker_row("fix-a"), worker_row("watcher", settled=True)]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: list(rows))
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=False))
     monkeypatch.setattr(watch_mod, "verify_worker", scan)
 
@@ -464,10 +630,12 @@ def test_watch_reads_roles_and_own_from_the_ownership_file(tmp_path, monkeypatch
 
 
 def test_watch_logs_a_skipped_nudge_without_a_terminal(tmp_path, monkeypatch):
-    base = "a" * 40
+    repo = committed_repo(tmp_path / "no-terminal")
+    base = git(repo, "rev-parse", "HEAD")
     heads = iter([base, "b" * 40])
     sent = []
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: [worker_row("fix-a", terminal=None)])
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", terminal=None, worktree=repo)])
     monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree: WorktreeProbe(head=next(heads), dirty=False,
                                                                                     activity_ts=100.0))
     monkeypatch.setattr(
@@ -493,6 +661,58 @@ def test_watch_logs_a_skipped_nudge_without_a_terminal(tmp_path, monkeypatch):
     assert "nudge skipped: no terminal" in log.read_text(encoding="utf-8")
 
 
+def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
+    from guard.core.watchdog import STALLED_TEXT
+
+    repo = committed_repo(tmp_path / "stalled-nudge")
+    base = git(repo, "rev-parse", "HEAD")
+    heads = iter([base, "b" * 40])
+    sent = []
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", terminal="term_1", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree",
+                        lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
+    log = tmp_path / "stalled.log"
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--base", base,
+              "--stall-min", "1", "--interval-sec", "1", "--json", "--log", str(log)]
+    )
+
+    assert result.exit_code == 0
+    assert sent == [("orca", "term_1", STALLED_TEXT.format(stall_min=1.0))]
+    assert json.loads(result.output)[0]["state"] == "done"  # the second pass observed the commit
+    assert "nudge skipped" not in log.read_text(encoding="utf-8")
+
+
+def test_watch_treats_an_empty_terminal_as_no_terminal(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "empty-terminal")
+    base = git(repo, "rev-parse", "HEAD")
+    heads = iter([base, "b" * 40])
+    sent = []
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", terminal="", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree",
+                        lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
+    log = tmp_path / "empty-terminal.log"
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--base", base,
+              "--stall-min", "1", "--interval-sec", "1", "--json", "--log", str(log)]
+    )
+
+    assert result.exit_code == 0
+    assert sent == []
+    assert json.loads(result.output)[0]["state"] == "done"
+    assert "nudge skipped: no terminal" in log.read_text(encoding="utf-8")
+
+
 def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
     from guard.core.watchdog import SETTLED_DIRTY_TEXT
 
@@ -504,7 +724,7 @@ def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
         return WorktreeProbe(head=next(heads), dirty=False, activity_ts=time.time())
 
     rows = [worker_row("test-a", terminal=None, settled=True), worker_row("fix-b")]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: list(rows))
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
     monkeypatch.setattr(watch_mod, "probe_worktree", probe)
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
@@ -553,7 +773,10 @@ def test_watch_plain_git_mode_logs_an_uncommitted_repo(tmp_path):
     payload = json.loads(result.output)
     assert payload[0]["head"] is None
     assert payload[0]["state"] == "working"
-    assert "quick scan skipped: no base or start head" in log.read_text(encoding="utf-8")
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # one log line per pass: the skip reason rides on the state line
+    assert LOG_LINE_RE.match(lines[0])
+    assert "  working  quick scan skipped: no base or start head" in lines[0]
 
 
 def test_watch_default_log_uses_the_first_worktree_name(tmp_path, monkeypatch):
@@ -568,7 +791,7 @@ def test_watch_default_log_uses_the_first_worktree_name(tmp_path, monkeypatch):
 
 def test_watch_default_log_uses_the_run_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: [worker_row("fix-a")])
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a")])
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
 
@@ -579,7 +802,7 @@ def test_watch_default_log_uses_the_run_id(tmp_path, monkeypatch):
 
 
 def test_watch_table_prints_one_row_per_worker(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run: [worker_row("fix-a", observed_at=1000.0)])
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a", observed_at=1000.0)])
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe())
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import typer
+from rich.console import Console
 from rich.table import Table
 
 from guard.cli import app, console
@@ -25,6 +27,7 @@ from guard.core.worker_runtime import (
 from guard.core.worker_verify import verify_worker
 
 PROBE_FAILED = "probe-failed"
+stderr_console = Console(stderr=True)  # warnings only: stdout stays the table or the JSON array
 
 
 @dataclass
@@ -58,7 +61,7 @@ def _log_line(log_path: Path, name: str, state: str, detail: str) -> None:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     except OSError as e:
-        console.print(f"[yellow]watch: cannot write {log_path}: {e}[/yellow]")
+        stderr_console.print(f"[yellow]watch: cannot write {log_path}: {e}[/yellow]")
 
 
 def _names(raw: Optional[str]) -> Set[str]:
@@ -150,6 +153,22 @@ def _resolve_orca(explicit: Optional[str]) -> str:
         console.print("[bold red]❌ orca CLI not found: pass --orca <path> or set ORCA_CLI_COMMAND[/bold red]")
         raise typer.Exit(code=2)
     return resolved
+
+
+def _base_resolves(worktree: Path, base: str) -> bool:
+    """True when `--base` names a commit in `worktree`; the rule `worker-verify` already enforces."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--verify", f"{base}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
 
 
 def _orca_targets(
@@ -251,9 +270,7 @@ class _Watcher:
         checks_base = self.base or start
 
         quick_fails: tuple[str, ...] = ()
-        if checks_base is None:
-            _log_line(self.log_path, name, "skipped", "quick scan skipped: no base or start head")
-        else:
+        if checks_base is not None:
             try:
                 quick = verify_worker(target.worktree, base=checks_base, role=target.role, own=target.own, quick=True)
             except (WorkerRuntimeError, OSError) as e:
@@ -359,6 +376,10 @@ def watch_cmd(
     ownership_map = _load_ownership(Path(ownership)) if ownership else {}
     test_names = _names(test_workers)
     wanted = _names(workers) if workers is not None else None
+    # With --workers the requested names reach the core so a named row without a worktree surfaces
+    # and is skipped with a log line; without it the run watches every unsettled worker, so no name
+    # filter is passed and --test-workers only assigns the test role.
+    names: Optional[List[str]] = sorted(wanted | test_names) if wanted is not None else None
 
     log_path = _log_path(run, plain_worktrees, log)
     targets: Dict[str, _Target] = {}
@@ -366,7 +387,7 @@ def watch_cmd(
     if run:
         orca_cmd = _resolve_orca(orca)
         try:
-            rows = list_workers(orca_cmd, run)
+            rows = list_workers(orca_cmd, run, names=names)
         except WorkerRuntimeError as e:
             console.print(f"[bold red]❌ {e}[/bold red]")
             raise typer.Exit(code=2) from e
@@ -378,6 +399,12 @@ def watch_cmd(
             continue
         targets[name] = _Target(name=name, worktree=path, role=_role(name, test_names, ownership_map),
                                 own=_own(name, ownership_map))
+
+    if base and targets:
+        first = next(iter(targets.values())).worktree
+        if not _base_resolves(first, base):
+            console.print(f"[bold red]❌ --base does not resolve to a commit in {first}: {base}[/bold red]")
+            raise typer.Exit(code=2)
 
     watcher = _Watcher(
         run_id=run,
