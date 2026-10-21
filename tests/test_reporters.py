@@ -2,11 +2,20 @@
 Unit tests for Markdown and Terminal Reporters.
 """
 
+import pytest
+
 from guard.core.invariant_eval import DomainType, InvariantCheck, InvariantResult
 from guard.core.ocr_engine import DiffSummary, FileDiffStat, RuleViolation
 from guard.core.session import BuildCheckResult, DomainContract, LockedInvariant, PostTaskRecord, PreTaskRecord
 from guard.reporters.markdown import generate_post_task_markdown, generate_pre_task_markdown
 from guard.reporters.terminal import render_post_task_terminal, render_pre_task_terminal
+
+
+@pytest.fixture(autouse=True)
+def glyphs_not_disabled_by_the_host(monkeypatch):
+    """Agent and CI shells often export NO_COLOR, which turns every glyph into its text fallback; a test
+    that wants the fallback sets it itself."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
 
 
 def test_markdown_pre_task_generation():
