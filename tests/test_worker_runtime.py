@@ -103,7 +103,7 @@ def test_list_workers_parses_a_real_worker_row(monkeypatch):
     assert worker.settled is False
 
 
-@pytest.mark.parametrize("state", ["succeeded", "failed", "abandoned", "stopped"])
+@pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled", "abandoned", "stopped"])
 def test_list_workers_marks_settled_states(monkeypatch, state):
     fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, workerState=state)))
     assert wr.list_workers("orca", "run_1")[0].settled is True

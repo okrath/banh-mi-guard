@@ -192,6 +192,7 @@ if __name__ != "__main__":
     import guard.commands.maintenance  # noqa: E402,F401
     import guard.commands.watch  # noqa: E402,F401
     import guard.commands.worker_verify  # noqa: E402,F401
+    import guard.commands.deps_check  # noqa: E402,F401
     # isort: on
 
 

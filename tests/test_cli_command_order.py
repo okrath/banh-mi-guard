@@ -33,6 +33,7 @@ EXPECTED_REGISTERED_COMMANDS = [
     "laya",
     "watch",
     "worker-verify",
+    "deps-check",
 ]
 
 EXPECTED_REGISTERED_GROUPS = [
@@ -59,6 +60,7 @@ EXPECTED_HELP_COMMAND_ORDER = [
     "doctor",
     "watch",
     "worker-verify",
+    "deps-check",
     "invariants",
     "config",
     "hook",
