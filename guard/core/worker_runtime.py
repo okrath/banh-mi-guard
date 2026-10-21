@@ -2,8 +2,9 @@
 Runtime probes for supervised Orca workers.
 
 The one guard module that touches the outside world: it runs plain `git` inside worker
-worktrees (read-only, and never by a shell), reads the `orca` worker list, and delivers
-nudges through the orca CLI. `guard watch` builds its ticks and actions from here.
+worktrees (read-only, and never by a shell), reads the `orca` worker list and terminal screens,
+delivers nudges through the orca CLI, and stops a worker's own foreground dev server.
+`guard watch` builds its ticks and actions from here.
 """
 
 from __future__ import annotations
@@ -11,17 +12,51 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
+import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-SETTLED_STATES = frozenset({"succeeded", "failed", "abandoned", "stopped"})
+SETTLED_STATES = frozenset({"succeeded", "failed", "cancelled", "abandoned", "stopped"})
 WORKTREE_ID_SEPARATOR = "::"
 OUTPUT_TAIL_CHARS = 400
 CALL_TIMEOUT_SECONDS = 60
+DESCRIPTION_CHARS = 120
 _C_UNESCAPES = {"\\": "\\", '"': '"', "a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+
+# Screen patterns of the agent CLIs, case-insensitive like the PowerShell watchdog they come from.
+# A braille spinner glyph followed by the turn timer ("12s", "45m", "1h") means a turn is running.
+_SPINNER_RE = re.compile(r"[\u2800-\u28FF]\s+\d+[smh]\b", re.IGNORECASE)
+# opencode has no braille timer: its footer shows "esc interrupt" only while a turn runs.
+_OPENCODE_BUSY_RE = re.compile(r"esc interrupt", re.IGNORECASE)
+# Parts that animate on their own and are no progress: spinner with timers, the opencode bar,
+# token counters such as "12.5K (40%)" and bare percentages.
+_ANIMATED_RE = re.compile(
+    r"[\u2800-\u28FF]\s+\d+[smh](\s+\d+[sm])?|[\u25A0\u2B1D]+|\d+(\.\d+)?K\s*\(\d+%\)|\d+(\.\d+)?\s*%",
+    re.IGNORECASE,
+)
+# The header of the shell command an agent runs: a spinner glyph, then "$ <command>".
+_COMMAND_RE = re.compile(r"[\u2800-\u28FF]\s+\$\s*(.{1,120})")
+# An omp background job the agent waits on: "<corner><tool>  bg_1 <command><ellipsis> <middle dot> 17m42s"
+# (\u2514\u2500 \u27e8bash\u27e9 ... \u00b7), the job's own elapsed time after the last middle dot.
+_JOB_RE = re.compile(
+    r"^.*?\u2514\u2500\s*\u27e8[^\u27e9]*\u27e9\s+\S+\s+(.*)\u00b7\s*(?:(\d+)h(\d+)m|(\d+)m(\d+)s|(\d+)s)\s*$",
+    re.MULTILINE,
+)
+_DEV_SERVER_RE = re.compile(
+    r"ready in \d+\s*ms|Local:\s+http|Nest application successfully started|watching for file changes",
+    re.IGNORECASE,
+)
+# A worker's own dev server: a node process running one of these with its worktree on the command line.
+_DEV_PROCESS_RE = re.compile(r"vite|nest start|ts-node|dev-provider-game", re.IGNORECASE)
+_WINDOWS_NODE_LIST = (
+    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+    "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+)
 
 
 class WorkerRuntimeError(RuntimeError):
@@ -48,10 +83,23 @@ class OrcaWorker:
     settled: bool
 
 
-def probe_worktree(worktree: Path) -> WorktreeProbe:
+@dataclass(frozen=True)
+class ScreenState:
+    """What one rendered terminal screen says about the agent behind it."""
+
+    busy: bool  # a turn is running (spinner with timer, or the opencode footer)
+    stable: str  # the screen without its self-animating parts: changes only on real progress
+    command: str | None  # the shell command the agent is running, while busy
+    dev_server: bool  # dev-server output owns the screen
+    jobs: tuple[tuple[str, float], ...] = ()  # (command, seconds it has run) of each background job shown
+
+
+def probe_worktree(worktree: Path, *, since: float | None = None) -> WorktreeProbe:
     """
     HEAD, dirtiness and the newest git-visible activity of one worktree. Read-only: git runs
     with `--no-optional-locks` so probing never refreshes the index and never fakes activity.
+    HEAD's commit time counts only when it is not older than `since` (when given): a fresh
+    worktree on an old base commit must not look like a worker that went quiet long ago.
     """
     rev = _git(worktree, "rev-parse", "HEAD")
     head = (rev.stdout.strip() or None) if rev is not None and rev.returncode == 0 else None
@@ -63,9 +111,11 @@ def probe_worktree(worktree: Path) -> WorktreeProbe:
     commit = _git(worktree, "log", "-1", "--format=%ct")
     if commit is not None and commit.returncode == 0:
         try:
-            stamps.append(float(commit.stdout.strip()))
+            commit_ts = float(commit.stdout.strip())
         except ValueError:
-            pass
+            commit_ts = None
+        if commit_ts is not None and (since is None or commit_ts >= since):
+            stamps.append(commit_ts)
     for changed in _porcelain_paths(porcelain):
         stamp = _mtime(worktree / changed)
         if stamp is not None:
@@ -111,12 +161,121 @@ def list_workers(orca: str, run: str, *, names: Sequence[str] | None = None) -> 
     return workers
 
 
-def send_nudge(orca: str, terminal: str, text: str) -> None:
-    """Type `text` into a worker terminal and press Enter; any failure raises."""
-    res = _run([orca, "terminal", "send", "--terminal", terminal, "--text", text, "--enter", "--json"])
+def send_nudge(orca: str, terminal: str, text: str, *, interrupt: bool = False) -> None:
+    """
+    Type `text` into a worker terminal and press Enter; any failure raises. `interrupt` sends it
+    as an interrupt, since a plain message queues behind the command a busy agent is running.
+    """
+    argv = [orca, "terminal", "send", "--terminal", terminal, "--text", text, "--enter"]
+    if interrupt:
+        argv.append("--interrupt")
+    res = _run([*argv, "--json"])
     if res is None or res.returncode != 0:
         detail = _tail(res.stderr) if res is not None else f"could not start {orca}"
         raise WorkerRuntimeError(f"orca terminal send to {terminal} failed: {detail}")
+
+
+def read_screen(orca: str, terminal: str, *, limit: int = 25) -> str | None:
+    """The rendered screen of a worker terminal (its last `limit` rows); None when it cannot be read."""
+    try:
+        res = _run([orca, "terminal", "read", "--terminal", terminal, "--screen", "--limit", str(limit)])
+    except WorkerRuntimeError:  # a timed-out read is no screen, not a reason to stop watching
+        return None
+    if res is None or res.returncode != 0:
+        return None
+    return res.stdout or ""
+
+
+def parse_screen(screen: str) -> ScreenState:
+    """Decode one screen: busy, the stable text, the running command, dev-server output and background jobs."""
+    busy = bool(_SPINNER_RE.search(screen) or _OPENCODE_BUSY_RE.search(screen))
+    stable = _ANIMATED_RE.sub("", screen)
+    # Matched on the stable text so a percentage or counter printed after it never renames the command.
+    match = _COMMAND_RE.search(stable) if busy else None
+    command = match.group(1).strip() if match else ""
+    return ScreenState(busy=busy, stable=stable, command=command or None, dev_server=bool(_DEV_SERVER_RE.search(screen)),
+                       jobs=tuple(_job(found) for found in _JOB_RE.finditer(screen)))
+
+
+def _job(match: re.Match[str]) -> tuple[str, float]:
+    """(command, elapsed seconds) of one background-job line; a cut-off command loses its ellipsis."""
+    hours, minutes, minutes_s, seconds, seconds_only = (int(group or 0) for group in match.groups()[1:])
+    elapsed = hours * 3600 + (minutes + minutes_s) * 60 + seconds + seconds_only
+    return match.group(1).strip().rstrip("\u2026").strip(), float(elapsed)
+
+
+def stop_dev_servers(worktree: Path) -> list[str]:
+    """
+    Stop the dev servers a worker runs from its own worktree: node processes whose command line
+    names the worktree and runs vite, nest start, ts-node or dev-provider-game. Returns one
+    "<pid>: <command line>" description per process stopped; a failed process listing raises.
+    """
+    stopped: list[str] = []
+    for pid, command in _node_processes():
+        if pid == os.getpid() or not _DEV_PROCESS_RE.search(command) or not mentions_path(command, worktree):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+        except OSError:  # already gone, or not ours to stop
+            continue
+        stopped.append(f"{pid}: {command[:DESCRIPTION_CHARS]}")
+    return stopped
+
+
+def mentions_path(text: str, path: Path) -> bool:
+    """
+    True when `text` names `path` or something inside it, in either slash style and any case;
+    a sibling that only shares the prefix (`wt` and `wt-2`) does not count.
+    """
+    haystack = text.lower().replace("\\", "/")
+    needle = str(path).lower().replace("\\", "/").rstrip("/")
+    if not needle:
+        return False
+    start = haystack.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        if end == len(haystack) or not (haystack[end].isalnum() or haystack[end] in "-_."):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _node_processes() -> list[tuple[int, str]]:
+    """(pid, command line) of every running node process."""
+    if sys.platform == "win32":
+        res = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_NODE_LIST])
+        if res is None or res.returncode != 0:
+            detail = _tail(res.stderr) if res is not None else "could not start powershell"
+            raise WorkerRuntimeError(f"listing node processes failed: {detail}")
+        return _windows_processes(res.stdout or "")
+    res = _run(["ps", "-eo", "pid=,comm=,args="])
+    if res is None or res.returncode != 0:
+        detail = _tail(res.stderr) if res is not None else "could not start ps"
+        raise WorkerRuntimeError(f"listing node processes failed: {detail}")
+    processes = []
+    for line in (res.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1] == "node":
+            processes.append((int(parts[0]), parts[2]))
+    return processes
+
+
+def _windows_processes(stdout: str) -> list[tuple[int, str]]:
+    """`ConvertTo-Json` output: nothing, one object, or a list of {ProcessId, CommandLine}."""
+    if not stdout.strip():
+        return []
+    try:
+        payload = json.loads(stdout)
+    except ValueError as e:
+        raise WorkerRuntimeError(f"listing node processes returned unparseable JSON: {_tail(stdout)}") from e
+    rows = payload if isinstance(payload, list) else [payload]
+    processes = []
+    for row in rows:
+        row = _mapping(row)
+        pid, command = row.get("ProcessId"), row.get("CommandLine")
+        if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(command, str):
+            processes.append((pid, command))
+    return processes
 
 
 def _worker_rows(stdout: str) -> list[Any]:

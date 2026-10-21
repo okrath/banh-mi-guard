@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 import guard.cli
 from guard.commands import watch as watch_mod
 from guard.core import worker_verify as engine
+from guard.core.watchdog import WatchConfig
 from guard.core.worker_runtime import OrcaWorker, WorkerRuntimeError, WorktreeProbe
 
 app = guard.cli.app
@@ -71,11 +72,32 @@ def settles_on_refresh(name: str, **kwargs):
 
 def fake_probe(head="b" * 40, *, dirty=False, activity_ts=None):
     stamp = time.time() if activity_ts is None else activity_ts
-    return lambda worktree: WorktreeProbe(head=head, dirty=dirty, activity_ts=stamp)
+    return lambda worktree, **kwargs: WorktreeProbe(head=head, dirty=dirty, activity_ts=stamp)
 
 
 def empty_verify(worktree, **kwargs) -> engine.VerifyResult:
     return engine.VerifyResult()
+
+
+def record_nudges(monkeypatch) -> list:
+    """Replace send_nudge; returns the (orca, terminal, text, interrupt) of every nudge sent."""
+    sent = []
+    monkeypatch.setattr(watch_mod, "send_nudge",
+                        lambda orca, terminal, text, *, interrupt=False: sent.append((orca, terminal, text, interrupt)))
+    return sent
+
+
+@pytest.fixture(autouse=True)
+def no_real_orca(monkeypatch):
+    """No test reaches the real Orca CLI, process list or dependency check: no screen, healthy links."""
+    monkeypatch.setattr(watch_mod, "read_screen", lambda orca, terminal, limit=25: None)
+    monkeypatch.setattr(watch_mod, "main_checkout_of", lambda worktree: None)
+    monkeypatch.setattr(watch_mod, "check_main_checkout", lambda repo: [])
+
+    def no_stop(worktree):
+        raise AssertionError("stop_dev_servers called without a dev-server stall")
+
+    monkeypatch.setattr(watch_mod, "stop_dev_servers", no_stop)
 
 
 # --- guard worker-verify ------------------------------------------------------
@@ -459,7 +481,7 @@ def test_watch_plain_git_needs_a_clean_head_held_for_two_passes(tmp_path, monkey
         WorktreeProbe(head="c" * 40, dirty=False, activity_ts=time.time()),  # second commit
         WorktreeProbe(head="c" * 40, dirty=False, activity_ts=time.time()),  # held still: done
     ])
-    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree: next(probes))
+    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree, **kwargs: next(probes))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
     log = tmp_path / "two.log"
@@ -488,7 +510,7 @@ def test_watch_once_json_reports_the_pass_and_writes_the_log(tmp_path, monkeypat
     now = time.time()
     rows = [
         worker_row("fix-a", terminal="term_1", observed_at=now),
-        worker_row("test-b", terminal=None, settled=True, observed_at=now),
+        worker_row("test-b", terminal="term_2", settled=True, observed_at=now),
     ]
     monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=True))
@@ -505,8 +527,8 @@ def test_watch_once_json_reports_the_pass_and_writes_the_log(tmp_path, monkeypat
     payload = json.loads(result.output)
     assert [row["name"] for row in payload] == ["fix-a", "test-b"]
     assert set(payload[0]) == {
-        "name", "head", "head_moved", "dirty", "activity_ts", "heartbeat_ts", "settled", "quick_fails", "state",
-        "actions",
+        "name", "head", "head_moved", "dirty", "activity_ts", "heartbeat_ts", "settled", "quick_fails", "busy",
+        "command", "deps_fails", "state", "actions",
     }
     assert payload[0]["heartbeat_ts"] == pytest.approx(now, abs=1.0)
     assert payload[0]["head"] == "b" * 40
@@ -524,7 +546,6 @@ def test_watch_once_json_reports_the_pass_and_writes_the_log(tmp_path, monkeypat
 
 
 def test_watch_once_never_sends_a_nudge(tmp_path, monkeypatch):
-    sent = []
     monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a", terminal="term_1")])
     monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=False))
     monkeypatch.setattr(
@@ -533,7 +554,7 @@ def test_watch_once_never_sends_a_nudge(tmp_path, monkeypatch):
             issues=[engine.VerifyIssue(engine.FAIL, "scope-outside-ownership", "edited outside its ownership: x.py")]
         ),
     )
-    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    sent = record_nudges(monkeypatch)
     log = tmp_path / "once.log"
 
     result = CliRunner().invoke(
@@ -642,7 +663,7 @@ def test_watch_survives_a_failing_probe_and_quick_scan(tmp_path, monkeypatch):
     rows = [worker_row("bad-probe"), worker_row("bad-scan"), worker_row("good")]
     monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
 
-    def probe(worktree: Path):
+    def probe(worktree: Path, **kwargs):
         if worktree.name == "bad-probe":
             raise WorkerRuntimeError("orca timed out after 60s")
         return WorktreeProbe(head="c" * 40, dirty=False, activity_ts=100.0)
@@ -717,20 +738,21 @@ def test_watch_reads_roles_and_own_from_the_ownership_file(tmp_path, monkeypatch
 
 
 def test_watch_logs_a_skipped_nudge_without_a_terminal(tmp_path, monkeypatch):
+    # A row without a terminal has no agent to nudge: it is skipped before probing, logged once,
+    # and it does not keep the run alive.
     repo = committed_repo(tmp_path / "no-terminal")
     base = git(repo, "rev-parse", "HEAD")
-    heads = iter([base, "b" * 40])
-    sent = []
-    monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal=None, worktree=repo))
-    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree: WorktreeProbe(head=next(heads), dirty=False,
-                                                                                    activity_ts=100.0))
+    probed = []
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", terminal=None, worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree, **kwargs: probed.append(worktree))
     monkeypatch.setattr(
         watch_mod, "verify_worker",
         lambda worktree, **kwargs: engine.VerifyResult(
             issues=[engine.VerifyIssue(engine.FAIL, "scope-outside-ownership", "edited outside its ownership: x.py")]
         ),
     )
-    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    sent = record_nudges(monkeypatch)
     sleeps = []
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
     log = tmp_path / "loop.log"
@@ -742,9 +764,12 @@ def test_watch_logs_a_skipped_nudge_without_a_terminal(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert sent == []
-    assert sleeps == [1.0]
-    assert json.loads(result.output)[0]["state"] == "done"
-    assert "nudge skipped: no terminal" in log.read_text(encoding="utf-8")
+    assert probed == []
+    assert sleeps == []
+    assert json.loads(result.output) == []
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "  fix-a  skipped  no terminal" in lines[0]
 
 
 def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
@@ -753,12 +778,11 @@ def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
     repo = committed_repo(tmp_path / "stalled-nudge")
     base = git(repo, "rev-parse", "HEAD")
     heads = iter([base, "b" * 40])
-    sent = []
     monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal="term_1", worktree=repo))
     monkeypatch.setattr(watch_mod, "probe_worktree",
-                        lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
+                        lambda worktree, **kwargs: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
-    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    sent = record_nudges(monkeypatch)
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
     log = tmp_path / "stalled.log"
 
@@ -768,7 +792,7 @@ def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
     )
 
     assert result.exit_code == 0
-    assert sent == [("orca", "term_1", STALLED_TEXT.format(stall_min=1.0))]
+    assert sent == [("orca", "term_1", STALLED_TEXT.format(stall_min=1.0), True)]  # stalled always interrupts
     assert json.loads(result.output)[0]["state"] == "done"  # the second pass saw the commit and the settled dispatch
     assert "nudge skipped" not in log.read_text(encoding="utf-8")
 
@@ -776,13 +800,12 @@ def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
 def test_watch_treats_an_empty_terminal_as_no_terminal(tmp_path, monkeypatch):
     repo = committed_repo(tmp_path / "empty-terminal")
     base = git(repo, "rev-parse", "HEAD")
-    heads = iter([base, "b" * 40])
-    sent = []
-    monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal="", worktree=repo))
-    monkeypatch.setattr(watch_mod, "probe_worktree",
-                        lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
+    probed = []
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", terminal="", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree, **kwargs: probed.append(worktree))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
-    monkeypatch.setattr(watch_mod, "send_nudge", lambda *args: sent.append(args))
+    sent = record_nudges(monkeypatch)
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
     log = tmp_path / "empty-terminal.log"
 
@@ -793,8 +816,9 @@ def test_watch_treats_an_empty_terminal_as_no_terminal(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert sent == []
-    assert json.loads(result.output)[0]["state"] == "done"
-    assert "nudge skipped: no terminal" in log.read_text(encoding="utf-8")
+    assert probed == []
+    assert json.loads(result.output) == []
+    assert "  fix-a  skipped  no terminal" in log.read_text(encoding="utf-8")
 
 
 def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
@@ -802,7 +826,7 @@ def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
 
     heads = iter(["a" * 40, "b" * 40])
 
-    def probe(worktree: Path) -> WorktreeProbe:
+    def probe(worktree: Path, **kwargs) -> WorktreeProbe:
         if worktree.name == "test-a":
             return WorktreeProbe(head="a" * 40, dirty=True, activity_ts=time.time())
         return WorktreeProbe(head=next(heads), dirty=False, activity_ts=time.time())
@@ -811,7 +835,7 @@ def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
 
     def rows(orca, run, names=None):
         calls.append(run)
-        return [worker_row("test-a", terminal=None, settled=True), worker_row("fix-b", settled=len(calls) > 1)]
+        return [worker_row("test-a", terminal="term_2", settled=True), worker_row("fix-b", settled=len(calls) > 1)]
 
     monkeypatch.setattr(watch_mod, "list_workers", rows)
     monkeypatch.setattr(watch_mod, "probe_worktree", probe)
@@ -903,3 +927,397 @@ def test_watch_table_prints_one_row_per_worker(tmp_path, monkeypatch):
     assert "fix-a" in result.output
     assert "working" in result.output
     assert "bbbbbbb" in result.output  # the short head sha
+
+
+# --- guard watch: screen supervision -------------------------------------------
+
+SPIN = "\u280b"  # a braille spinner glyph
+BASE = "a" * 40
+
+
+def watcher(tmp_path, *rows, cfg=None, base=BASE, once=False, ownership_path=None, ownership=None):
+    """A watcher over Orca rows, driven pass by pass with explicit clocks."""
+    targets = {
+        row.name: watch_mod._Target(name=row.name, worktree=row.worktree, role="fix", own=["**"], row=row)
+        for row in rows
+    }
+    return watch_mod._Watcher(
+        run_id="run_1", base=base, cfg=cfg or WatchConfig(), log_path=tmp_path / "w.log", orca="orca", once=once,
+        targets=targets, ownership_path=ownership_path, ownership=ownership or {},
+    )
+
+
+def screens(monkeypatch, *frames):
+    """read_screen answers the given frames in order, then repeats the last; returns the (orca, terminal) reads."""
+    reads = []
+    queue = list(frames)
+
+    def read(orca, terminal, limit=25):
+        reads.append((orca, terminal))
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    monkeypatch.setattr(watch_mod, "read_screen", read)
+    return reads
+
+
+def busy_screen(body: str = "Thinking about the bug") -> str:
+    return f"{SPIN} 3m 12s  {body}\n"
+
+
+def test_watch_once_reads_the_worker_screen(tmp_path, monkeypatch):
+    reads = screens(monkeypatch, f"{SPIN} 2m\n{SPIN} $ pnpm test --watch\n")
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a", terminal="term_7")])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=True))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--once", "--json", "--log", str(tmp_path / "s.log")]
+    )
+
+    assert result.exit_code == 0
+    assert reads == [("orca", "term_7")]
+    record = json.loads(result.output)[0]
+    assert record["busy"] is True
+    assert record["command"] == "pnpm test --watch"
+
+
+def test_watch_loop_min_option_reaches_the_monitor(tmp_path, monkeypatch):
+    screens(monkeypatch, f"{SPIN} 2m\n{SPIN} $ node poll.js\n")
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a")])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(dirty=True))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--loop-min", "0", "--once", "--json",
+              "--log", str(tmp_path / "loop.log")]
+    )
+
+    assert result.exit_code == 0
+    record = json.loads(result.output)[0]
+    assert record["state"] == "looping"
+    assert record["actions"][0]["interrupt"] is True
+    assert sent == []  # --once never sends
+
+
+def test_watch_frozen_busy_screen_gets_an_interrupting_stall_nudge(tmp_path, monkeypatch):
+    from guard.core.watchdog import STALLED_TEXT
+
+    t0 = 1_000_000.0
+    row = worker_row("fix-a", observed_at=t0 + 480)  # a fresh heartbeat must not mask the frozen screen
+    screens(monkeypatch, busy_screen(), f"{SPIN} 11m 20s  Thinking about the bug\n")  # only the timer moved
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0 + 480))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, row)
+
+    assert w.tick_pass(t0)[0].record["state"] == "working"
+    rows = w.tick_pass(t0 + 480)
+
+    assert rows[0].record["state"] == "stalled"
+    assert sent == [("orca", "term_1", STALLED_TEXT.format(stall_min=8.0), True)]  # no dev server: nothing stopped
+
+
+def test_watch_stops_the_dev_server_before_the_stall_nudge(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    events = []
+    screen = f"{SPIN} 9m  Bash\n$ pnpm dev\n  VITE v5.0.0  ready in 312 ms\n  Local:   http://localhost:5173/\n"
+    screens(monkeypatch, screen)
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    def stop(worktree):
+        events.append(("stop", worktree))
+        return ["4242: node C:/w/fix-a/node_modules/vite/bin/vite.js"]
+
+    monkeypatch.setattr(watch_mod, "stop_dev_servers", stop)
+    monkeypatch.setattr(watch_mod, "send_nudge",
+                        lambda orca, terminal, text, *, interrupt=False: events.append(("nudge", interrupt)))
+    row = worker_row("fix-a")
+    w = watcher(tmp_path, row)
+
+    w.tick_pass(t0)
+    assert events == []  # dev-server output alone is no reason to stop anything
+    w.tick_pass(t0 + 480)
+
+    assert events == [("stop", row.worktree), ("nudge", True)]
+    assert "  fix-a  dev-server-stopped  4242: node C:/w/fix-a/node_modules/vite/bin/vite.js" in (
+        tmp_path / "w.log").read_text(encoding="utf-8")
+
+
+def test_watch_once_never_stops_a_dev_server(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    screens(monkeypatch, f"{SPIN} 9m\nwatching for file changes\n")
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    w = watcher(tmp_path, worker_row("fix-a"), once=True)
+
+    w.tick_pass(t0)
+    rows = w.tick_pass(t0 + 480)  # the autouse fake fails the test if a stop is attempted
+
+    assert rows[0].record["state"] == "stalled"
+    assert "nudge skipped: dry run (--once)" in rows[0].note
+
+
+def test_watch_interrupts_a_looping_command(tmp_path, monkeypatch):
+    from guard.core.watchdog import LOOPING_TEXT
+
+    t0 = 1_000_000.0
+    frames = [f"{SPIN} {n}m\n{SPIN} $ node retry.js\nattempt {n}\n" for n in (1, 6, 11)]
+    screens(monkeypatch, *frames)  # the output changes every pass, so the stall check never fires
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    w.tick_pass(t0)
+    w.tick_pass(t0 + 300)
+    rows = w.tick_pass(t0 + 600)
+
+    assert rows[0].record["state"] == "looping"
+    assert sent == [("orca", "term_1", LOOPING_TEXT.format(loop_min=10.0, command="node retry.js"), True)]
+
+
+def test_watch_idle_screen_nudge_is_not_an_interrupt(tmp_path, monkeypatch):
+    from guard.core.watchdog import IDLE_TEXT
+
+    t0 = 1_000_000.0
+    screens(monkeypatch, "> \n  ? for shortcuts\n")
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a", observed_at=t0))
+
+    w.tick_pass(t0)
+    w.tick_pass(t0 + 90)
+
+    assert sent == [("orca", "term_1", IDLE_TEXT, False)]
+
+
+def test_watch_keeps_watching_a_committed_but_busy_worker(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    screens(monkeypatch, busy_screen("taking stills"), busy_screen("writing the report"), "> \n")
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head="c" * 40, dirty=False, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    assert w.tick_pass(t0)[0].record["state"] == "working"
+    assert w.tick_pass(t0 + 90)[0].record["state"] == "working"
+    assert w._finished("fix-a") is False
+    w.targets["fix-a"].row = worker_row("fix-a", settled=True)  # the report is sent: the dispatch settles
+    assert w.tick_pass(t0 + 180)[0].record["state"] == "done"
+    assert sent == []
+
+
+def test_watch_clean_commit_with_findings_is_a_reject_candidate(tmp_path, monkeypatch):
+    from guard.core.watchdog import REJECT_TEXT
+
+    finding = "weakened-skip-focus: tests/test_x.py adds pytest.skip"
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head="c" * 40, dirty=False))
+    monkeypatch.setattr(
+        watch_mod, "verify_worker",
+        lambda worktree, **kwargs: engine.VerifyResult(
+            issues=[engine.VerifyIssue(engine.FAIL, "weakened-skip-focus", "tests/test_x.py adds pytest.skip")]
+        ),
+    )
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a", settled=True))  # the worker finished: its dispatch settled
+    log = tmp_path / "w.log"
+
+    record = w.tick_pass(time.time())[0].record
+
+    assert sent == []
+    assert w.monitors["fix-a"].done is False
+    assert record["state"] == "needs-human"
+    assert record["actions"] == [
+        {"kind": "needs-human", "reason": "reject-candidate", "text": REJECT_TEXT.format(findings=finding),
+         "interrupt": False}
+    ]
+    log_text = log.read_text(encoding="utf-8")
+    assert finding in log_text
+    assert "  done  " not in log_text
+
+
+def test_watch_rereads_the_ownership_file_every_pass(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    path = tmp_path / "ownership.json"
+    path.write_text(json.dumps({"fix-a": {"role": "fix", "own": ["src/**"]}}), encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", lambda worktree, **kwargs: seen.append(kwargs["own"]) or engine.VerifyResult())
+    w = watcher(tmp_path, worker_row("fix-a"), ownership_path=path, ownership={"fix-a": {"role": "fix", "own": ["src/**"]}})
+
+    w.tick_pass(t0)
+    path.write_text(json.dumps({"fix-a": {"role": "fix", "own": ["src/**", "docs/**"]}}), encoding="utf-8")
+    w.tick_pass(t0 + 90)
+    path.write_text('{"fix-a": {"role": "fix", "own": ["src/**"', encoding="utf-8")  # caught mid-write
+    w.tick_pass(t0 + 180)
+
+    assert seen == [["src/**"], ["src/**", "docs/**"], ["src/**", "docs/**"]]
+    log_lines = (tmp_path / "w.log").read_text(encoding="utf-8").splitlines()
+    warnings = [line for line in log_lines if "  ownership  warning  " in line]
+    assert len(warnings) == 1
+    assert "keeping the previous copy" in warnings[0]
+    assert all(LOG_LINE_RE.match(line) for line in log_lines)
+
+
+def test_watch_flags_broken_dependency_links_once(tmp_path, monkeypatch):
+    from guard.core.watchdog import DEPS_TEXT
+
+    t0 = 1_000_000.0
+    mine = r"FAIL node_modules -> C:\w\fix-a\node_modules (a worker's worktree)"
+    other = r"FAIL apps/api/node_modules -> C:\w\old-b\apps\api\node_modules"
+    checked = []
+    monkeypatch.setattr(watch_mod, "main_checkout_of", lambda worktree: checked.append(worktree) or Path("C:/repo"))
+    monkeypatch.setattr(watch_mod, "check_main_checkout", lambda repo: [mine, other])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    rows = [worker_row("fix-a", observed_at=t0), worker_row("fix-c", observed_at=t0)]
+    w = watcher(tmp_path, *rows)
+
+    first = w.tick_pass(t0)
+    w.tick_pass(t0 + 30)
+
+    assert checked == [Path("C:/w/fix-a"), Path("C:/w/fix-a")]  # the first watched worktree, every pass
+    assert first[0].record["deps_fails"] == [mine]
+    assert first[1].record["deps_fails"] == []
+    assert sent == [("orca", "term_1", DEPS_TEXT.format(line=mine), True)]
+    log_text = (tmp_path / "w.log").read_text(encoding="utf-8")
+    assert log_text.count(f"  deps  deps-broken  {mine}") == 1
+    assert log_text.count(f"  deps  deps-broken  {other}") == 1
+
+
+def test_watch_survives_a_failing_dependency_check(tmp_path, monkeypatch):
+    def broken(worktree):
+        raise RuntimeError("git vanished")
+
+    monkeypatch.setattr(watch_mod, "main_checkout_of", broken)
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    assert w.tick_pass(time.time())[0].record["state"] == "working"
+    assert "  deps  warning  dependency check failed: git vanished" in (tmp_path / "w.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("state", ["stopped", "abandoned", "released", "start_unknown", "starting"])
+def test_watch_skips_rows_without_an_agent(tmp_path, monkeypatch, state):
+    row = OrcaWorker(name="fix-a", worktree=Path("C:/w/fix-a"), terminal="term_1", worker_state=state,
+                     stage_detail="", activity="", liveness="", observed_at=None, settled=False)
+    probed = []
+    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree, **kwargs: probed.append(worktree))
+    w = watcher(tmp_path, row)
+
+    assert w.tick_pass(1_000_000.0) == []
+    w.tick_pass(1_000_090.0)
+
+    assert probed == []
+    assert w.monitors == {}
+    assert w._finished("fix-a") is (state != "starting")  # a starting worker may still come up
+    lines = (tmp_path / "w.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # logged when the reason changes, not every pass
+    assert f"  fix-a  skipped  {state}" in lines[0]
+
+
+def test_watch_picks_up_a_worker_once_it_has_started(tmp_path, monkeypatch):
+    starting = OrcaWorker(name="fix-a", worktree=Path("C:/w/fix-a"), terminal=None, worker_state="starting",
+                          stage_detail="", activity="", liveness="", observed_at=None, settled=False)
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [worker_row("fix-a")])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    w = watcher(tmp_path, starting)
+
+    assert w.tick_pass(1_000_000.0) == []
+    w._refresh_rows()
+
+    assert [row.record["state"] for row in w.tick_pass(1_000_090.0)] == ["working"]
+
+
+def test_watch_treats_a_cancelled_named_worker_as_settled(tmp_path, monkeypatch):
+    row = OrcaWorker(name="fix-a", worktree=Path("C:/w/fix-a"), terminal="term_1", worker_state="cancelled",
+                     stage_detail="", activity="", liveness="", observed_at=None, settled=True)
+    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: [row])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=False))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--once", "--json",
+              "--log", str(tmp_path / "c.log")]
+    )
+
+    assert result.exit_code == 0
+    record = json.loads(result.output)[0]
+    assert record["settled"] is True
+    assert record["actions"][0]["reason"] == "settled-no-commit"
+
+
+def test_watch_probes_with_the_first_seen_time(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    since = []
+
+    def probe(worktree, **kwargs):
+        since.append(kwargs.get("since"))
+        return WorktreeProbe(head=BASE, dirty=False, activity_ts=None)
+
+    monkeypatch.setattr(watch_mod, "probe_worktree", probe)
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    w.tick_pass(t0)
+    w.tick_pass(t0 + 90)
+
+    assert since == [t0, t0]  # an old base commit never counts as the worker's activity
+
+
+def test_watch_logs_the_nudge_limit(tmp_path, monkeypatch):
+    from guard.core.watchdog import NUDGE_LIMIT_TEXT
+
+    t0 = 1_000_000.0
+    screens(monkeypatch, busy_screen())
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a"), cfg=WatchConfig(max_nudges=0))
+
+    w.tick_pass(t0)
+    rows = w.tick_pass(t0 + 480)
+
+    assert sent == []
+    assert rows[0].record["state"] == "needs-human"
+    assert f"  fix-a  needs-human  {NUDGE_LIMIT_TEXT.format(max_nudges=0)}" in (tmp_path / "w.log").read_text(
+        encoding="utf-8")
+
+
+def test_watch_background_job_past_loop_min_is_looping_at_once(tmp_path, monkeypatch):
+    from guard.core.watchdog import LOOPING_TEXT
+
+    t0 = 1_000_000.0
+    job = "\u2514\u2500 \u27e8bash\u27e9 bg_1 python -m pytest tests/x.py -q\u2026 \u00b7 17m42s"
+    screens(monkeypatch, f"{SPIN} 18m 2s  Waiting for background jobs\n  {job}\n")
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    rows = w.tick_pass(t0)  # the first pass: the job's own clock says it hung long ago
+
+    assert rows[0].record["state"] == "looping"
+    assert rows[0].record["command"] == "python -m pytest tests/x.py -q"
+    command = "python -m pytest tests/x.py -q"
+    assert sent == [("orca", "term_1", LOOPING_TEXT.format(loop_min=10.0, command=command), True)]
+    assert w.tick_pass(t0 + 90)[0].record["state"] == "working"  # the clock restarts after the nudge
+
+
+def test_watch_young_background_job_is_not_looping(tmp_path, monkeypatch):
+    t0 = 1_000_000.0
+    job = "\u2514\u2500 \u27e8bash\u27e9 bg_1 pnpm build \u00b7 2m10s"
+    screens(monkeypatch, f"{SPIN} 3m  Waiting\n  {job}\n")
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head=BASE, dirty=True, activity_ts=t0))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    sent = record_nudges(monkeypatch)
+    w = watcher(tmp_path, worker_row("fix-a"))
+
+    assert w.tick_pass(t0)[0].record["state"] == "working"
+    assert sent == []
