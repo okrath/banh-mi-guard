@@ -316,6 +316,27 @@ def test_probe_worktree_reads_changed_paths_with_spaces(tmp_path):
     assert probe.activity_ts == pytest.approx(edited_at, abs=0.01)
 
 
+def test_probe_worktree_reads_files_inside_a_new_untracked_folder(tmp_path):
+    repo = make_repo(tmp_path / "new-folder")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "init")
+    first = wr.probe_worktree(repo)
+
+    folder = repo / "models" / "characters"
+    folder.mkdir(parents=True)
+    new_file = folder / "chibi.glb"
+    new_file.write_bytes(b"glb")
+    edited_at = first.activity_ts + 50
+    os.utime(new_file, (edited_at, edited_at))
+    for parent in (folder, repo / "models"):  # a collapsed `?? models/` line would read these older stamps
+        os.utime(parent, (first.activity_ts + 1, first.activity_ts + 1))
+
+    probe = wr.probe_worktree(repo)
+    assert probe.dirty is True
+    assert probe.activity_ts == pytest.approx(edited_at, abs=0.01)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows file names cannot contain '>'")
 def test_probe_worktree_counts_an_untracked_name_with_an_arrow(tmp_path):
     repo = make_repo(tmp_path / "arrows")
