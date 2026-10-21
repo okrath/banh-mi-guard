@@ -56,7 +56,7 @@ def probe_worktree(worktree: Path) -> WorktreeProbe:
     rev = _git(worktree, "rev-parse", "HEAD")
     head = (rev.stdout.strip() or None) if rev is not None and rev.returncode == 0 else None
 
-    status = _git(worktree, "status", "--porcelain")
+    status = _git(worktree, "status", "--porcelain", "-uall")  # -uall: files inside a new folder, one per line
     porcelain = (status.stdout or "") if status is not None and status.returncode == 0 else ""
 
     stamps: list[float] = []

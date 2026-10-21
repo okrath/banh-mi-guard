@@ -66,12 +66,19 @@ class WorkerMonitor:
     would exceed the budget becomes a needs-human `nudge-limit` instead.
     """
 
-    def __init__(self, name: str, role: str, start_head: str | None, cfg: WatchConfig, *, now: float) -> None:
+    def __init__(
+        self, name: str, role: str, start_head: str | None, cfg: WatchConfig, *, now: float, settles: bool = False
+    ) -> None:
         self.name = name
         self.role = role  # "fix" | "test"
         self.start_head = start_head  # None: unknown at start
         self.cfg = cfg
+        # True when the provider reports settlement (Orca): a fix worker is done only once it settles,
+        # and a commit before that is progress. False (plain worktree): a clean committed head must
+        # hold still for two consecutive passes.
+        self.settles = settles
         self.started_at = now
+        self._clean_head: str | None = None  # the clean committed head seen on the previous pass
         self._nudges = 0
         self._done = False
         self._needs_human = False
@@ -124,7 +131,13 @@ class WorkerMonitor:
             return Action("needs-human", "settled-dirty", SETTLED_DIRTY_TEXT)
 
         moved = self._head_moved(tick)
-        if moved and not tick.dirty:
+        clean_step = moved and not tick.dirty
+        if self.settles:
+            delivered = clean_step and tick.settled
+        else:
+            delivered = clean_step and tick.head is not None and tick.head == self._clean_head
+            self._clean_head = tick.head if clean_step else None
+        if delivered:
             self._done = True
             return Action("done", "done", "")
         if tick.settled:

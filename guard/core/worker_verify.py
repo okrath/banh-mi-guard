@@ -158,24 +158,27 @@ def _unquote_git_path(raw: str) -> str:
     return out.decode("utf-8", "replace")
 
 
-def _porcelain_paths(line: str) -> list[str]:
-    """The paths a porcelain line names: the 3-char status stripped, Git quoting undone.
-
-    A rename or copy entry names two paths (`old -> new`), and both of them count as changed.
-    """
-    raw = line[3:]
-    if " -> " in raw:
-        old, new = raw.split(" -> ", 1)
-        return [_unquote_git_path(old), _unquote_git_path(new)]
-    return [_unquote_git_path(raw)]
-
-
 def _status_entries(worktree: Path) -> list[tuple[str, str]]:
-    """(status, path) for every working-tree entry Git reports, one entry per path."""
+    """(status, path) for every working-tree entry Git reports, one entry per path.
+
+    `-uall` lists each file inside a new folder instead of the folder itself, so a narrow `own`
+    glob can match it; `-z` gives raw, unquoted paths. A rename or copy entry is `new NUL old`,
+    and both paths count as changed.
+    """
     entries = []
-    for line in _git(worktree, "status", "--porcelain").splitlines():
-        if len(line) > 3:
-            entries.extend((line[:2], path) for path in _porcelain_paths(line))
+    parts = _git(worktree, "status", "--porcelain", "-z", "-uall").split("\0")
+    i = 0
+    while i < len(parts):
+        item = parts[i]
+        i += 1
+        if len(item) < 4:
+            continue
+        status = item[:2]
+        entries.append((status, item[3:]))
+        if "R" in status or "C" in status:
+            if i < len(parts) and parts[i]:
+                entries.append((status, parts[i]))
+            i += 1
     return entries
 
 

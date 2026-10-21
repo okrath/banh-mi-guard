@@ -36,20 +36,47 @@ def monitor(role: str = "fix", cfg: WatchConfig | None = None) -> WorkerMonitor:
     return WorkerMonitor("w1", role, "a" * 40, cfg or WatchConfig(), now=START)
 
 
-# 1. done: a fix worker that committed on a clean tree.
+# 1. done: a fix worker that committed on a clean tree and finished.
 
 
-def test_fix_is_done_when_the_head_moved_and_the_tree_is_clean() -> None:
+def test_worktree_fix_is_done_when_a_clean_moved_head_holds_for_two_passes() -> None:
     mon = monitor()
-    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 10) == [Action("done", "done", "")]
+    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 10) == []  # first sight: progress
+    assert mon.done is False
+    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 20) == [Action("done", "done", "")]
     assert mon.done is True
-    assert mon.observe(make_tick(), START + 20) == []
-    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 30) == []
+    assert mon.observe(make_tick(), START + 30) == []
+    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 40) == []
+
+
+def test_worktree_fix_that_keeps_working_after_a_commit_is_not_done() -> None:
+    mon = monitor()
+    assert mon.observe(make_tick(head="c" * 40, head_moved=True, dirty=False), START + 10) == []
+    assert mon.observe(make_tick(head="c" * 40, head_moved=True, dirty=True), START + 20) == []  # editing again
+    assert mon.observe(make_tick(head="c" * 40, head_moved=True, dirty=False), START + 30) == []  # streak restarts
+    assert mon.observe(make_tick(head="d" * 40, head_moved=True, dirty=False), START + 40) == []  # a new commit
+    assert mon.done is False
+    assert mon.observe(make_tick(head="d" * 40, head_moved=True, dirty=False), START + 50) == [Action("done", "done", "")]
+
+
+def test_orca_fix_first_commit_while_the_dispatch_is_active_is_not_done() -> None:
+    mon = WorkerMonitor("w1", "fix", "a" * 40, WatchConfig(), now=START, settles=True)
+    for offset in (10, 20, 30):
+        assert mon.observe(make_tick(head_moved=True, dirty=False), START + offset) == []
+    assert mon.done is False
+
+
+def test_orca_fix_is_done_when_its_dispatch_settles_on_a_clean_commit() -> None:
+    mon = WorkerMonitor("w1", "fix", "a" * 40, WatchConfig(), now=START, settles=True)
+    assert mon.observe(make_tick(head_moved=True, dirty=False), START + 10) == []
+    assert mon.observe(make_tick(head_moved=True, dirty=False, settled=True), START + 20) == [Action("done", "done", "")]
+    assert mon.done is True
 
 
 def test_fix_with_uncommitted_changes_is_not_done() -> None:
     mon = monitor()
     assert mon.observe(make_tick(head_moved=True, dirty=True), START + 10) == []
+    assert mon.observe(make_tick(head_moved=True, dirty=True), START + 20) == []
     assert mon.done is False
 
 
@@ -57,7 +84,8 @@ def test_unknown_start_head_counts_the_first_real_head_as_moved() -> None:
     mon = WorkerMonitor("w1", "fix", None, WatchConfig(), now=START)
     # Unborn HEAD: no commit to compare against, so nothing is decided.
     assert mon.observe(make_tick(head=None, head_moved=False, dirty=True), START + 10) == []
-    assert mon.observe(make_tick(head="c" * 40, head_moved=False, dirty=False), START + 20) == [Action("done", "done", "")]
+    assert mon.observe(make_tick(head="c" * 40, head_moved=False, dirty=False), START + 20) == []
+    assert mon.observe(make_tick(head="c" * 40, head_moved=False, dirty=False), START + 30) == [Action("done", "done", "")]
     assert mon.done is True
 
 

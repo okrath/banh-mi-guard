@@ -298,14 +298,26 @@ def test_quoted_porcelain_paths_are_unquoted(repo: Path) -> None:
     assert verify_worker(repo, base=base, own=["docs/*.md"]).passed
 
 
-def test_untracked_directory_is_reported_as_the_directory(repo: Path) -> None:
-    """Git collapses a wholly untracked directory in porcelain, and the engine sees `docs/`."""
+def test_untracked_files_in_a_new_folder_inside_a_narrow_glob_pass(repo: Path) -> None:
+    """Git would collapse a wholly new folder to `apps/`; each file must be checked on its own."""
     base = head(repo)
-    (repo / "docs").mkdir()
-    (repo / "docs" / "a.md").write_text("x\n", encoding="utf-8")
-    result = verify_worker(repo, base=base, own=["docs/*.md"])
+    models = repo / "apps" / "web" / "public" / "models" / "characters"
+    models.mkdir(parents=True)
+    (models / "chibi.glb").write_bytes(b"glb")
+    (models / "chibi.json").write_text("{}\n", encoding="utf-8")
+    assert verify_worker(repo, base=base, own=["apps/web/public/models/characters/**"]).passed
+
+
+def test_untracked_file_outside_a_narrow_glob_in_a_new_folder_is_flagged(repo: Path) -> None:
+    base = head(repo)
+    models = repo / "apps" / "web" / "public" / "models" / "characters"
+    models.mkdir(parents=True)
+    (models / "chibi.glb").write_bytes(b"glb")
+    (repo / "apps" / "web" / "public" / "favicon.ico").write_bytes(b"ico")
+    result = verify_worker(repo, base=base, own=["apps/web/public/models/characters/**"])
     assert codes(result) == ["scope-outside-ownership"]
-    assert "docs/" in result.issues[0].message
+    assert "apps/web/public/favicon.ico" in result.issues[0].message
+    assert "chibi.glb" not in result.issues[0].message
 
 
 def test_staged_rename_names_both_paths(repo: Path) -> None:
