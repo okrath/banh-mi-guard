@@ -8,6 +8,19 @@ import pytest
 # The user's real agent config and guard home, resolved before any test patches HOME
 _REAL_FILES = [Path(os.path.expanduser("~/.claude/settings.json")), Path(os.path.expanduser("~/.guard/agents/claude-code.json"))]
 
+# Git variables that redirect every git call to another repository. A git hook exports them (guard
+# runs this suite from one), and a test's `git -C <tmp repo>` would then act on the real repository.
+_GIT_REDIRECT_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_NAMESPACE",
+)
+
 
 def _fingerprint():
     return {p: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None for p in _REAL_FILES}
@@ -20,6 +33,14 @@ def never_touch_the_users_agent_config():
     yield
     changed = [str(p) for p, h in _fingerprint().items() if h != before[p]]
     assert not changed, f"tests changed the user's real files: {changed}"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def scrub_inherited_git_environment():
+    """No test inherits a git redirect from its caller (a hook): temp repos stay the only repos touched."""
+    saved = {name: os.environ.pop(name) for name in _GIT_REDIRECT_VARS if name in os.environ}
+    yield
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)
