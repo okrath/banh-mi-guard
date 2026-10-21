@@ -155,8 +155,8 @@ def _resolve_orca(explicit: Optional[str]) -> str:
     return resolved
 
 
-def _base_resolves(worktree: Path, base: str) -> bool:
-    """True when `--base` names a commit in `worktree`; the rule `worker-verify` already enforces."""
+def _resolve_base(worktree: Path, base: str) -> Optional[str]:
+    """The full SHA `--base` names in `worktree`, None when it is not a commit there."""
     try:
         proc = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--verify", f"{base}^{{commit}}"],
@@ -167,8 +167,8 @@ def _base_resolves(worktree: Path, base: str) -> bool:
             check=False,
         )
     except OSError:
-        return False
-    return proc.returncode == 0
+        return None
+    return (proc.stdout.strip() or None) if proc.returncode == 0 else None
 
 
 def _orca_targets(
@@ -280,7 +280,7 @@ class _Watcher:
 
         monitor = self.monitors.get(name)
         if monitor is None:
-            monitor = WorkerMonitor(name, target.role, start, self.cfg, now=now)
+            monitor = WorkerMonitor(name, target.role, start, self.cfg, now=now, settles=target.row is not None)
             self.monitors[name] = monitor
         tick = WorkerTick(
             name=name,
@@ -401,10 +401,13 @@ def watch_cmd(
                                 own=_own(name, ownership_map))
 
     if base and targets:
+        # A short SHA would never equal a probed full HEAD, so every head would look moved: compare full SHAs.
         first = next(iter(targets.values())).worktree
-        if not _base_resolves(first, base):
+        resolved = _resolve_base(first, base)
+        if resolved is None:
             console.print(f"[bold red]❌ --base does not resolve to a commit in {first}: {base}[/bold red]")
             raise typer.Exit(code=2)
+        base = resolved
 
     watcher = _Watcher(
         run_id=run,

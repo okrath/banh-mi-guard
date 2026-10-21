@@ -58,6 +58,17 @@ def worker_row(name: str, *, terminal="term_1", settled=False, observed_at=None,
     )
 
 
+def settles_on_refresh(name: str, **kwargs):
+    """A worker-list stub: the dispatch is active on the first call and settled from the next one on."""
+    calls = []
+
+    def list_workers(orca, run, names=None):
+        calls.append(run)
+        return [worker_row(name, settled=len(calls) > 1, **kwargs)]
+
+    return list_workers
+
+
 def fake_probe(head="b" * 40, *, dirty=False, activity_ts=None):
     stamp = time.time() if activity_ts is None else activity_ts
     return lambda worktree: WorktreeProbe(head=head, dirty=dirty, activity_ts=stamp)
@@ -387,6 +398,82 @@ def test_watch_accepts_a_resolvable_base_in_orca_mode(tmp_path, monkeypatch):
     assert payload[0]["state"] == "working"
 
 
+def test_watch_resolves_a_short_base_to_the_full_sha(tmp_path):
+    repo = committed_repo(tmp_path / "short-base")
+    head = git(repo, "rev-parse", "HEAD")
+    payloads = []
+    for base in (head, head[:7]):
+        result = CliRunner().invoke(
+            app, ["watch", "--worktree", str(repo), "--base", base, "--once", "--json",
+                  "--log", str(tmp_path / "short.log")]
+        )
+        assert result.exit_code == 0
+        payloads.append(json.loads(result.output)[0])
+
+    full, short = ({k: v for k, v in payload.items() if k != "activity_ts"} for payload in payloads)
+    assert short["head_moved"] is False  # the short SHA names the current HEAD: nothing moved
+    assert short["state"] == "working"
+    assert short == full  # a short base behaves exactly like the full one (activity stamps aside)
+
+
+def test_watch_passes_the_full_base_to_the_quick_scan(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "short-scan")
+    head = git(repo, "rev-parse", "HEAD")
+    seen = []
+    monkeypatch.setattr(watch_mod, "verify_worker",
+                        lambda worktree, **kwargs: seen.append(kwargs["base"]) or engine.VerifyResult())
+
+    result = CliRunner().invoke(
+        app, ["watch", "--worktree", str(repo), "--base", head[:7], "--once", "--log", str(tmp_path / "s.log")]
+    )
+
+    assert result.exit_code == 0
+    assert seen == [head]
+
+
+def test_watch_orca_first_commit_while_the_dispatch_is_active_is_working(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "early-commit")
+    base = git(repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(watch_mod, "list_workers",
+                        lambda orca, run, names=None: [worker_row("fix-a", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "probe_worktree", fake_probe(head="b" * 40, dirty=False))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+
+    result = CliRunner().invoke(
+        app, ["watch", "--run", "run_1", "--orca", "orca", "--workers", "fix-a", "--base", base,
+              "--once", "--json", "--log", str(tmp_path / "early.log")]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)[0]
+    assert payload["head_moved"] is True
+    assert payload["state"] == "working"  # a commit is progress; only a settled dispatch is done
+
+
+def test_watch_plain_git_needs_a_clean_head_held_for_two_passes(tmp_path, monkeypatch):
+    repo = committed_repo(tmp_path / "plain-two-passes")
+    base = git(repo, "rev-parse", "HEAD")
+    probes = iter([
+        WorktreeProbe(head="b" * 40, dirty=False, activity_ts=time.time()),  # first commit
+        WorktreeProbe(head="b" * 40, dirty=True, activity_ts=time.time()),  # still editing
+        WorktreeProbe(head="c" * 40, dirty=False, activity_ts=time.time()),  # second commit
+        WorktreeProbe(head="c" * 40, dirty=False, activity_ts=time.time()),  # held still: done
+    ])
+    monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree: next(probes))
+    monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
+    monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
+    log = tmp_path / "two.log"
+
+    result = CliRunner().invoke(
+        app, ["watch", "--worktree", str(repo), "--base", base, "--interval-sec", "1", "--json", "--log", str(log)]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)[0]["state"] == "done"
+    states = [line.split("  ")[2] for line in log.read_text(encoding="utf-8").splitlines()]
+    assert states == ["working", "working", "working", "done"]
+
+
 def test_help_lists_both_new_commands():
     output = CliRunner().invoke(app, ["--help"]).output
 
@@ -634,8 +721,7 @@ def test_watch_logs_a_skipped_nudge_without_a_terminal(tmp_path, monkeypatch):
     base = git(repo, "rev-parse", "HEAD")
     heads = iter([base, "b" * 40])
     sent = []
-    monkeypatch.setattr(watch_mod, "list_workers",
-                        lambda orca, run, names=None: [worker_row("fix-a", terminal=None, worktree=repo)])
+    monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal=None, worktree=repo))
     monkeypatch.setattr(watch_mod, "probe_worktree", lambda worktree: WorktreeProbe(head=next(heads), dirty=False,
                                                                                     activity_ts=100.0))
     monkeypatch.setattr(
@@ -668,8 +754,7 @@ def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
     base = git(repo, "rev-parse", "HEAD")
     heads = iter([base, "b" * 40])
     sent = []
-    monkeypatch.setattr(watch_mod, "list_workers",
-                        lambda orca, run, names=None: [worker_row("fix-a", terminal="term_1", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal="term_1", worktree=repo))
     monkeypatch.setattr(watch_mod, "probe_worktree",
                         lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
@@ -684,7 +769,7 @@ def test_watch_delivers_a_stalled_nudge_to_the_terminal(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert sent == [("orca", "term_1", STALLED_TEXT.format(stall_min=1.0))]
-    assert json.loads(result.output)[0]["state"] == "done"  # the second pass observed the commit
+    assert json.loads(result.output)[0]["state"] == "done"  # the second pass saw the commit and the settled dispatch
     assert "nudge skipped" not in log.read_text(encoding="utf-8")
 
 
@@ -693,8 +778,7 @@ def test_watch_treats_an_empty_terminal_as_no_terminal(tmp_path, monkeypatch):
     base = git(repo, "rev-parse", "HEAD")
     heads = iter([base, "b" * 40])
     sent = []
-    monkeypatch.setattr(watch_mod, "list_workers",
-                        lambda orca, run, names=None: [worker_row("fix-a", terminal="", worktree=repo)])
+    monkeypatch.setattr(watch_mod, "list_workers", settles_on_refresh("fix-a", terminal="", worktree=repo))
     monkeypatch.setattr(watch_mod, "probe_worktree",
                         lambda worktree: WorktreeProbe(head=next(heads), dirty=False, activity_ts=100.0))
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
@@ -723,8 +807,13 @@ def test_watch_final_summary_keeps_a_needs_human_line(tmp_path, monkeypatch):
             return WorktreeProbe(head="a" * 40, dirty=True, activity_ts=time.time())
         return WorktreeProbe(head=next(heads), dirty=False, activity_ts=time.time())
 
-    rows = [worker_row("test-a", terminal=None, settled=True), worker_row("fix-b")]
-    monkeypatch.setattr(watch_mod, "list_workers", lambda orca, run, names=None: list(rows))
+    calls = []
+
+    def rows(orca, run, names=None):
+        calls.append(run)
+        return [worker_row("test-a", terminal=None, settled=True), worker_row("fix-b", settled=len(calls) > 1)]
+
+    monkeypatch.setattr(watch_mod, "list_workers", rows)
     monkeypatch.setattr(watch_mod, "probe_worktree", probe)
     monkeypatch.setattr(watch_mod, "verify_worker", empty_verify)
     monkeypatch.setattr(watch_mod.time, "sleep", lambda seconds: None)
