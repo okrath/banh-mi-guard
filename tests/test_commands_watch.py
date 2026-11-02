@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import guard.cli
@@ -390,14 +391,13 @@ def test_watch_failing_terminal_list_is_a_usage_error(monkeypatch):
     assert "no runtime" in result.output
 
 
-def test_watch_help_shows_the_camponi_options_only():
-    output = CliRunner().invoke(app, ["watch", "--help"]).output
+def test_watch_takes_the_camponi_options_only():
+    # The command's own options, not its rendered help, which rich colours differently on each CI runner.
+    command = typer.main.get_command(app).commands["watch"]
+    options = {opt for param in command.params for opt in param.opts}
 
-    for option in ("--agent", "--worktree", "--camponi", "--camponi-dir", "--test-agents"):
-        assert option in output
-    assert "orca" not in output.lower()
-    assert "--run" not in output
-    assert "--workers" not in output
+    assert {"--agent", "--worktree", "--camponi", "--camponi-dir", "--test-agents"} <= options
+    assert not options & {"--run", "--workers", "--orca", "--test-workers"}
 
 
 def test_watch_rejects_a_broken_ownership_file(tmp_path):

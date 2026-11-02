@@ -298,7 +298,8 @@ def _terminal_rows(stdout: str) -> list[Any]:
 def _parse_terminal(row: dict[str, Any]) -> CamponiTerminal:
     cwd = _text(row.get("cwd"))
     worktree = _text(row.get("worktree")) or cwd
-    args = row.get("args") if isinstance(row.get("args"), list) else []
+    raw_args = row.get("args")
+    args = raw_args if isinstance(raw_args, list) else []
     return CamponiTerminal(
         id=str(row["id"]),
         kind=str(row.get("kind") or ""),
