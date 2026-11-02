@@ -31,7 +31,6 @@ EXPECTED_REGISTERED_COMMANDS = [
     "update",
     "doctor",
     "laya",
-    "watch",
     "worker-verify",
     "deps-check",
 ]
@@ -58,7 +57,6 @@ EXPECTED_HELP_COMMAND_ORDER = [
     "review",
     "update",
     "doctor",
-    "watch",
     "worker-verify",
     "deps-check",
     "invariants",
