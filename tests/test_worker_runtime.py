@@ -1,4 +1,4 @@
-"""Tests for guard.core.worker_runtime: git worktree probes, orca worker-list parsing, nudges."""
+"""Tests for guard.core.worker_runtime: git worktree probes, camponi terminal-list parsing, nudges."""
 
 import json
 import os
@@ -9,26 +9,33 @@ import pytest
 
 from guard.core import worker_runtime as wr
 
-# A real captured `orca orchestration worker-list` row (phase spec fixture).
+# A real captured `camponi --json --no-start terminal ls` row.
 SAMPLE_ROW = {
-    "workerState": "ready",
-    "dispatchStatus": "dispatched",
-    "agentTerminalHandle": "term_63459aa6-d73e-489f-bd1f-230b046e05e6",
-    "terminalState": "active",
-    "resource": {
-        "worktreeId": "da4c74d8-728f-4fb3-b7cf-ddc8ac9efcc2::C:/orca/workspaces/mystery-box/v8w5-reels",
-        "terminalHandle": "term_63459aa6-d73e-489f-bd1f-230b046e05e6",
-    },
-    "projection": {
-        "stage": {"worker": "ready", "dispatch": "dispatched", "detail": "input_accepted", "activity": "working"},
-        "outcome": "in_progress",
-        "liveness": {"verdict": "live", "observedAt": 1792380735663, "source": "agent_status"},
-    },
+    "args": [],
+    "attached": 0,
+    "cols": 143,
+    "cwd": "/mnt/ssd-data/Projects/camponi",
+    "id": "t-0e5d40644195",
+    "kind": "omp",
+    "lastOutputAt": 1793624957511,
+    "pid": 105443,
+    "program": "/home/u/.local/bin/omp",
+    "restored": False,
+    "rows": 18,
+    "runtimeId": "3782c05d015508e7",
+    "screenTitle": "omp > HEROIC: Connect games",
+    "seq": 175210460,
+    "startedAt": 1793597926641,
+    "status": "running",
+    "title": "omp · camponi",
+    "worktree": "/mnt/ssd-data/Projects/camponi",
 }
+RUN_KWARGS = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False,
+              "timeout": 60}
 
 
-def orca_payload(*rows: dict) -> str:
-    return json.dumps({"ok": True, "result": {"workers": list(rows)}})
+def terminals_payload(*rows: dict) -> str:
+    return json.dumps({"terminals": list(rows)})
 
 
 def fake_run(monkeypatch, *, returncode: int = 0, stdout: str = "", stderr: str = "", exc: Exception | None = None):
@@ -57,208 +64,160 @@ def make_repo(path: Path) -> Path:
     return path
 
 
-# --- resolve_orca -------------------------------------------------------------
+# --- resolve_camponi -----------------------------------------------------------
 
 
-def test_resolve_orca_prefers_the_environment(monkeypatch):
-    monkeypatch.setenv("ORCA_CLI_COMMAND", "C:/custom/orca.exe")
-    monkeypatch.setattr(wr.shutil, "which", lambda name: "/from/path/orca")
-    assert wr.resolve_orca() == "C:/custom/orca.exe"
+def test_resolve_camponi_prefers_the_environment(monkeypatch):
+    monkeypatch.setenv("CAMPONI_CLI", "C:/custom/camponi.exe")
+    monkeypatch.setattr(wr.shutil, "which", lambda name: "/from/path/camponi")
+    assert wr.resolve_camponi() == "C:/custom/camponi.exe"
 
 
-def test_resolve_orca_falls_back_to_path(monkeypatch):
-    monkeypatch.delenv("ORCA_CLI_COMMAND", raising=False)
-    monkeypatch.setattr(wr.shutil, "which", lambda name: "/from/path/orca" if name == "orca" else None)
-    assert wr.resolve_orca() == "/from/path/orca"
+def test_resolve_camponi_falls_back_to_path(monkeypatch):
+    monkeypatch.delenv("CAMPONI_CLI", raising=False)
+    monkeypatch.setattr(wr.shutil, "which", lambda name: "/from/path/camponi" if name == "camponi" else None)
+    assert wr.resolve_camponi() == "/from/path/camponi"
 
 
-def test_resolve_orca_returns_none_without_environment_or_path(monkeypatch):
-    monkeypatch.delenv("ORCA_CLI_COMMAND", raising=False)
+def test_resolve_camponi_returns_none_without_environment_or_path(monkeypatch):
+    monkeypatch.delenv("CAMPONI_CLI", raising=False)
     monkeypatch.setattr(wr.shutil, "which", lambda name: None)
-    assert wr.resolve_orca() is None
+    assert wr.resolve_camponi() is None
 
 
-# --- list_workers -------------------------------------------------------------
+# --- list_terminals ------------------------------------------------------------
 
 
-def test_list_workers_parses_a_real_worker_row(monkeypatch):
-    calls = fake_run(monkeypatch, stdout=orca_payload(SAMPLE_ROW))
-    workers = wr.list_workers("orca.exe", "run_1")
+def test_list_terminals_parses_a_real_row(monkeypatch):
+    calls = fake_run(monkeypatch, stdout=terminals_payload(SAMPLE_ROW))
+    terminals = wr.list_terminals("camponi")
 
-    assert calls[0] == (
-        ["orca.exe", "orchestration", "worker-list", "--run", "run_1", "--json"],
-        {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False,
-         "timeout": 60},
-    )
-    assert len(workers) == 1
-    worker = workers[0]
-    assert worker.name == "v8w5-reels"
-    assert worker.worktree == Path("C:/orca/workspaces/mystery-box/v8w5-reels")
-    assert worker.terminal == "term_63459aa6-d73e-489f-bd1f-230b046e05e6"
-    assert worker.worker_state == "ready"
-    assert worker.stage_detail == "input_accepted"
-    assert worker.activity == "working"
-    assert worker.liveness == "live"
-    assert worker.observed_at == 1792380735663 / 1000
-    assert worker.settled is False
+    assert calls[0] == (["camponi", "--no-start", "--json", "terminal", "ls"], RUN_KWARGS)
+    assert terminals == [wr.CamponiTerminal(
+        id="t-0e5d40644195", kind="omp", status="running", cwd="/mnt/ssd-data/Projects/camponi",
+        worktree=Path("/mnt/ssd-data/Projects/camponi"), started_at=1793597926641 / 1000,
+        last_output_at=1793624957511 / 1000, args=(),
+    )]
+    assert terminals[0].running is True
 
 
-@pytest.mark.parametrize("state", ["succeeded", "failed", "cancelled", "abandoned", "stopped"])
-def test_list_workers_marks_settled_states(monkeypatch, state):
-    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, workerState=state)))
-    assert wr.list_workers("orca", "run_1")[0].settled is True
+def test_list_terminals_passes_the_runtime_folder(monkeypatch):
+    calls = fake_run(monkeypatch, stdout=terminals_payload())
+    assert wr.list_terminals("camponi", runtime_dir="/srv/camponi-rt") == []
+    assert calls[0][0] == ["camponi", "--no-start", "--dir", "/srv/camponi-rt", "--json", "terminal", "ls"]
 
 
-@pytest.mark.parametrize("state", ["ready", "starting", "released", "unknown"])
-def test_list_workers_leaves_other_states_unsettled(monkeypatch, state):
-    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, workerState=state)))
-    assert wr.list_workers("orca", "run_1")[0].settled is False
+def test_list_terminals_reads_a_bare_array_too(monkeypatch):
+    fake_run(monkeypatch, stdout=json.dumps([dict(SAMPLE_ROW, status="ended")]))
+    terminal = wr.list_terminals("camponi")[0]
+    assert terminal.status == "ended"
+    assert terminal.running is False
 
 
-def test_list_workers_filters_by_name(monkeypatch):
-    other = dict(SAMPLE_ROW, resource={"worktreeId": "repo::C:/w/other"})
-    fake_run(monkeypatch, stdout=orca_payload(SAMPLE_ROW, other))
-    assert [w.name for w in wr.list_workers("orca", "run_1")] == ["v8w5-reels", "other"]
-    assert [w.name for w in wr.list_workers("orca", "run_1", names=["other"])] == ["other"]
-    assert wr.list_workers("orca", "run_1", names=[]) == []
+def test_list_terminals_falls_back_to_the_cwd_and_tolerates_missing_fields(monkeypatch):
+    row = {"id": "t-1", "cwd": "C:/w/app", "worktree": "", "args": ["--resume=C:/s.jsonl", 7], "startedAt": "soon",
+           "future": {"a": 1}}
+    fake_run(monkeypatch, stdout=terminals_payload(row, {"kind": "omp"}, "junk"))
+    terminals = wr.list_terminals("camponi")
+    assert len(terminals) == 1  # rows without an id are no terminals
+    assert terminals[0].worktree == Path("C:/w/app")
+    assert terminals[0].args == ("--resume=C:/s.jsonl", "7")
+    assert terminals[0].kind == ""
+    assert terminals[0].started_at is None
+    assert terminals[0].last_output_at is None
 
 
-def test_list_workers_keeps_a_row_without_a_worktree_only_when_named(monkeypatch):
-    fake_run(monkeypatch, stdout=orca_payload({"taskId": "task_abc", "workerState": "ready"}))
-    assert wr.list_workers("orca", "run_1") == []
-    kept = wr.list_workers("orca", "run_1", names=["task_abc"])
-    assert [w.name for w in kept] == ["task_abc"]
-    assert kept[0].worktree is None
-    assert wr.list_workers("orca", "run_1", names=["task_other"]) == []
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 10 ** 400, True])
+def test_list_terminals_ignores_an_unusable_stamp(monkeypatch, value):
+    fake_run(monkeypatch, stdout=terminals_payload(dict(SAMPLE_ROW, lastOutputAt=value)))
+    assert wr.list_terminals("camponi")[0].last_output_at is None
 
 
-@pytest.mark.parametrize("worktree_id", ["just-a-repo-id", "repo::"])
-def test_list_workers_drops_a_malformed_worktree_id(monkeypatch, worktree_id):
-    row = {"taskId": "task_named", "workerState": "ready", "resource": {"worktreeId": worktree_id}}
-    fake_run(monkeypatch, stdout=orca_payload(row))
-    assert wr.list_workers("orca", "run_1") == []
-    kept = wr.list_workers("orca", "run_1", names=["task_named"])
-    assert [w.name for w in kept] == ["task_named"]
-    assert kept[0].worktree is None
+def test_list_terminals_raises_with_the_stderr_tail(monkeypatch):
+    fake_run(monkeypatch, returncode=1, stderr="noise\nno Camponi runtime is running\n")
+    with pytest.raises(wr.WorkerRuntimeError, match="no Camponi runtime"):
+        wr.list_terminals("camponi")
 
 
-def test_list_workers_tolerates_missing_optionals_and_unknown_fields(monkeypatch):
-    row = {"workerState": "ready", "taskId": "task_x", "resource": {"worktreeId": "repo::C:/w/x"}, "future": {"a": 1}}
-    fake_run(monkeypatch, stdout=orca_payload(row))
-    worker = wr.list_workers("orca", "run_1")[0]
-    assert worker.name == "x"
-    assert worker.worktree == Path("C:/w/x")
-    assert worker.terminal is None
-    assert worker.stage_detail == ""
-    assert worker.activity == ""
-    assert worker.liveness == ""
-    assert worker.observed_at is None
-    assert worker.settled is False
-
-
-def test_list_workers_coerces_a_present_terminal_to_text(monkeypatch):
-    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, agentTerminalHandle=12345)))
-    assert wr.list_workers("orca", "run_1")[0].terminal == "12345"
-
-
-def test_list_workers_reads_a_null_terminal_as_missing(monkeypatch):
-    fake_run(monkeypatch, stdout=orca_payload(dict(SAMPLE_ROW, agentTerminalHandle=None)))
-    assert wr.list_workers("orca", "run_1")[0].terminal is None
-
-
-def test_list_workers_ignores_a_non_numeric_liveness_stamp(monkeypatch):
-    row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": "yesterday"}})
-    fake_run(monkeypatch, stdout=orca_payload(row))
-    assert wr.list_workers("orca", "run_1")[0].observed_at is None
-
-
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_list_workers_ignores_a_non_finite_liveness_stamp(monkeypatch, value):
-    row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": value}})
-    fake_run(monkeypatch, stdout=orca_payload(row))
-    assert wr.list_workers("orca", "run_1")[0].observed_at is None
-
-
-def test_list_workers_ignores_an_unrepresentable_liveness_stamp(monkeypatch):
-    row = dict(SAMPLE_ROW, projection={"stage": {}, "liveness": {"verdict": "live", "observedAt": 10 ** 400}})
-    fake_run(monkeypatch, stdout=orca_payload(row))
-    assert wr.list_workers("orca", "run_1")[0].observed_at is None
-
-
-def test_list_workers_raises_with_the_stderr_tail(monkeypatch):
-    fake_run(monkeypatch, returncode=1, stderr="noise\nfatal: run not found\n")
-    with pytest.raises(wr.WorkerRuntimeError, match="run not found"):
-        wr.list_workers("orca", "run_missing")
-
-
-def test_list_workers_trims_the_stderr_tail(monkeypatch):
+def test_list_terminals_trims_the_stderr_tail(monkeypatch):
     fake_run(monkeypatch, returncode=1, stderr="x" * 600 + "tail-marker")
     with pytest.raises(wr.WorkerRuntimeError) as error:
-        wr.list_workers("orca", "run_missing")
+        wr.list_terminals("camponi")
     message = str(error.value)
     assert "tail-marker" in message
     assert "x" * 390 not in message  # only the last 400 characters of stderr are kept
 
 
-def test_list_workers_raises_on_unparseable_json(monkeypatch):
+def test_list_terminals_raises_on_unparseable_json(monkeypatch):
     fake_run(monkeypatch, stdout="<html>not json</html>")
     with pytest.raises(wr.WorkerRuntimeError, match="unparseable JSON"):
-        wr.list_workers("orca", "run_1")
+        wr.list_terminals("camponi")
 
 
-def test_list_workers_raises_without_a_workers_list(monkeypatch):
-    fake_run(monkeypatch, stdout=json.dumps({"ok": True, "result": {}}))
-    with pytest.raises(wr.WorkerRuntimeError, match="result.workers"):
-        wr.list_workers("orca", "run_1")
+def test_list_terminals_raises_without_a_terminals_list(monkeypatch):
+    fake_run(monkeypatch, stdout=json.dumps({"ok": True}))
+    with pytest.raises(wr.WorkerRuntimeError, match="no terminals list"):
+        wr.list_terminals("camponi")
 
 
-def test_list_workers_raises_when_orca_cannot_be_started(monkeypatch):
-    fake_run(monkeypatch, exc=FileNotFoundError("no orca here"))
+def test_list_terminals_raises_when_camponi_cannot_be_started(monkeypatch):
+    fake_run(monkeypatch, exc=FileNotFoundError("no camponi here"))
     with pytest.raises(wr.WorkerRuntimeError, match="could not start"):
-        wr.list_workers("orca", "run_1")
+        wr.list_terminals("camponi")
 
 
-def test_list_workers_raises_when_orca_times_out(monkeypatch):
-    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["orca"], 60))
+def test_list_terminals_raises_when_camponi_times_out(monkeypatch):
+    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["camponi"], 60))
     with pytest.raises(wr.WorkerRuntimeError, match="timed out after 60s"):
-        wr.list_workers("orca", "run_1")
+        wr.list_terminals("camponi")
 
 
-def test_list_workers_raises_on_an_unusable_argument_list(monkeypatch):
+def test_list_terminals_raises_on_an_unusable_argument_list(monkeypatch):
     fake_run(monkeypatch, exc=ValueError("embedded null byte"))
     with pytest.raises(wr.WorkerRuntimeError, match="could not start"):
-        wr.list_workers("orca", "run_1")
+        wr.list_terminals("camponi")
 
 
 # --- send_nudge ---------------------------------------------------------------
 
 
-def test_send_nudge_builds_the_exact_command(monkeypatch):
-    calls = fake_run(monkeypatch, stdout='{"ok": true}')
-    assert wr.send_nudge("orca.exe", "term_1", "keep going") is None
-    argv, kwargs = calls[0]
-    assert argv == ["orca.exe", "terminal", "send", "--terminal", "term_1", "--text", "keep going",
-                    "--enter", "--json"]
-    assert kwargs == {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace", "check": False,
-                      "timeout": 60}
+def test_send_nudge_pastes_the_text_and_presses_enter(monkeypatch):
+    calls = fake_run(monkeypatch)
+    monkeypatch.setattr(wr.time, "sleep", lambda seconds: pytest.fail("a plain nudge never pauses"))
+    assert wr.send_nudge("camponi", "t-1", "keep going") is None
+    assert calls == [(["camponi", "--no-start", "terminal", "send", "--terminal", "t-1", "--text", "keep going",
+                       "--paste", "--enter"], RUN_KWARGS)]
+
+
+def test_send_nudge_interrupt_sends_escape_then_pauses_then_the_text(monkeypatch):
+    events = []
+    calls = fake_run(monkeypatch)
+    monkeypatch.setattr(wr.time, "sleep", lambda seconds: events.append(("sleep", seconds, len(calls))))
+    wr.send_nudge("camponi", "t-1", "stop the loop", interrupt=True, runtime_dir="/rt")
+    assert [argv for argv, _ in calls] == [
+        ["camponi", "--no-start", "--dir", "/rt", "terminal", "send", "--terminal", "t-1", "--text", "\x1b"],
+        ["camponi", "--no-start", "--dir", "/rt", "terminal", "send", "--terminal", "t-1", "--text", "stop the loop",
+         "--paste", "--enter"],
+    ]
+    assert events == [("sleep", wr.INTERRUPT_PAUSE_SECONDS, 1)]  # after the Escape, before the text
 
 
 def test_send_nudge_raises_on_failure(monkeypatch):
-    fake_run(monkeypatch, returncode=1, stderr="terminal term_gone is not connected\n")
-    with pytest.raises(wr.WorkerRuntimeError, match="term_gone"):
-        wr.send_nudge("orca", "term_gone", "hello")
+    fake_run(monkeypatch, returncode=1, stderr="terminal t-gone is not running\n")
+    with pytest.raises(wr.WorkerRuntimeError, match="t-gone"):
+        wr.send_nudge("camponi", "t-gone", "hello")
 
 
-def test_send_nudge_raises_when_orca_cannot_be_started(monkeypatch):
-    fake_run(monkeypatch, exc=FileNotFoundError("no orca here"))
+def test_send_nudge_raises_when_camponi_cannot_be_started(monkeypatch):
+    fake_run(monkeypatch, exc=FileNotFoundError("no camponi here"))
     with pytest.raises(wr.WorkerRuntimeError, match="could not start"):
-        wr.send_nudge("orca", "term_1", "hello")
+        wr.send_nudge("camponi", "t-1", "hello")
 
 
-def test_send_nudge_raises_when_orca_times_out(monkeypatch):
-    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["orca"], 60))
+def test_send_nudge_raises_when_camponi_times_out(monkeypatch):
+    fake_run(monkeypatch, exc=subprocess.TimeoutExpired(["camponi"], 60))
     with pytest.raises(wr.WorkerRuntimeError, match="timed out after 60s"):
-        wr.send_nudge("orca", "term_1", "hello")
+        wr.send_nudge("camponi", "t-1", "hello")
 
 
 # --- probe_worktree -----------------------------------------------------------

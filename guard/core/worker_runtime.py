@@ -1,10 +1,11 @@
 """
-Runtime probes for supervised Orca workers.
+Runtime probes for supervised Camponi agents.
 
-The one guard module that touches the outside world: it runs plain `git` inside worker
-worktrees (read-only, and never by a shell), reads the `orca` worker list and terminal screens,
-delivers nudges through the orca CLI, and stops a worker's own foreground dev server.
-`guard watch` builds its ticks and actions from here.
+With `agent_sessions` (the agents' session logs) the guard code that touches the outside world:
+it runs plain `git` inside agent worktrees (read-only, and never by a shell), reads the Camponi
+terminal list and terminal screens, types nudges into terminals through the `camponi` CLI, and
+stops an agent's own foreground dev server. `guard watch` builds its ticks and actions from here.
+Every `camponi` call passes `--no-start`: watching never starts a Camponi runtime.
 """
 
 from __future__ import annotations
@@ -17,15 +18,16 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-SETTLED_STATES = frozenset({"succeeded", "failed", "cancelled", "abandoned", "stopped"})
-WORKTREE_ID_SEPARATOR = "::"
 OUTPUT_TAIL_CHARS = 400
 CALL_TIMEOUT_SECONDS = 60
 DESCRIPTION_CHARS = 120
+ESCAPE_KEY = "\x1b"
+INTERRUPT_PAUSE_SECONDS = 1.0  # between the Escape that stops a turn and the message after it
 _C_UNESCAPES = {"\\": "\\", '"': '"', "a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
 
 # Screen patterns of the agent CLIs, case-insensitive like the PowerShell watchdog they come from.
@@ -60,7 +62,7 @@ _WINDOWS_NODE_LIST = (
 
 
 class WorkerRuntimeError(RuntimeError):
-    """The orca CLI failed, or answered with something that cannot be parsed."""
+    """The camponi CLI failed, or answered with something that cannot be parsed."""
 
 
 @dataclass(frozen=True)
@@ -71,16 +73,21 @@ class WorktreeProbe:
 
 
 @dataclass(frozen=True)
-class OrcaWorker:
-    name: str
-    worktree: Path | None
-    terminal: str | None
-    worker_state: str
-    stage_detail: str
-    activity: str
-    liveness: str
-    observed_at: float | None
-    settled: bool
+class CamponiTerminal:
+    """One terminal of `camponi terminal ls`; times are epoch seconds."""
+
+    id: str
+    kind: str  # "omp" | "claude" | "codex" | "opencode" | "shell" | ...
+    status: str  # "running" | "ended" (or "missing" once it left the list)
+    cwd: str | None
+    worktree: Path | None  # the terminal's worktree, else its cwd
+    started_at: float | None
+    last_output_at: float | None
+    args: tuple[str, ...] = ()
+
+    @property
+    def running(self) -> bool:
+        return self.status == "running"
 
 
 @dataclass(frozen=True)
@@ -130,60 +137,46 @@ def probe_worktree(worktree: Path, *, since: float | None = None) -> WorktreePro
     return WorktreeProbe(head=head, dirty=bool(porcelain.strip()), activity_ts=max(stamps) if stamps else None)
 
 
-def resolve_orca() -> str | None:
-    """The orca CLI to run: `$ORCA_CLI_COMMAND` when set, else `orca` on PATH, else None."""
-    return os.environ.get("ORCA_CLI_COMMAND") or shutil.which("orca")
+def resolve_camponi() -> str | None:
+    """The camponi CLI to run: `$CAMPONI_CLI` when set, else `camponi` on PATH, else None."""
+    return os.environ.get("CAMPONI_CLI") or shutil.which("camponi")
 
 
-def list_workers(orca: str, run: str, *, names: Sequence[str] | None = None) -> list[OrcaWorker]:
-    """
-    The workers of one Orca run as `orca orchestration worker-list --run <run> --json` reports
-    them. A row without a worktree has no basename to watch, so it is kept only when `names`
-    asks for its task id explicitly.
-    """
-    res = _run([orca, "orchestration", "worker-list", "--run", run, "--json"])
+def list_terminals(camponi: str, *, runtime_dir: str | None = None) -> list[CamponiTerminal]:
+    """Every terminal the Camponi runtime knows, running and ended, as `camponi --json terminal ls` reports them."""
+    res = _run(_camponi_argv(camponi, runtime_dir, "--json", "terminal", "ls"))
     if res is None or res.returncode != 0:
-        detail = _tail(res.stderr) if res is not None else f"could not start {orca}"
-        raise WorkerRuntimeError(f"orca orchestration worker-list failed: {detail}")
-    rows = _worker_rows(res.stdout or "")
-
-    wanted = set(names) if names is not None else None
-    workers: list[OrcaWorker] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        worker = _parse_worker(row)
-        if wanted is None:
-            if worker.worktree is not None:
-                workers.append(worker)
-        elif worker.name in wanted:
-            workers.append(worker)
-    return workers
+        detail = _tail(res.stderr or res.stdout) if res is not None else f"could not start {camponi}"
+        raise WorkerRuntimeError(f"camponi terminal ls failed: {detail}")
+    return [_parse_terminal(row) for row in _terminal_rows(res.stdout or "") if isinstance(row, dict) and row.get("id")]
 
 
-def send_nudge(orca: str, terminal: str, text: str, *, interrupt: bool = False) -> None:
+def send_nudge(camponi: str, terminal: str, text: str, *, interrupt: bool = False, runtime_dir: str | None = None) -> None:
     """
-    Type `text` into a worker terminal and press Enter; any failure raises. `interrupt` sends it
-    as an interrupt, since a plain message queues behind the command a busy agent is running.
+    Paste `text` into an agent terminal and press Enter; any failure raises. `interrupt` first
+    sends Escape, which stops the agent's running turn, and pauses a moment: a plain message only
+    queues behind the command a busy agent is running.
     """
-    argv = [orca, "terminal", "send", "--terminal", terminal, "--text", text, "--enter"]
     if interrupt:
-        argv.append("--interrupt")
-    res = _run([*argv, "--json"])
-    if res is None or res.returncode != 0:
-        detail = _tail(res.stderr) if res is not None else f"could not start {orca}"
-        raise WorkerRuntimeError(f"orca terminal send to {terminal} failed: {detail}")
+        _send(camponi, runtime_dir, terminal, "--text", ESCAPE_KEY)
+        time.sleep(INTERRUPT_PAUSE_SECONDS)
+    _send(camponi, runtime_dir, terminal, "--text", text, "--paste", "--enter")
 
 
-def read_screen(orca: str, terminal: str, *, limit: int = 25) -> str | None:
-    """The rendered screen of a worker terminal (its last `limit` rows); None when it cannot be read."""
+def read_screen(camponi: str, terminal: str, *, runtime_dir: str | None = None, limit: int = 25) -> str | None:
+    """The rendered screen of an agent terminal (its last `limit` rows); None when it cannot be read."""
     try:
-        res = _run([orca, "terminal", "read", "--terminal", terminal, "--screen", "--limit", str(limit)])
+        res = _run(_camponi_argv(camponi, runtime_dir, "--json", "terminal", "read", "--terminal", terminal))
     except WorkerRuntimeError:  # a timed-out read is no screen, not a reason to stop watching
         return None
     if res is None or res.returncode != 0:
         return None
-    return res.stdout or ""
+    try:
+        payload = json.loads(res.stdout or "")
+    except ValueError:
+        return None
+    rows = _screen_rows(_mapping(payload))
+    return "\n".join(rows[-limit:]) + "\n" if rows else ""
 
 
 def parse_screen(screen: str) -> ScreenState:
@@ -278,43 +271,65 @@ def _windows_processes(stdout: str) -> list[tuple[int, str]]:
     return processes
 
 
-def _worker_rows(stdout: str) -> list[Any]:
+def _camponi_argv(camponi: str, runtime_dir: str | None, *args: str) -> list[str]:
+    """`camponi --no-start [--dir <runtime folder>] <args>`."""
+    return [camponi, "--no-start", *(["--dir", runtime_dir] if runtime_dir else []), *args]
+
+
+def _send(camponi: str, runtime_dir: str | None, terminal: str, *args: str) -> None:
+    res = _run(_camponi_argv(camponi, runtime_dir, "terminal", "send", "--terminal", terminal, *args))
+    if res is None or res.returncode != 0:
+        detail = _tail(res.stderr or res.stdout) if res is not None else f"could not start {camponi}"
+        raise WorkerRuntimeError(f"camponi terminal send to {terminal} failed: {detail}")
+
+
+def _terminal_rows(stdout: str) -> list[Any]:
+    """`{"terminals": [...]}` (what the CLI prints) or a bare array."""
     try:
         payload = json.loads(stdout)
     except ValueError as e:
-        raise WorkerRuntimeError(f"orca orchestration worker-list returned unparseable JSON: {_tail(stdout)}") from e
-    result = _mapping(payload.get("result") if isinstance(payload, dict) else None)
-    rows = result.get("workers")
+        raise WorkerRuntimeError(f"camponi terminal ls returned unparseable JSON: {_tail(stdout)}") from e
+    rows = payload.get("terminals") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
-        raise WorkerRuntimeError(f"orca orchestration worker-list JSON has no result.workers list: {_tail(stdout)}")
+        raise WorkerRuntimeError(f"camponi terminal ls JSON has no terminals list: {_tail(stdout)}")
     return rows
 
 
-def _parse_worker(row: dict[str, Any]) -> OrcaWorker:
-    resource = _mapping(row.get("resource"))
-    projection = _mapping(row.get("projection"))
-    stage = _mapping(projection.get("stage"))
-    liveness = _mapping(projection.get("liveness"))
-    worker_state = str(row.get("workerState") or "")
-    worktree_id = str(resource.get("worktreeId") or "")
-    _repo_id, separator, raw_path = worktree_id.partition(WORKTREE_ID_SEPARATOR)
-    worktree = Path(raw_path) if separator and raw_path else None
-    terminal = row.get("agentTerminalHandle")
-    return OrcaWorker(
-        name=worktree.name if worktree is not None else str(row.get("taskId") or ""),
-        worktree=worktree,
-        terminal=str(terminal) if terminal is not None else None,
-        worker_state=worker_state,
-        stage_detail=str(stage.get("detail") or ""),
-        activity=str(stage.get("activity") or ""),
-        liveness=str(liveness.get("verdict") or ""),
-        observed_at=_observed_at(liveness.get("observedAt")),
-        settled=worker_state in SETTLED_STATES,
+def _parse_terminal(row: dict[str, Any]) -> CamponiTerminal:
+    cwd = _text(row.get("cwd"))
+    worktree = _text(row.get("worktree")) or cwd
+    raw_args = row.get("args")
+    args = raw_args if isinstance(raw_args, list) else []
+    return CamponiTerminal(
+        id=str(row["id"]),
+        kind=str(row.get("kind") or ""),
+        status=str(row.get("status") or ""),
+        cwd=cwd,
+        worktree=Path(worktree) if worktree else None,
+        started_at=_epoch_ms(row.get("startedAt")),
+        last_output_at=_epoch_ms(row.get("lastOutputAt")),
+        args=tuple(str(arg) for arg in args),
     )
 
 
-def _observed_at(value: Any) -> float | None:
-    """`projection.liveness.observedAt` is epoch milliseconds; callers work in epoch seconds."""
+def _text(value: Any) -> str | None:
+    """A non-empty string field, else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _screen_rows(payload: dict[str, Any]) -> list[str]:
+    """The screen rows of `terminal read`: `screen`, else `lines`, as strings or `{text}` rows."""
+    rows = []
+    raw = payload.get("screen") if isinstance(payload.get("screen"), list) else payload.get("lines")
+    for line in raw if isinstance(raw, list) else []:
+        text = line if isinstance(line, str) else _mapping(line).get("text")
+        if isinstance(text, str):
+            rows.append(text.rstrip())
+    return rows
+
+
+def _epoch_ms(value: Any) -> float | None:
+    """Camponi stamps are epoch milliseconds; callers work in epoch seconds."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:

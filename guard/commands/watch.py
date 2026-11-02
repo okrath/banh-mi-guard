@@ -1,7 +1,8 @@
-"""`guard watch`: supervise the workers of one Orca run, or explicit worktrees, until each settles."""
+"""`guard watch`: supervise named Camponi agents and their subagents, or explicit worktrees, until each settles."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -15,48 +16,41 @@ from rich.console import Console
 from rich.table import Table
 
 from guard.cli import app, console
+from guard.core.agent_sessions import SESSION_SLACK_SECONDS, session_log, subagent_logs
 from guard.core.deps_check import check_main_checkout, main_checkout_of
-from guard.core.watchdog import Action, WatchConfig, WorkerMonitor, WorkerTick
+from guard.core.watchdog import Action, SubagentMonitor, WatchConfig, WorkerMonitor, WorkerTick
 from guard.core.worker_runtime import (
-    OrcaWorker,
+    CamponiTerminal,
     WorkerRuntimeError,
-    list_workers,
+    list_terminals,
     mentions_path,
     parse_screen,
     probe_worktree,
     read_screen,
-    resolve_orca,
+    resolve_camponi,
     send_nudge,
     stop_dev_servers,
 )
 from guard.core.worker_verify import verify_worker
 
 PROBE_FAILED = "probe-failed"
-# Rows with no agent to supervise: a stopped, abandoned or released attempt, or a start that has
-# not produced a terminal. `starting` ones keep the run waiting; they may still come up.
-SKIPPED_STATES = frozenset({"stopped", "abandoned", "released", "start_unknown", "starting"})
-WAITING_STATES = frozenset({"starting"})
 stderr_console = Console(stderr=True)  # warnings only: stdout stays the table or the JSON array
 
 
 @dataclass
 class _Target:
-    """One watched worker: its worktree, its role and (Orca mode) its live worker-list row."""
+    """One watched agent (its Camponi terminal) or plain worktree, with its role and ownership."""
 
     name: str
     worktree: Path
     role: str
     own: List[str]
-    row: Optional[OrcaWorker] = None
-
-    @property
-    def terminal(self) -> Optional[str]:
-        return self.row.terminal if self.row is not None else None
+    terminal: Optional[CamponiTerminal] = None  # None: a plain worktree
 
 
 @dataclass
 class _ScreenTrack:
-    """What the previous passes saw on one worker's screen."""
+    """What the previous passes saw on one agent's screen."""
 
     stable: Optional[str] = None
     changed_ts: Optional[float] = None
@@ -88,7 +82,7 @@ def _names(raw: Optional[str]) -> Set[str]:
 
 
 def _role(name: str, test_names: Set[str], ownership: Dict[str, Dict[str, Any]]) -> str:
-    """`--test-workers` is explicit, the ownership file is the default per worker."""
+    """`--test-agents` is explicit, the ownership file is the default per agent."""
     if name in test_names:
         return "test"
     entry = ownership.get(name) or {}
@@ -101,7 +95,7 @@ def _own(name: str, ownership: Dict[str, Dict[str, Any]]) -> List[str]:
 
 
 def _state(monitor: WorkerMonitor, tick: WorkerTick, actions: Sequence[Action]) -> str:
-    """The state this pass shows for the worker: terminal, else this pass's nudge reason."""
+    """The state this pass shows for the agent: terminal, else this pass's nudge reason."""
     if monitor.done:
         return "done"
     if monitor.needs_human:
@@ -110,17 +104,32 @@ def _state(monitor: WorkerMonitor, tick: WorkerTick, actions: Sequence[Action]) 
         if action.kind == "nudge":
             return action.reason
     if tick.quick_fails:
-        return "suspect"  # already nudged for this finding set, still a suspect worker
+        return "suspect"  # already nudged for this finding set, still a suspect agent
     return "working"
+
+
+def _subagent_state(monitor: SubagentMonitor, actions: Sequence[Action]) -> str:
+    if monitor.done:
+        return "done"
+    if monitor.needs_human:
+        return "needs-human"
+    return "stalled" if actions else "working"
 
 
 def _short(head: Optional[str]) -> str:
     return head[:7] if head else "-"
 
 
+def _actions(actions: Sequence[Action]) -> List[Dict[str, Any]]:
+    return [{"kind": action.kind, "reason": action.reason, "text": action.text, "interrupt": action.interrupt}
+            for action in actions]
+
+
 def _record(tick: WorkerTick, state: str, actions: Sequence[Action]) -> Dict[str, Any]:
     return {
         "name": tick.name,
+        "kind": "agent",
+        "parent": None,
         "head": tick.head,
         "head_moved": tick.head_moved,
         "dirty": tick.dirty,
@@ -132,10 +141,7 @@ def _record(tick: WorkerTick, state: str, actions: Sequence[Action]) -> Dict[str
         "command": tick.command,
         "deps_fails": list(tick.deps_fails),
         "state": state,
-        "actions": [
-            {"kind": action.kind, "reason": action.reason, "text": action.text, "interrupt": action.interrupt}
-            for action in actions
-        ],
+        "actions": _actions(actions),
     }
 
 
@@ -146,7 +152,7 @@ def _parse_ownership(path: Path) -> Dict[str, Dict[str, Any]]:
     except (OSError, ValueError) as e:
         raise ValueError(f"cannot read --ownership {path}: {e}") from e
     if not isinstance(data, dict):
-        raise ValueError(f"--ownership {path} must map worker names to {{role, own}}")
+        raise ValueError(f"--ownership {path} must map agent names to {{role, own}}")
     for name, entry in data.items():
         if not isinstance(entry, dict):
             raise ValueError(f"--ownership {path}: {name}: must be an object with role and own")
@@ -168,18 +174,18 @@ def _load_ownership(path: Path) -> Dict[str, Dict[str, Any]]:
         raise typer.Exit(code=2) from e
 
 
-def _log_path(run: Optional[str], worktrees: Sequence[Path], raw: Optional[str]) -> Path:
+def _log_path(agents: Sequence[str], worktrees: Sequence[Path], raw: Optional[str]) -> Path:
     if raw:
         return Path(raw)
-    if run:
-        return Path.cwd() / f"guard-watch-{run}.log"
+    if agents:
+        return Path.cwd() / f"guard-watch-{agents[0]}.log"
     return Path.cwd() / f"guard-watch-{worktrees[0].name or 'watch'}.log"
 
 
-def _resolve_orca(explicit: Optional[str]) -> str:
-    resolved = explicit or resolve_orca()
+def _resolve_camponi(explicit: Optional[str]) -> str:
+    resolved = explicit or resolve_camponi()
     if not resolved:
-        console.print("[bold red]❌ orca CLI not found: pass --orca <path> or set ORCA_CLI_COMMAND[/bold red]")
+        console.print("[bold red]❌ camponi CLI not found: pass --camponi <path> or set CAMPONI_CLI[/bold red]")
         raise typer.Exit(code=2)
     return resolved
 
@@ -200,43 +206,42 @@ def _resolve_base(worktree: Path, base: str) -> Optional[str]:
     return (proc.stdout.strip() or None) if proc.returncode == 0 else None
 
 
-def _orca_targets(
-    rows: Sequence[OrcaWorker],
-    wanted: Optional[Set[str]],
+def _agent_targets(
+    agents: Sequence[str],
+    terminals: Sequence[CamponiTerminal],
     test_names: Set[str],
     ownership: Dict[str, Dict[str, Any]],
     log_path: Path,
 ) -> Dict[str, _Target]:
-    """The rows to watch: with a worktree, and named or (no --workers) not settled yet."""
+    """The named agents to watch: running terminals with a worktree; the others are logged as skipped."""
+    known = {terminal.id: terminal for terminal in terminals}
     targets: Dict[str, _Target] = {}
-    for row in rows:
-        if row.worktree is None:
-            _log_line(log_path, row.name, "skipped", "no worktree")
-            continue
-        named = row.name in test_names or (wanted is not None and row.name in wanted)
-        if not named and (wanted is not None or row.settled):
-            continue
-        targets[row.name] = _Target(
-            name=row.name,
-            worktree=row.worktree,
-            role=_role(row.name, test_names, ownership),
-            own=_own(row.name, ownership),
-            row=row,
-        )
+    for name in agents:
+        terminal = known.get(name)
+        if terminal is None:
+            _log_line(log_path, name, "skipped", "no such Camponi terminal")
+        elif not terminal.running:
+            _log_line(log_path, name, "skipped", f"terminal {terminal.status or 'not running'}")
+        elif terminal.worktree is None:
+            _log_line(log_path, name, "skipped", "no worktree")
+        else:
+            targets[name] = _Target(name=name, worktree=terminal.worktree, role=_role(name, test_names, ownership),
+                                    own=_own(name, ownership), terminal=terminal)
     return targets
 
 
 @dataclass
 class _Watcher:
-    """The state of one watch run: targets, monitors, start heads, screens and the log."""
+    """The state of one watch run: targets, monitors, start heads, screens, subagents and the log."""
 
-    run_id: Optional[str]
     base: Optional[str]
     cfg: WatchConfig
     log_path: Path
-    orca: Optional[str]
+    camponi: Optional[str]
     once: bool
     targets: Dict[str, _Target]
+    camponi_dir: Optional[str] = None
+    terminals: List[CamponiTerminal] = field(default_factory=list)  # the latest terminal list, for session matching
     ownership_path: Optional[Path] = None
     ownership: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     test_names: Set[str] = field(default_factory=set)
@@ -244,13 +249,14 @@ class _Watcher:
     start_heads: Dict[str, Optional[str]] = field(default_factory=dict)
     first_seen: Dict[str, float] = field(default_factory=dict)
     screens: Dict[str, _ScreenTrack] = field(default_factory=dict)
-    skipped: Dict[str, str] = field(default_factory=dict)  # name -> worker state or "no terminal", this pass
+    subagents: Dict[str, SubagentMonitor] = field(default_factory=dict)  # "<terminal>/<Name>" -> its monitor
+    no_session: Set[str] = field(default_factory=set)  # agents whose session log was not found (logged once)
     deps_fails: List[str] = field(default_factory=list)
     deps_logged: Set[str] = field(default_factory=set)
     last_notes: Dict[str, str] = field(default_factory=dict)
 
     def tick_pass(self, now: float) -> List[_Row]:
-        """One pass over every target; one summary row per worker that was probed."""
+        """One pass over every target and its live subagents; one summary row each that was probed."""
         self._reload_ownership()
         self._check_deps()
         rows = []
@@ -258,6 +264,7 @@ class _Watcher:
             row = self._tick(target, now)
             if row is not None:
                 rows.append(row)
+            rows.extend(self._tick_subagents(target, now))
         return rows
 
     def run(self) -> List[_Row]:
@@ -267,33 +274,29 @@ class _Watcher:
         while True:
             if not first:
                 time.sleep(self.cfg.interval_sec)
-                self._refresh_rows()
+                self._refresh_terminals()
             first = False
             rows = self.tick_pass(time.time())
             if all(self._finished(name) for name in self.targets):
                 return rows
 
     def _finished(self, name: str) -> bool:
-        """Terminal, or skipped for good: a skipped row that is only starting keeps the run waiting."""
         monitor = self.monitors.get(name)
-        if monitor is not None and (monitor.done or monitor.needs_human):
-            return True
-        return name in self.skipped and self.skipped[name] not in WAITING_STATES
+        return monitor is not None and (monitor.done or monitor.needs_human)
 
-    def _refresh_rows(self) -> None:
-        """Orca mode: refresh heartbeats, settled flags and terminals of the watched workers."""
-        if self.orca is None or self.run_id is None:
+    def _refresh_terminals(self) -> None:
+        """Refresh status, heartbeat and args of the watched agents' terminals; a vanished one counts as ended."""
+        if self.camponi is None or not any(target.terminal for target in self.targets.values()):
             return
         try:
-            rows = list_workers(self.orca, self.run_id)
+            self.terminals = list_terminals(self.camponi, runtime_dir=self.camponi_dir)
         except WorkerRuntimeError as e:
-            _log_line(self.log_path, "orca", "warning", f"worker-list failed: {e}")
+            _log_line(self.log_path, "camponi", "warning", f"terminal ls failed: {e}")
             return
-        known = {row.name: row for row in rows}
-        for name, target in self.targets.items():
-            row = known.get(name)
-            if row is not None:
-                target.row = row
+        known = {terminal.id: terminal for terminal in self.terminals}
+        for target in self.targets.values():
+            if target.terminal is not None:
+                target.terminal = known.get(target.name) or dataclasses.replace(target.terminal, status="missing")
 
     def _reload_ownership(self) -> None:
         """Re-read the ownership file: the coordinator widens ownership mid-run. A bad read keeps the last copy."""
@@ -313,7 +316,7 @@ class _Watcher:
 
     def _check_deps(self) -> None:
         """
-        The main checkout's dependency links, once per pass: a worker that runs an install through
+        The main checkout's dependency links, once per pass: an agent that runs an install through
         its node_modules junction rewrites them into its own worktree. Each new FAIL line is logged once.
         """
         if not self.targets:
@@ -331,27 +334,8 @@ class _Watcher:
                 _log_line(self.log_path, "deps", "deps-broken", line)
         self.deps_fails = list(fails)
 
-    def _skip_reason(self, target: _Target) -> Optional[str]:
-        """Why an Orca row has no agent to supervise this pass; None for a live one or plain-git mode."""
-        row = target.row
-        if row is None:
-            return None
-        if row.worker_state in SKIPPED_STATES:
-            return row.worker_state
-        if not row.terminal:
-            return "no terminal"
-        return None
-
     def _tick(self, target: _Target, now: float) -> Optional[_Row]:
         name = target.name
-        skip = self._skip_reason(target)
-        if skip is not None:
-            if self.skipped.get(name) != skip:  # logged when the reason changes, not every pass
-                _log_line(self.log_path, name, "skipped", skip)
-            self.skipped[name] = skip
-            return None
-        self.skipped.pop(name, None)
-
         first_seen = self.first_seen.setdefault(name, now)
         try:
             probe = probe_worktree(target.worktree, since=first_seen)
@@ -367,7 +351,7 @@ class _Watcher:
             self.start_heads[name] = start
         checks_base = self.base or start
 
-        # The delivery check runs every pass, so no worker is ever done without one.
+        # The delivery check runs every pass, so no agent is ever done without one.
         quick_fails: tuple[str, ...] = ()
         if checks_base is not None:
             try:
@@ -377,10 +361,14 @@ class _Watcher:
                 return None
             quick_fails = tuple(f"{issue.code}: {issue.message}" for issue in quick.fails)
 
+        # A running Camponi terminal never settles; once it ended, its last state is the delivery.
+        terminal = target.terminal
+        settled = terminal is not None and not terminal.running
         monitor = self.monitors.get(name)
         if monitor is None:
-            monitor = WorkerMonitor(name, target.role, start, self.cfg, now=now, settles=target.row is not None)
+            monitor = WorkerMonitor(name, target.role, start, self.cfg, now=now)
             self.monitors[name] = monitor
+        monitor.settles = settled
         screen = self._screen_fields(target, now)
         tick = WorkerTick(
             name=name,
@@ -388,8 +376,8 @@ class _Watcher:
             head_moved=moved,
             dirty=probe.dirty,
             activity_ts=probe.activity_ts,
-            heartbeat_ts=target.row.observed_at if target.row is not None else None,
-            settled=target.row.settled if target.row is not None else False,
+            heartbeat_ts=terminal.last_output_at if terminal is not None else None,
+            settled=settled,
             quick_fails=quick_fails,
             deps_fails=tuple(line for line in self.deps_fails if mentions_path(line, target.worktree)),
             **screen,
@@ -405,14 +393,59 @@ class _Watcher:
         _log_line(self.log_path, name, state, note)
         return _Row(record=_record(tick, state, actions), nudges=monitor.nudges, note=note)
 
+    def _tick_subagents(self, target: _Target, now: float) -> List[_Row]:
+        """
+        The live subagents of one running agent, found again every pass from its session log. A
+        subagent counts once its log was created after the agent's terminal started and while it
+        has not ended; its row shows until the pass that sees it end.
+        """
+        terminal = target.terminal
+        monitor = self.monitors.get(target.name)
+        if terminal is None or not terminal.running or monitor is None or monitor.done or monitor.needs_human:
+            return []
+        session = session_log(terminal, self.terminals)
+        if session is None:
+            if target.name not in self.no_session:
+                self.no_session.add(target.name)
+                _log_line(self.log_path, target.name, "subagents", "no session log found: subagents not watched")
+            return []
+        self.no_session.discard(target.name)
+        since = (terminal.started_at - SESSION_SLACK_SECONDS) if terminal.started_at is not None else self.first_seen[target.name]
+        rows: List[_Row] = []
+        for log in subagent_logs(terminal.kind, session, now=now, quiet_sec=self.cfg.interval_sec):
+            key = f"{target.name}/{log.name}"
+            sub = self.subagents.get(key)
+            if sub is None:
+                if log.ended or log.created is None or log.created < since:
+                    continue
+                sub = self.subagents[key] = SubagentMonitor(log.name, self.cfg)
+            elif sub.done or sub.needs_human:
+                continue
+            actions = sub.observe(log.mtime, log.ended, now)
+            state = _subagent_state(sub, actions)
+            parts = []
+            for action in actions:
+                if action.kind == "nudge":
+                    skip = self._deliver(terminal, action)  # a subagent has no terminal: its parent hears about it
+                    parts.append(f"nudge skipped: {skip}" if skip else action.text)
+                elif action.text:
+                    parts.append(action.text)
+            note = "; ".join(parts)
+            _log_line(self.log_path, key, state, note)
+            record = {"name": key, "kind": "subagent", "parent": target.name, "log": str(log.path),
+                      "log_ts": log.mtime, "ended": log.ended, "state": state, "actions": _actions(actions)}
+            rows.append(_Row(record=record, nudges=sub.nudges, note=note))
+        return rows
+
     def _screen_fields(self, target: _Target, now: float) -> Dict[str, Any]:
         """
-        Orca mode: the `WorkerTick` screen fields of the worker's terminal, remembering since when its
+        The `WorkerTick` screen fields of the agent's running terminal, remembering since when its
         stable text and its running command are unchanged. Empty (busy None) when there is no screen.
         """
-        if self.orca is None or not target.terminal:
+        terminal = target.terminal
+        if self.camponi is None or terminal is None or not terminal.running:
             return {}
-        screen = read_screen(self.orca, target.terminal)
+        screen = read_screen(self.camponi, terminal.id, runtime_dir=self.camponi_dir)
         if screen is None:
             return {}
         state = parse_screen(screen)
@@ -441,7 +474,7 @@ class _Watcher:
         print(f"watch: {name}: probe failed: {error}", file=sys.stderr)  # stdout stays the JSON/table only
 
     def _execute(self, target: _Target, tick: WorkerTick, actions: Sequence[Action]) -> str:
-        """Run this pass's actions; returns the summary note of the worker."""
+        """Run this pass's actions; returns the summary note of the agent."""
         parts: List[str] = []
         for action in actions:
             if action.kind != "nudge":
@@ -449,7 +482,7 @@ class _Watcher:
                 continue
             if action.reason == "stalled" and tick.dev_server_on_screen and not self.once:
                 self._stop_dev_servers(target)  # the blocked foreground call returns once its server is gone
-            skip = self._deliver(target, action)
+            skip = self._deliver(target.terminal, action)
             parts.append(f"nudge skipped: {skip}" if skip else action.text)
         return "; ".join(parts)
 
@@ -462,18 +495,16 @@ class _Watcher:
         for description in stopped:
             _log_line(self.log_path, target.name, "dev-server-stopped", description)
 
-    def _deliver(self, target: _Target, action: Action) -> Optional[str]:
-        """Send one nudge; returns why it was not sent, None when it was (or once mode disabled it)."""
+    def _deliver(self, terminal: Optional[CamponiTerminal], action: Action) -> Optional[str]:
+        """Type one nudge into `terminal`; returns why it was not sent, None when it was."""
         if self.once:
             return "dry run (--once)"
-        orca = self.orca
-        terminal = target.terminal
-        if orca is None or target.row is None:
+        if self.camponi is None or terminal is None:
             return "plain-git mode"
-        if not terminal:
-            return "no terminal"
+        if not terminal.running:
+            return f"terminal {terminal.status}"
         try:
-            send_nudge(orca, terminal, action.text, interrupt=action.interrupt)
+            send_nudge(self.camponi, terminal.id, action.text, interrupt=action.interrupt, runtime_dir=self.camponi_dir)
         except (WorkerRuntimeError, OSError) as e:
             return str(e)
         return None
@@ -481,63 +512,60 @@ class _Watcher:
 
 def _print_table(rows: Sequence[_Row]) -> None:
     table = Table(title="👀 guard watch")
-    table.add_column("Worker", style="bold")
+    table.add_column("Agent", style="bold")
     table.add_column("State")
     table.add_column("Head", style="dim")
     table.add_column("Nudges", justify="right")
     table.add_column("Note")
     for row in rows:
-        table.add_row(row.record["name"], row.record["state"], _short(row.record["head"]), str(row.nudges), row.note)
+        table.add_row(row.record["name"], row.record["state"], _short(row.record.get("head")), str(row.nudges), row.note)
     console.print(table)
 
 
 @app.command("watch")
 def watch_cmd(
-    run: Optional[str] = typer.Option(None, "--run", help="Orca run id whose workers are supervised"),
-    workers: Optional[str] = typer.Option(None, "--workers", help="Comma-separated worker names to watch; default: every unsettled worker"),
-    base: Optional[str] = typer.Option(None, "--base", help="Git base commit for the delivery checks; default: each worker's first-seen HEAD"),
-    ownership: Optional[str] = typer.Option(None, "--ownership", help="JSON file: {worker: {role, own}} (the coordinator's file)"),
-    test_workers: Optional[str] = typer.Option(None, "--test-workers", help="Comma-separated workers treated as test workers"),
-    worktree: Optional[List[str]] = typer.Option(None, "--worktree", help="Worktree to watch without Orca (repeatable)"),
+    agent: Optional[List[str]] = typer.Option(None, "--agent", help="Camponi terminal id of an agent to watch with its subagents (repeatable)"),
+    worktree: Optional[List[str]] = typer.Option(None, "--worktree", help="Worktree to watch without Camponi (repeatable)"),
+    base: Optional[str] = typer.Option(None, "--base", help="Git base commit for the delivery checks; default: each agent's first-seen HEAD"),
+    ownership: Optional[str] = typer.Option(None, "--ownership", help="JSON file: {agent: {role, own}} (the coordinator's file)"),
+    test_agents: Optional[str] = typer.Option(None, "--test-agents", help="Comma-separated agents (terminal ids or worktree names) treated as test agents"),
     interval_sec: float = typer.Option(90.0, "--interval-sec", help="Seconds between passes"),
     stall_min: float = typer.Option(8.0, "--stall-min", help="Minutes without progress before a stall nudge"),
-    budget_min: float = typer.Option(45.0, "--budget-min", help="Minutes a fix worker may work without committing"),
-    max_nudges: int = typer.Option(5, "--max-nudges", help="Nudges per worker before it needs a human"),
-    loop_min: float = typer.Option(10.0, "--loop-min", help="Minutes one shell command may own a worker's screen before it is interrupted"),
-    log: Optional[str] = typer.Option(None, "--log", help="Log file; default guard-watch-<run>.log in the cwd"),
-    orca: Optional[str] = typer.Option(None, "--orca", help="The orca executable; default $ORCA_CLI_COMMAND or orca on PATH"),
+    budget_min: float = typer.Option(45.0, "--budget-min", help="Minutes a fix agent may work without committing"),
+    max_nudges: int = typer.Option(5, "--max-nudges", help="Nudges per agent or subagent before it needs a human"),
+    loop_min: float = typer.Option(10.0, "--loop-min", help="Minutes one shell command may own an agent's screen before it is interrupted"),
+    log: Optional[str] = typer.Option(None, "--log", help="Log file; default guard-watch-<first agent or worktree>.log in the cwd"),
+    camponi: Optional[str] = typer.Option(None, "--camponi", help="The camponi executable; default $CAMPONI_CLI or camponi on PATH"),
+    camponi_dir: Optional[str] = typer.Option(None, "--camponi-dir", help="The Camponi runtime folder (passed to camponi as --dir); default: camponi's own"),
     once: bool = typer.Option(False, "--once", help="One pass only: no nudges, print the summary and exit"),
     json_output: bool = typer.Option(False, "--json", help="Print the summary as JSON instead of the table"),
 ):
     """
-    Supervise the workers of one Orca run, or explicit worktrees, by terminal screen, heartbeat and
-    Git activity: nudge idle, stalled and looping workers, report done and needs-human ones.
-    The ownership file is re-read every pass. Exit code 0, 2 on a usage error.
+    Supervise named Camponi agents and their subagents, or explicit worktrees, by terminal screen,
+    session log and Git activity: nudge idle, stalled and looping agents, nudge an agent about its
+    stalled subagents, report done and needs-human ones. Never touches other agents. The ownership
+    file is re-read every pass. Exit code 0, 2 on a usage error.
     """
+    agent_ids = list(dict.fromkeys(agent or []))
     plain_worktrees = [Path(path) for path in (worktree or [])]
-    if not run and not plain_worktrees:
-        console.print("[bold red]❌ give --run <id> for an Orca run, or --worktree <path> to watch worktrees directly[/bold red]")
+    if not agent_ids and not plain_worktrees:
+        console.print("[bold red]❌ give --agent <terminal id> for a Camponi agent, or --worktree <path> to watch worktrees directly[/bold red]")
         raise typer.Exit(code=2)
 
     ownership_map = _load_ownership(Path(ownership)) if ownership else {}
-    test_names = _names(test_workers)
-    wanted = _names(workers) if workers is not None else None
-    # With --workers the requested names reach the core so a named row without a worktree surfaces
-    # and is skipped with a log line; without it the run watches every unsettled worker, so no name
-    # filter is passed and --test-workers only assigns the test role.
-    names: Optional[List[str]] = sorted(wanted | test_names) if wanted is not None else None
-
-    log_path = _log_path(run, plain_worktrees, log)
+    test_names = _names(test_agents)
+    log_path = _log_path(agent_ids, plain_worktrees, log)
     targets: Dict[str, _Target] = {}
-    orca_cmd: Optional[str] = None
-    if run:
-        orca_cmd = _resolve_orca(orca)
+    camponi_cmd: Optional[str] = None
+    terminals: List[CamponiTerminal] = []
+    if agent_ids:
+        camponi_cmd = _resolve_camponi(camponi)
         try:
-            rows = list_workers(orca_cmd, run, names=names)
+            terminals = list_terminals(camponi_cmd, runtime_dir=camponi_dir)
         except WorkerRuntimeError as e:
             console.print(f"[bold red]❌ {e}[/bold red]")
             raise typer.Exit(code=2) from e
-        targets.update(_orca_targets(rows, wanted, test_names, ownership_map, log_path))
+        targets.update(_agent_targets(agent_ids, terminals, test_names, ownership_map, log_path))
     for path in plain_worktrees:
         name = path.name or str(path)
         if name in targets:
@@ -556,14 +584,15 @@ def watch_cmd(
         base = resolved
 
     watcher = _Watcher(
-        run_id=run,
         base=base,
         cfg=WatchConfig(interval_sec=interval_sec, stall_min=stall_min, budget_min=budget_min, max_nudges=max_nudges,
                         loop_min=loop_min),
         log_path=log_path,
-        orca=orca_cmd,
+        camponi=camponi_cmd,
         once=once,
         targets=targets,
+        camponi_dir=camponi_dir,
+        terminals=terminals,
         ownership_path=Path(ownership) if ownership else None,
         ownership=ownership_map,
         test_names=test_names,

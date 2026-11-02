@@ -1,5 +1,6 @@
-"""Tests for guard.core.worker_runtime: terminal screens, interrupt nudges, dev-server stops, `since`."""
+"""Tests for guard.core.worker_runtime: terminal screens, dev-server stops, `since`."""
 
+import json
 import os
 import subprocess
 import time
@@ -109,63 +110,56 @@ def test_screen_patterns_use_escapes_instead_of_glyphs():
 # --- read_screen --------------------------------------------------------------
 
 
-def test_read_screen_builds_the_exact_command(monkeypatch):
-    calls = fake_run(monkeypatch, stdout=f"{SPINNER} 3s working\n")
-    assert wr.read_screen("orca.exe", "term_1") == f"{SPINNER} 3s working\n"
+def test_read_screen_builds_the_exact_command_and_reads_the_rendered_rows(monkeypatch):
+    # `terminal read` prints the rendered screen as `lines` rows with their spans and text.
+    lines = [{"spans": [], "text": "> fix the bug   "}, {"spans": [], "text": f"{SPINNER} 3s working"}]
+    calls = fake_run(monkeypatch, stdout=json.dumps({"terminal": "t-1", "lines": lines, "rows": 2}))
+    assert wr.read_screen("camponi", "t-1") == f"> fix the bug\n{SPINNER} 3s working\n"
     argv, kwargs = calls[0]
-    assert argv == ["orca.exe", "terminal", "read", "--terminal", "term_1", "--screen", "--limit", "25"]
+    assert argv == ["camponi", "--no-start", "--json", "terminal", "read", "--terminal", "t-1"]
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
     assert kwargs["timeout"] == wr.CALL_TIMEOUT_SECONDS
 
 
-def test_read_screen_passes_the_limit(monkeypatch):
-    calls = fake_run(monkeypatch, stdout="x")
-    wr.read_screen("orca", "term_1", limit=40)
-    assert calls[0][0][-2:] == ["--limit", "40"]
+def test_read_screen_prefers_a_screen_list_and_keeps_the_last_rows(monkeypatch):
+    rows = [f"row {n}" for n in range(40)]
+    calls = fake_run(monkeypatch, stdout=json.dumps({"screen": rows, "lines": ["scrollback"]}))
+    assert wr.read_screen("camponi", "t-1", runtime_dir="/rt", limit=3) == "row 37\nrow 38\nrow 39\n"
+    assert calls[0][0][:4] == ["camponi", "--no-start", "--dir", "/rt"]
+
+
+def test_read_screen_of_an_empty_terminal_is_empty(monkeypatch):
+    fake_run(monkeypatch, stdout=json.dumps({"terminal": "t-1", "lines": []}))
+    assert wr.read_screen("camponi", "t-1") == ""
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"returncode": 1, "stderr": "terminal term_1 is gone"},
-        {"exc": FileNotFoundError("no orca")},
-        {"exc": subprocess.TimeoutExpired(["orca"], 60)},
+        {"returncode": 1, "stderr": "terminal t-1 is gone"},
+        {"stdout": "not json"},
+        {"exc": FileNotFoundError("no camponi")},
+        {"exc": subprocess.TimeoutExpired(["camponi"], 60)},
     ],
 )
 def test_read_screen_returns_none_when_there_is_no_screen(monkeypatch, kwargs):
     fake_run(monkeypatch, **kwargs)
-    assert wr.read_screen("orca", "term_1") is None
-
-
-# --- send_nudge interrupt -----------------------------------------------------
-
-
-def test_send_nudge_interrupt_adds_the_flag(monkeypatch):
-    calls = fake_run(monkeypatch, stdout='{"ok": true}')
-    wr.send_nudge("orca.exe", "term_1", "stop the loop", interrupt=True)
-    assert calls[0][0] == ["orca.exe", "terminal", "send", "--terminal", "term_1", "--text", "stop the loop",
-                           "--enter", "--interrupt", "--json"]
-
-
-def test_send_nudge_without_interrupt_has_no_flag(monkeypatch):
-    calls = fake_run(monkeypatch, stdout='{"ok": true}')
-    wr.send_nudge("orca.exe", "term_1", "keep going")
-    assert "--interrupt" not in calls[0][0]
+    assert wr.read_screen("camponi", "t-1") is None
 
 
 # --- stop_dev_servers ---------------------------------------------------------
 
 
 def test_stop_dev_servers_stops_only_the_worktrees_own_dev_processes(monkeypatch):
-    wt = Path("C:/orca/workspaces/app/fix-a")
+    wt = Path("C:/camponi/worktrees/app/fix-a")
     processes = [
-        (101, r'"C:\Program Files\nodejs\node.exe" C:\orca\workspaces\app\fix-a\node_modules\vite\bin\vite.js'),
-        (102, r"node C:\orca\workspaces\app\fix-a\node_modules\@nestjs\cli\bin\nest.js start --watch"),
-        (103, r"node C:\orca\workspaces\app\fix-a-2\node_modules\vite\bin\vite.js"),  # a sibling worktree
-        (104, r"node C:\orca\workspaces\app\other\node_modules\vite\bin\vite.js"),
-        (105, r"node C:\orca\workspaces\app\fix-a\node_modules\typescript\lib\tsserver.js"),  # not a dev server
-        (106, "node c:/ORCA/workspaces/app/fix-a/node_modules/.bin/ts-node src/main.ts"),
+        (101, r'"C:\Program Files\nodejs\node.exe" C:\camponi\worktrees\app\fix-a\node_modules\vite\bin\vite.js'),
+        (102, r"node C:\camponi\worktrees\app\fix-a\node_modules\@nestjs\cli\bin\nest.js start --watch"),
+        (103, r"node C:\camponi\worktrees\app\fix-a-2\node_modules\vite\bin\vite.js"),  # a sibling worktree
+        (104, r"node C:\camponi\worktrees\app\other\node_modules\vite\bin\vite.js"),
+        (105, r"node C:\camponi\worktrees\app\fix-a\node_modules\typescript\lib\tsserver.js"),  # not a dev server
+        (106, "node c:/CAMPONI/worktrees/app/fix-a/node_modules/.bin/ts-node src/main.ts"),
     ]
     killed = []
     monkeypatch.setattr(wr, "_node_processes", lambda: processes)
@@ -176,7 +170,7 @@ def test_stop_dev_servers_stops_only_the_worktrees_own_dev_processes(monkeypatch
     assert [pid for pid, _sig in killed] == [101, 106]
     assert all(sig == wr.signal.SIGTERM for _pid, sig in killed)
     assert stopped[0] == "101: " + processes[0][1][:120]
-    assert stopped[1].startswith("106: node c:/ORCA/workspaces/app/fix-a/")
+    assert stopped[1].startswith("106: node c:/CAMPONI/worktrees/app/fix-a/")
 
 
 def test_stop_dev_servers_matches_nest_start(monkeypatch):
@@ -243,12 +237,12 @@ def test_node_processes_raises_when_the_listing_fails(monkeypatch, platform):
 
 
 def test_mentions_path_matches_the_path_and_its_children_only():
-    wt = Path("C:/orca/workspaces/app/fix-a")
-    assert wr.mentions_path(r"FAIL node_modules -> C:\orca\workspaces\app\fix-a\node_modules", wt)
-    assert wr.mentions_path("points at c:/orca/workspaces/app/fix-a", wt)
-    assert wr.mentions_path('"C:/orca/workspaces/app/fix-a" broke it', wt)
-    assert not wr.mentions_path(r"C:\orca\workspaces\app\fix-a-2\node_modules", wt)
-    assert not wr.mentions_path(r"C:\orca\workspaces\app\fix-ab", wt)
+    wt = Path("C:/camponi/worktrees/app/fix-a")
+    assert wr.mentions_path(r"FAIL node_modules -> C:\camponi\worktrees\app\fix-a\node_modules", wt)
+    assert wr.mentions_path("points at c:/camponi/worktrees/app/fix-a", wt)
+    assert wr.mentions_path('"C:/camponi/worktrees/app/fix-a" broke it', wt)
+    assert not wr.mentions_path(r"C:\camponi\worktrees\app\fix-a-2\node_modules", wt)
+    assert not wr.mentions_path(r"C:\camponi\worktrees\app\fix-ab", wt)
     assert not wr.mentions_path("FAIL something else", wt)
 
 
