@@ -13,7 +13,7 @@ reads every package link instead:
   asked for must load from it with Node.
 
 Read-only: links are listed and read, never followed to change or delete anything. Stdlib only
-and no guard imports, so the watchdog can run it on every tick.
+and no guard imports, so it stays cheap to run on its own (`guard deps-check`).
 """
 
 from __future__ import annotations

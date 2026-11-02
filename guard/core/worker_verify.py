@@ -4,7 +4,7 @@ Auditing one worker's delivery before the coordinator accepts it.
 A worker's own report is a claim; this module looks for the ways a claim can be false:
 edits outside the declared ownership, weakened or deleted tests, CI workflow edits, a
 stale report, reused evidence, and acceptance commands that no longer pass. Stdlib only
-and no guard imports, so the watchdog can run it cheaply on every tick.
+and no guard imports, so it stays cheap to run on its own (`guard worker-verify`).
 """
 
 from __future__ import annotations
