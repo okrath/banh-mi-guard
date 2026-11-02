@@ -10,8 +10,10 @@ from guard.core.watchdog import (
     OVERDUE_TEXT,
     REJECT_TEXT,
     STALLED_TEXT,
+    SUBAGENT_STALLED_TEXT,
     SUSPECT_TEXT,
     Action,
+    SubagentMonitor,
     WatchConfig,
     WorkerMonitor,
     WorkerTick,
@@ -62,14 +64,14 @@ def test_worktree_fix_that_keeps_working_after_a_commit_is_not_done() -> None:
     assert mon.observe(make_tick(head="d" * 40, head_moved=True, dirty=False), START + 50) == [Action("done", "done", "")]
 
 
-def test_orca_fix_first_commit_while_the_dispatch_is_active_is_not_done() -> None:
+def test_settling_fix_first_commit_while_the_agent_still_runs_is_not_done() -> None:
     mon = WorkerMonitor("w1", "fix", "a" * 40, WatchConfig(), now=START, settles=True)
     for offset in (10, 20, 30):
         assert mon.observe(make_tick(head_moved=True, dirty=False), START + offset) == []
     assert mon.done is False
 
 
-def test_orca_fix_is_done_when_its_dispatch_settles_on_a_clean_commit() -> None:
+def test_settling_fix_is_done_when_its_agent_ends_on_a_clean_commit() -> None:
     mon = WorkerMonitor("w1", "fix", "a" * 40, WatchConfig(), now=START, settles=True)
     assert mon.observe(make_tick(head_moved=True, dirty=False), START + 10) == []
     assert mon.observe(make_tick(head_moved=True, dirty=False, settled=True), START + 20) == [Action("done", "done", "")]
@@ -568,3 +570,41 @@ def test_new_texts_are_exact() -> None:
     assert DEPS_TEXT.format(line="FAIL x") == "Dependency check: FAIL x. You ran an install through your node_modules junction and the main checkout now loads packages from your worktree. Never install, clean or prune dependencies. Stop, run no other install, and say in your report which command did it."
     assert REJECT_TEXT.format(findings="a; b") == "Reject candidate: the delivery check failed on the finished work: a; b. Do not accept it without a human review."
     assert WatchConfig().loop_min == 10.0
+
+
+# 12. Subagents: their session log alone decides.
+
+
+def test_subagent_is_done_once_its_log_ended() -> None:
+    mon = SubagentMonitor("Fixer", WatchConfig())
+    assert mon.observe(START, False, START + 60) == []
+    assert mon.observe(START, True, START + 900) == [Action("done", "done", "")]
+    assert mon.done is True
+    assert mon.observe(START, True, START + 990) == []
+
+
+def test_subagent_stall_nudges_once_per_quiet_window_and_re_arms_on_a_write() -> None:
+    mon = SubagentMonitor("Fixer", WatchConfig(stall_min=8.0))
+    assert mon.observe(START, False, START + 479) == []
+    first = mon.observe(START, False, START + 480)
+    assert first == [Action("nudge", "stalled", SUBAGENT_STALLED_TEXT.format(name="Fixer", minutes=8))]
+    assert first[0].interrupt is False  # the parent reads it at its next step
+    assert mon.observe(START, False, START + 1200) == []  # same quiet window: no second nudge
+    assert mon.observe(START + 1300, False, START + 1500) == []  # it wrote again: re-armed, not stale yet
+    again = mon.observe(START + 1300, False, START + 1300 + 600)
+    assert [a.text for a in again] == [SUBAGENT_STALLED_TEXT.format(name="Fixer", minutes=10)]
+    assert mon.nudges == 2
+
+
+def test_subagent_stall_past_the_nudge_limit_needs_a_human() -> None:
+    mon = SubagentMonitor("Review/Backend", WatchConfig(stall_min=1.0, max_nudges=1))
+    assert [a.reason for a in mon.observe(START, False, START + 60)] == ["stalled"]
+    actions = mon.observe(START + 100, False, START + 200)
+    assert actions == [Action("needs-human", "nudge-limit", NUDGE_LIMIT_TEXT.format(max_nudges=1))]
+    assert mon.needs_human is True
+    assert mon.nudges == 1
+    assert mon.observe(START + 300, True, START + 400) == []
+
+
+def test_subagent_stalled_text_is_exact() -> None:
+    assert SUBAGENT_STALLED_TEXT.format(name="Fixer", minutes=9) == "Your subagent Fixer has written nothing for 9 minutes. Check on it: wait for it, or cancel it and do that step yourself."

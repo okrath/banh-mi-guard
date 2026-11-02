@@ -1,10 +1,11 @@
 """
-Deterministic supervision state machine for one watched worker.
+Deterministic supervision state machines for one watched agent and one of its subagents.
 
 Pure decision logic ported from the parallel-tasks watchdog: `WorkerTick` observations become
-done / nudge / needs-human `Action`s that the caller executes. No I/O, no git, no Orca here -
-a leaf module other tasks can depend on. Decisions are deterministic for a given sequence of
-(tick, now) and mutate only this monitor's state.
+done / nudge / needs-human `Action`s that the caller executes, and `SubagentMonitor` decides the
+same from one subagent's session log. No I/O, no git, no Camponi here - a leaf module other
+tasks can depend on. Decisions are deterministic for a given sequence of observations and `now`,
+and mutate only the monitor's own state.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ OVERDUE_TEXT = "No commit after {budget_min:g} minutes of work. Commit what work
 SUSPECT_TEXT = "Delivery check found: {findings}. Revert those edits at once. Never skip, weaken or silence checks."
 LOOPING_TEXT = "One command has run for {loop_min:g} minutes ({command}). Stop it now and do not restart it. Keep what you have, write the blocker and what you measured into your report, finish the remaining acceptance steps, then send worker_done."
 DEPS_TEXT = "Dependency check: {line}. You ran an install through your node_modules junction and the main checkout now loads packages from your worktree. Never install, clean or prune dependencies. Stop, run no other install, and say in your report which command did it."
+SUBAGENT_STALLED_TEXT = "Your subagent {name} has written nothing for {minutes} minutes. Check on it: wait for it, or cancel it and do that step yourself."
 
 # Explanations attached to needs-human actions; the coordinator reads them.
 SETTLED_NO_COMMIT_TEXT = "Settled without a commit: HEAD did not move, so there is no committed step to accept."
@@ -88,9 +90,9 @@ class WorkerMonitor:
         self.role = role  # "fix" | "test"
         self.start_head = start_head  # None: unknown at start
         self.cfg = cfg
-        # True when the provider reports settlement (Orca): a fix worker is done only once it settles,
-        # and a commit before that is progress. False (plain worktree): a clean committed head must
-        # hold still for two consecutive passes.
+        # True when the provider reports settlement (an ended agent terminal): a fix worker is done
+        # only once it settles, and a commit before that is progress. False (a running agent or a
+        # plain worktree): a clean committed head must hold still for two consecutive passes.
         self.settles = settles
         self.started_at = now
         self._clean_head: str | None = None  # the clean committed head seen on the previous pass
@@ -253,3 +255,51 @@ def _last_signal(tick: WorkerTick) -> float | None:
     """Newest of the activity and heartbeat timestamps; None when both are unknown."""
     stamps = [ts for ts in (tick.activity_ts, tick.heartbeat_ts) if ts is not None]
     return max(stamps) if stamps else None
+
+
+class SubagentMonitor:
+    """
+    Supervision state of one subagent, from its session log alone: no git, budget or screen.
+
+    A subagent shares its parent agent's worktree, which the parent's monitor checks, and has no
+    terminal of its own: its nudge text is meant for the parent. It is done once its log says it
+    ended; stalled once the log was not written for `stall_min` (one nudge per quiet window, a
+    newer write re-arms); the stall that would exceed `max_nudges` makes it needs-human instead.
+    """
+
+    def __init__(self, name: str, cfg: WatchConfig) -> None:
+        self.name = name  # as the parent knows it: "<Name>", nested "<Name>/<Sub>"
+        self.cfg = cfg
+        self._nudges = 0
+        self._done = False
+        self._needs_human = False
+        self._last_stalled_write: float | None = None
+
+    @property
+    def nudges(self) -> int:
+        return self._nudges
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def needs_human(self) -> bool:
+        return self._needs_human
+
+    def observe(self, log_ts: float, ended: bool, now: float) -> list[Action]:
+        """Decide about one look at the log (`log_ts`: its last write); [] while there is nothing to do."""
+        if self._done or self._needs_human:
+            return []
+        if ended:
+            self._done = True
+            return [Action("done", "done", "")]
+        if now - log_ts < self.cfg.stall_min * 60 or log_ts == self._last_stalled_write:
+            return []
+        self._last_stalled_write = log_ts
+        if self._nudges >= self.cfg.max_nudges:
+            self._needs_human = True
+            return [Action("needs-human", "nudge-limit", NUDGE_LIMIT_TEXT.format(max_nudges=self.cfg.max_nudges))]
+        self._nudges += 1
+        text = SUBAGENT_STALLED_TEXT.format(name=self.name, minutes=int((now - log_ts) // 60))
+        return [Action("nudge", "stalled", text)]
